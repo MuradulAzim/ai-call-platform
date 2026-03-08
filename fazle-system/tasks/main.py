@@ -63,9 +63,11 @@ def ensure_tables():
 
 app = FastAPI(title="Fazle Task Engine — Scheduling & Automation", version="1.0.0")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

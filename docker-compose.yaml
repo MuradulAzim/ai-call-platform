@@ -42,7 +42,7 @@ services:
 
   # ── Cache / Pub-Sub ──────────────────────────────────────
   redis:
-    image: redis:7
+    image: redis:7.2.5-alpine
     container_name: ai-redis
     restart: always
     command: >
@@ -75,7 +75,7 @@ services:
 
   # ── Object Storage ───────────────────────────────────────
   minio:
-    image: minio/minio
+    image: minio/minio:RELEASE.2024-11-11T11-18-37Z
     container_name: minio
     restart: always
     command: server /data --console-address ":9001"
@@ -107,7 +107,7 @@ services:
 
   # ── LiveKit — Real-time WebRTC Audio Streaming ───────────
   livekit:
-    image: livekit/livekit-server:latest
+    image: livekit/livekit-server:v1.8.2
     container_name: livekit
     restart: always
     entrypoint: ["/bin/sh", "/etc/livekit-entrypoint.sh"]
@@ -152,7 +152,7 @@ services:
 
   # ── Coturn — TURN/STUN for NAT Traversal ─────────────────
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.6.2-r12-alpine
     container_name: coturn
     restart: always
     entrypoint: ["/bin/sh", "/etc/coturn-entrypoint.sh"]
@@ -160,7 +160,9 @@ services:
     volumes:
       - ./configs/coturn/turnserver.conf:/etc/coturn/turnserver-template.conf:ro
       - ./scripts/coturn-entrypoint.sh:/etc/coturn-entrypoint.sh:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /etc/letsencrypt/live/iamazim.com/fullchain.pem:/etc/coturn/certs/fullchain.pem:ro
+      - /etc/letsencrypt/live/iamazim.com/privkey.pem:/etc/coturn/certs/privkey.pem:ro
+    user: root
     logging:
       driver: "json-file"
       options:
@@ -277,7 +279,7 @@ services:
 
   # ── Cloudflare Tunnel (optional fallback) ─────────────────
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2024.10.1
     container_name: cloudflared-tunnel
     restart: always
     command: tunnel --no-autoupdate --url http://api:8000 --metrics 0.0.0.0:2000
@@ -301,7 +303,7 @@ services:
 
   # ── Qdrant — Vector Database for Fazle Memory ─────────────
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.12.1
     container_name: qdrant
     restart: always
     volumes:
@@ -328,7 +330,7 @@ services:
 
   # ── Ollama — Local LLM Server ─────────────────────────────
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.3.14
     container_name: ollama
     restart: always
     volumes:
@@ -634,7 +636,7 @@ services:
 
   # ── Prometheus — Metrics Collection ────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.55.0
     container_name: prometheus
     restart: always
     volumes:
@@ -669,7 +671,7 @@ services:
 
   # ── Grafana — Dashboards & Visualization ───────────────────
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.2.2
     container_name: grafana
     restart: always
     environment:
@@ -707,7 +709,7 @@ services:
 
   # ── Node Exporter — Host Metrics ───────────────────────────
   node-exporter:
-    image: prom/node-exporter:latest
+    image: prom/node-exporter:v1.8.2
     container_name: node-exporter
     restart: always
     command:
@@ -726,7 +728,7 @@ services:
 
   # ── cAdvisor — Container Metrics ───────────────────────────
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: cadvisor
     restart: always
     cap_add:
@@ -750,7 +752,7 @@ services:
 
   # ── Loki — Log Aggregation ─────────────────────────────────
   loki:
-    image: grafana/loki:latest
+    image: grafana/loki:3.2.1
     container_name: loki
     restart: always
     command: -config.file=/etc/loki/loki.yml
@@ -780,7 +782,7 @@ services:
 
   # ── Promtail — Log Shipper ────────────────────────────────
   promtail:
-    image: grafana/promtail:latest
+    image: grafana/promtail:3.2.1
     container_name: promtail
     restart: always
     command: -config.file=/etc/promtail/promtail.yml

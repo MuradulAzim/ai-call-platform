@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 import httpx
 import logging
+import os
 import re
 from typing import Optional
 from datetime import datetime
@@ -30,9 +31,11 @@ settings = Settings()
 
 app = FastAPI(title="Fazle Web Intelligence — Search & Extraction", version="1.0.0")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
