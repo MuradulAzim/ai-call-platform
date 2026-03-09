@@ -12,7 +12,9 @@ import json
 import logging
 import uuid
 from typing import Optional
+import os
 from datetime import datetime
+from memory_manager import conversation_get, conversation_set
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-brain")
@@ -36,15 +38,14 @@ settings = Settings()
 
 app = FastAPI(title="Fazle Brain — Reasoning Engine", version="1.0.0")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# In-memory conversation store (keyed by conversation_id)
-conversations: dict[str, list[dict]] = {}
 
 SYSTEM_PROMPT = """You are Fazle, a personal AI assistant for Azim. You are intelligent, direct, and helpful.
 
@@ -263,7 +264,7 @@ async def chat(request: ChatRequest):
         )
 
     # Build conversation history
-    history = conversations.get(conversation_id, [])
+    history = conversation_get(conversation_id)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT + memory_context},
         *history[-10:],  # Keep last 10 turns
@@ -280,10 +281,10 @@ async def chat(request: ChatRequest):
     memory_updates = result.get("memory_updates", [])
     actions = result.get("actions", [])
 
-    # Update conversation history
+    # Update conversation history in Redis
     history.append({"role": "user", "content": request.message})
     history.append({"role": "assistant", "content": reply})
-    conversations[conversation_id] = history
+    conversation_set(conversation_id, history)
 
     # Process side effects
     if memory_updates:

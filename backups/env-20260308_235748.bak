@@ -1,70 +1,50 @@
 # ============================================================
 # Environment Configuration — AI Voice Agent SaaS Platform
 # Domain: iamazim.com | VPS: 5.189.131.48
-# ============================================================
-# SETUP: Copy this file to .env and replace ALL "CHANGE_ME_*"
-#        values with secure random strings.
-#        Run: gen-secrets.sh (or generate manually with openssl)
+# Copy to .env and fill in your actual values
 # ============================================================
 
 # ── VPS / Infrastructure ────────────────────────────────────
 VPS_IP=5.189.131.48
 
 # ── Docker Registry ─────────────────────────────────────────
-# REGISTRY=your-registry-here
+REGISTRY=ghcr.io/dograh-hq
 
 # ── Domain ──────────────────────────────────────────────────
 BACKEND_API_ENDPOINT=https://api.iamazim.com
 
 # ── PostgreSQL ──────────────────────────────────────────────
 POSTGRES_USER=postgres
-POSTGRES_PASSWORD=CHANGE_ME_STRONG_PASSWORD
+POSTGRES_PASSWORD=3UTioVfpNwVgcZ2VtlEr9XDR5C8PSOb
 POSTGRES_DB=postgres
 
 # ── Redis ───────────────────────────────────────────────────
-REDIS_PASSWORD=CHANGE_ME_REDIS_SECRET
+REDIS_PASSWORD=UuhN4ehSgOTbeDlLltEnJ8R2tYQa8F
 
 # ── MinIO (S3-compatible storage) ───────────────────────────
 MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=CHANGE_ME_MINIO_SECRET
+MINIO_SECRET_KEY=vxzTY3DP35ihRRv0C0uCQCmY2jdNBsw
 
 # ── JWT Secret ──────────────────────────────────────────────
-OSS_JWT_SECRET=CHANGE_ME_JWT_SECRET_32_CHARS_MIN
+OSS_JWT_SECRET=NBRk0559CseXlnGVMPCBxH3rD4YWbYmMjqClB4TVVJviThAg
 
 # ── LiveKit (Real-time WebRTC Voice Streaming) ──────────────
-LIVEKIT_API_KEY=CHANGE_ME_LIVEKIT_API_KEY
-LIVEKIT_API_SECRET=CHANGE_ME_LIVEKIT_SECRET_MIN_32_CHARS
+LIVEKIT_API_KEY=API88f0aec95c61
+LIVEKIT_API_SECRET=tvHZFR0IImCbKcDgi19rRrqTMXCTzKiKrRzL1SkQqqc2nakB
 LIVEKIT_WS_URL=wss://livekit.iamazim.com
 LIVEKIT_WEBHOOK_URL=http://api:8000/api/v1/livekit/webhook
 
 # ── TURN Server (WebRTC NAT traversal) ─────────────────────
 TURN_HOST=turn.iamazim.com
-TURN_SECRET=CHANGE_ME_TURN_SHARED_SECRET
-
-# ── Grafana ────────────────────────────────────────────────
-GRAFANA_USER=admin
-GRAFANA_PASSWORD=CHANGE_ME_GRAFANA_PASSWORD
-
-# ── Fazle Personal AI ──────────────────────────────────────
-# REQUIRED: 64-char alphanumeric key to protect Fazle API
-FAZLE_API_KEY=CHANGE_ME_64_CHAR_FAZLE_API_KEY
-
-# LLM provider: "openai" or "ollama"
-FAZLE_LLM_PROVIDER=openai
-FAZLE_LLM_MODEL=gpt-4o
-FAZLE_OLLAMA_MODEL=llama3.1
-
-# OpenAI API key (required when FAZLE_LLM_PROVIDER=openai)
-OPENAI_API_KEY=CHANGE_ME_OPENAI_API_KEY
-
-# Web search API keys (at least one required for web intelligence)
-SERPER_API_KEY=CHANGE_ME_SERPER_KEY
-TAVILY_API_KEY=
-FAZLE_SEARCH_PROVIDER=serper
+TURN_SECRET=T7Gni2xwbHWPWMjDiLG2599xCiZbMjwJ
+TURN_TLS_CERT_DIR=/etc/letsencrypt/live/turn.iamazim.com
 
 # ── Twilio (configure in Dograh UI → Settings) ─────────────
 # TWILIO_ACCOUNT_SID=your_sid
 # TWILIO_AUTH_TOKEN=your_token
+
+# ── LLM Provider (configure in Dograh UI → Settings) ───────
+# OPENAI_API_KEY=your_key
 
 # ── ElevenLabs Voice Cloning (optional) ────────────────────
 # ELEVENLABS_API_KEY=your_key
@@ -80,7 +60,3 @@ ENABLE_TELEMETRY=false
 
 # ── UI Backend URL (internal Docker network) ───────────────
 BACKEND_URL=http://api:8000
-
-# ── Monitoring (Grafana) ───────────────────────────────────
-GRAFANA_USER=admin
-GRAFANA_PASSWORD=CHANGE_ME_GRAFANA_PASSWORD
