@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from prometheus_fastapi_instrumentator import Instrumentator
 import httpx
 import json
 import logging
@@ -16,6 +17,7 @@ import os
 from datetime import datetime
 from memory_manager import conversation_get, conversation_set
 from persona_engine import build_system_prompt
+from safety import check_content
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-brain")
@@ -38,6 +40,8 @@ class Settings(BaseSettings):
 settings = Settings()
 
 app = FastAPI(title="Fazle Brain — Reasoning Engine", version="1.0.0")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
 
@@ -271,6 +275,20 @@ async def chat(request: ChatRequest):
     relationship = request.relationship or "self"
     user_id = request.user_id
 
+    # Content safety check on user input
+    safety_result = await check_content(
+        request.message,
+        openai_api_key=settings.openai_api_key,
+        relationship=relationship,
+    )
+    if not safety_result["safe"]:
+        logger.info(f"Input blocked for user={user_name} reason={safety_result['reason']}")
+        return {
+            "reply": safety_result["blocked_reply"],
+            "conversation_id": conversation_id,
+            "memory_updates": [],
+        }
+
     # Build persona-aware system prompt
     system_prompt = build_system_prompt(
         user_name=user_name,
@@ -303,6 +321,18 @@ async def chat(request: ChatRequest):
     reply = result.get("reply", "I'm not sure how to respond to that.")
     memory_updates = result.get("memory_updates", [])
     actions = result.get("actions", [])
+
+    # Content safety check on LLM output
+    output_safety = await check_content(
+        reply,
+        openai_api_key=settings.openai_api_key,
+        relationship=relationship,
+    )
+    if not output_safety["safe"]:
+        logger.info(f"Output blocked for user={user_name} reason={output_safety['reason']}")
+        reply = output_safety["blocked_reply"]
+        memory_updates = []
+        actions = []
 
     # Update conversation history in Redis
     history.append({"role": "user", "content": request.message})

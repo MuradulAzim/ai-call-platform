@@ -8,6 +8,43 @@
 
 ---
 
+## Phase B-D Remediation (Latest Round)
+
+### Phase B — Fix the Brain (Network Isolation)
+
+| # | Issue | Fix | File |
+|---|-------|-----|------|
+| 5 | AI services isolated from internet — no OpenAI connectivity | Added `app-network` to fazle-brain, fazle-memory, fazle-web-intelligence, fazle-trainer | `docker-compose.yaml` |
+
+### Phase C — Data Integrity & Persistence
+
+| # | Issue | Fix | File |
+|---|-------|-----|------|
+| 6 | PostgreSQL RLS defined but never activated | Switched `save_message`, `get_user_conversations`, `get_conversation_messages` from `_get_conn()` to `_rls_conn(user_id)` | `fazle-system/api/database.py` |
+| 7 | Trainer sessions lost on restart (in-memory dict) | Replaced `training_sessions: dict` with Redis-backed storage (`redis[hiredis]`), 30-day TTL, db/2 | `fazle-system/trainer/main.py`, `trainer/requirements.txt`, `docker-compose.yaml` |
+| 8 | Missing healthchecks on fazle-voice and node-exporter | Added healthcheck blocks (python urllib on :8700, wget on :9100) | `docker-compose.yaml` |
+
+### Phase D — Observability & Polish
+
+| # | Issue | Fix | File |
+|---|-------|-----|------|
+| 9 | No application metrics — Prometheus only scrapes infra | Added `prometheus-fastapi-instrumentator` to API, exposed `/metrics`, added `fazle-api` scrape target | `api/requirements.txt`, `api/main.py`, `configs/prometheus/prometheus.yml` |
+| 10 | PWA manifest references non-existent icon files | Cleared icons array to prevent browser 404 warnings | `fazle-system/ui/public/manifest.json` |
+| 11 | .env.example has duplicates and missing vars | Removed duplicate GRAFANA_USER/PASSWORD, added FAZLE_NEXTAUTH_URL and FAZLE_LIVEKIT_URL | `.env.example` |
+
+### Network Changes Summary
+
+| Service | Before | After |
+|---------|--------|-------|
+| fazle-brain | ai-network, db-network | ai-network, db-network, **app-network** |
+| fazle-memory | ai-network, db-network | ai-network, db-network, **app-network** |
+| fazle-web-intelligence | ai-network | ai-network, **app-network** |
+| fazle-trainer | ai-network | ai-network, **app-network**, **db-network** |
+| fazle-voice | app-network, ai-network | app-network, ai-network (+ healthcheck) |
+| node-exporter | monitoring-network | monitoring-network (+ healthcheck) |
+
+---
+
 ## Commit History
 
 | Commit | Phase | Description |

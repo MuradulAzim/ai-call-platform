@@ -5,12 +5,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from prometheus_fastapi_instrumentator import Instrumentator
 import httpx
+import ipaddress
 import logging
 import os
 import re
+import socket
 from typing import Optional
 from datetime import datetime
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +34,8 @@ class Settings(BaseSettings):
 settings = Settings()
 
 app = FastAPI(title="Fazle Web Intelligence — Search & Extraction", version="1.0.0")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
 
@@ -129,12 +135,38 @@ class ScrapeRequest(BaseModel):
     extract_text: bool = True
 
 
+def _is_private_ip(url: str) -> bool:
+    """Check if URL points to private/internal IP ranges (SSRF protection)."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return True
+        # Resolve hostname to IP
+        try:
+            ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+            return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
+        except (socket.gaierror, ValueError):
+            # Block unresolvable or invalid hostnames
+            if hostname in ('localhost', '0.0.0.0', '[::1]', '[::]'):
+                return True
+            if hostname.endswith('.internal') or hostname.endswith('.local'):
+                return True
+            return False
+    except Exception:
+        return True  # Fail closed on any parsing error
+
+
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
     """Extract content from a web page."""
     # Validate URL format
     if not re.match(r'^https?://', request.url):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+
+    # SSRF protection: block requests to internal/private IPs
+    if _is_private_ip(request.url):
+        raise HTTPException(status_code=400, detail="URL resolves to internal/private IP range")
 
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:

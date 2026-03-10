@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Header
-from jose import JWTError, jwt
+import jwt
+from jwt.exceptions import PyJWTError
 from passlib.context import CryptContext
 from pydantic_settings import BaseSettings
 
@@ -20,7 +21,7 @@ ACCESS_TOKEN_EXPIRE_HOURS = 24 * 7  # 7 days
 
 
 class AuthSettings(BaseSettings):
-    jwt_secret: str = "change-me-in-production-min-32-chars!"
+    jwt_secret: str  # Required — fails fast if FAZLE_JWT_SECRET not set
 
     class Config:
         env_prefix = "FAZLE_"
@@ -58,7 +59,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     token = authorization[7:]  # strip "Bearer "
     try:
         payload = decode_access_token(token)
-    except JWTError:
+    except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     user_id = payload.get("sub")

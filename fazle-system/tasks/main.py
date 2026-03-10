@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from prometheus_fastapi_instrumentator import Instrumentator
 import httpx
 import json
 import logging
@@ -62,6 +63,8 @@ def ensure_tables():
 
 
 app = FastAPI(title="Fazle Task Engine — Scheduling & Automation", version="1.0.0")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
 

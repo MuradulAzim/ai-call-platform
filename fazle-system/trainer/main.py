@@ -14,6 +14,8 @@ import uuid
 from typing import Optional
 from datetime import datetime
 
+import redis
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-trainer")
 
@@ -25,12 +27,21 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o"
     ollama_model: str = "llama3.1"
     memory_url: str = "http://fazle-memory:8300"
+    redis_url: str = "redis://redis:6379/2"
 
     class Config:
         env_prefix = ""
 
 
 settings = Settings()
+
+_redis: Optional[redis.Redis] = None
+
+def _get_redis() -> redis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    return _redis
 
 app = FastAPI(title="Fazle Trainer — Learning & Preference Extraction", version="1.0.0")
 
@@ -43,8 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Training sessions history
-training_sessions: dict[str, dict] = {}
+REDIS_SESSION_PREFIX = "trainer:session:"
 
 EXTRACTION_PROMPT = """You are an AI that extracts structured knowledge from conversations.
 
@@ -170,7 +180,7 @@ async def train(request: TrainRequest):
         "stored_count": stored_count,
         "created_at": datetime.utcnow().isoformat(),
     }
-    training_sessions[session_id] = session
+    _get_redis().set(f"{REDIS_SESSION_PREFIX}{session_id}", json.dumps(session), ex=86400 * 30)
 
     return session
 
@@ -179,16 +189,24 @@ async def train(request: TrainRequest):
 @app.get("/sessions")
 async def list_sessions(limit: int = 20):
     """List recent training sessions."""
-    sessions = sorted(training_sessions.values(), key=lambda s: s["created_at"], reverse=True)
+    r = _get_redis()
+    keys = r.keys(f"{REDIS_SESSION_PREFIX}*")
+    sessions = []
+    for key in keys:
+        raw = r.get(key)
+        if raw:
+            sessions.append(json.loads(raw))
+    sessions.sort(key=lambda s: s["created_at"], reverse=True)
     return {"sessions": sessions[:limit], "count": len(sessions)}
 
 
 # ── Get training session ───────────────────────────────────
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
-    if session_id not in training_sessions:
+    raw = _get_redis().get(f"{REDIS_SESSION_PREFIX}{session_id}")
+    if not raw:
         raise HTTPException(status_code=404, detail="Session not found")
-    return training_sessions[session_id]
+    return json.loads(raw)
 
 
 # ── Teach directly ─────────────────────────────────────────

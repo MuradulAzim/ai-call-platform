@@ -42,6 +42,21 @@ export default function MemoryPanel() {
     }
   };
 
+  const deleteMemory = async (memoryId) => {
+    if (!confirm("Delete this memory?")) return;
+    try {
+      const res = await fetch(`/api/fazle/memory/${memoryId}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        setMemories((prev) => prev.filter((m) => m.id !== memoryId));
+      }
+    } catch {
+      console.error("Failed to delete memory");
+    }
+  };
+
   useEffect(() => {
     fetchMemories();
   }, [selectedType]);
@@ -95,13 +110,24 @@ export default function MemoryPanel() {
           memories.map((memory, i) => (
             <div
               key={memory.id || i}
-              className="bg-[#1a1a2e] border border-gray-700/50 rounded-xl p-4 space-y-2"
+              className="bg-[#1a1a2e] border border-gray-700/50 rounded-xl p-4 space-y-2 group"
             >
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-fazle-700/20 text-fazle-300">
                   {memory.type}
                 </span>
-                <span className="text-xs text-gray-500">{memory.created_at?.split("T")[0]}</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-500">{memory.created_at?.split("T")[0]}</span>
+                  {memory.id && (
+                    <button
+                      onClick={() => deleteMemory(memory.id)}
+                      className="opacity-0 group-hover:opacity-100 text-red-400/60 hover:text-red-400 text-xs transition-opacity"
+                      title="Delete memory"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               </div>
               <p className="text-sm text-gray-200">{memory.text}</p>
               {memory.score && (

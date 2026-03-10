@@ -2,11 +2,14 @@
 # Fazle API Gateway — Central entry point for Fazle system
 # Routes requests to Brain, Memory, Tasks, and Tools services
 # ============================================================
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
+from prometheus_fastapi_instrumentator import Instrumentator
+import hmac
 import httpx
 import logging
+import os
 from typing import Optional
 from datetime import datetime
 
@@ -28,11 +31,16 @@ from auth import (
 from database import (
     ensure_users_table, create_user, get_user_by_email,
     get_user_by_id, list_family_members, update_user, delete_user,
-    count_users,
+    count_users, save_message, get_user_conversations,
+    get_conversation_messages, get_all_conversations,
 )
+from audit import ensure_audit_table, log_action, get_audit_logs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-api")
+
+# Allowed file extensions for upload
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".png", ".jpg", ".jpeg", ".gif"}
 
 
 class Settings(BaseSettings):
@@ -55,9 +63,11 @@ settings = Settings()
 app = FastAPI(
     title="Fazle Personal AI — API Gateway",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None,
+    redoc_url=None,
 )
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,17 +90,23 @@ async def verify_auth(
     authorization: Optional[str] = Header(None),
 ):
     """Accept either API key (X-API-Key header) or JWT (Authorization: Bearer)."""
+    # Fail fast if API key not configured
+    if not settings.api_key or not settings.api_key.strip():
+        raise HTTPException(
+            status_code=500,
+            detail="FAZLE_API_KEY not configured on server"
+        )
+
     # Try JWT first
     if authorization and authorization.startswith("Bearer "):
         user = await get_current_user(authorization)
         return user
 
-    # Fall back to API key
+    # Fall back to API key (timing-safe comparison)
+    if x_api_key and hmac.compare_digest(x_api_key.strip(), settings.api_key.strip()):
+        return {"id": "api-key", "email": "system", "name": "API Key", "role": "admin", "relationship_to_azim": "self"}
+
     if x_api_key:
-        if not settings.api_key or settings.api_key == "":
-            raise HTTPException(status_code=500, detail="FAZLE_API_KEY not configured")
-        if x_api_key == settings.api_key:
-            return {"id": "api-key", "email": "system", "name": "API Key", "role": "admin", "relationship_to_azim": "self"}
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     raise HTTPException(status_code=401, detail="Authentication required")
@@ -100,6 +116,7 @@ async def verify_auth(
 def startup():
     try:
         ensure_users_table()
+        ensure_audit_table()
         logger.info("Database tables ensured on startup")
     except Exception as e:
         logger.error(f"Failed to ensure database tables: {e}")
@@ -122,6 +139,7 @@ async def register(request: RegisterRequest, admin: dict = Depends(require_admin
         role=request.role,
     )
     token = create_access_token({"sub": str(user["id"]), "role": user["role"], "rel": user["relationship_to_azim"]})
+    log_action(admin, "register_user", target_type="user", target_id=str(user["id"]), detail=f"Registered {request.name} ({request.email}) as {request.relationship_to_azim}")
     return TokenResponse(access_token=token, user=UserResponse(**user))
 
 
@@ -136,6 +154,7 @@ async def login(request: LoginRequest):
 
     token = create_access_token({"sub": str(user["id"]), "role": user["role"], "rel": user["relationship_to_azim"]})
     user_resp = {k: v for k, v in user.items() if k != "hashed_password"}
+    log_action(user_resp, "login", target_type="user", target_id=str(user["id"]))
     return TokenResponse(access_token=token, user=UserResponse(**user_resp))
 
 
@@ -176,6 +195,7 @@ async def update_family_member(user_id: str, request: UpdateUserRequest, admin: 
     updated = update_user(user_id, **request.model_dump(exclude_unset=True))
     if not updated:
         raise HTTPException(status_code=404, detail="User not found")
+    log_action(admin, "update_user", target_type="user", target_id=user_id, detail=str(request.model_dump(exclude_unset=True)))
     return UserResponse(**updated)
 
 
@@ -186,6 +206,7 @@ async def delete_family_member(user_id: str, admin: dict = Depends(require_admin
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
     if not delete_user(user_id):
         raise HTTPException(status_code=404, detail="User not found")
+    log_action(admin, "delete_user", target_type="user", target_id=user_id)
     return {"status": "deleted"}
 
 
@@ -273,10 +294,41 @@ async def chat(
                 json=body,
             )
             resp.raise_for_status()
-            return ChatResponse(**resp.json())
+            data = resp.json()
+
+            # Persist chat history to DB
+            user_id = str(auth_user["id"]) if isinstance(auth_user, dict) and auth_user.get("id") != "api-key" else None
+            conv_id = data.get("conversation_id", "")
+            if user_id and conv_id:
+                try:
+                    save_message(user_id, conv_id, "user", request.message, title=request.message[:200])
+                    save_message(user_id, conv_id, "assistant", data.get("reply", ""))
+                except Exception as e:
+                    logger.warning(f"Chat history save failed: {e}")
+
+            return ChatResponse(**data)
         except httpx.HTTPError as e:
             logger.error(f"Brain service error: {e}")
             raise HTTPException(status_code=502, detail="Brain service unavailable")
+
+
+# ── Chat history ────────────────────────────────────────────
+@app.get("/fazle/conversations")
+async def list_conversations(auth_user: dict = Depends(verify_auth)):
+    """List conversations for the current user (admin sees all)."""
+    if auth_user.get("role") == "admin":
+        return {"conversations": get_all_conversations()}
+    return {"conversations": get_user_conversations(str(auth_user["id"]))}
+
+
+@app.get("/fazle/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str, auth_user: dict = Depends(verify_auth)):
+    """Get messages for a specific conversation."""
+    user_id = None if auth_user.get("role") == "admin" else str(auth_user["id"])
+    messages = get_conversation_messages(conversation_id, user_id=user_id)
+    if not messages and user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"messages": messages}
 
 
 # ── Memory proxy ────────────────────────────────────────────
@@ -317,6 +369,20 @@ async def search_memory(request: MemorySearchRequest, auth_user: dict = Depends(
             raise HTTPException(status_code=502, detail="Memory service unavailable")
 
 
+@app.delete("/fazle/memory/{memory_id}")
+async def delete_memory(memory_id: str, auth_user: dict = Depends(verify_auth)):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.delete(
+                f"{settings.memory_url}/memories/{memory_id}",
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPError as e:
+            logger.error(f"Memory service error: {e}")
+            raise HTTPException(status_code=502, detail="Memory service unavailable")
+
+
 # ── Knowledge ingestion proxy ───────────────────────────────
 @app.post("/fazle/knowledge/ingest", dependencies=[Depends(verify_auth)])
 async def ingest_knowledge(request: KnowledgeIngestRequest):
@@ -331,6 +397,80 @@ async def ingest_knowledge(request: KnowledgeIngestRequest):
         except httpx.HTTPError as e:
             logger.error(f"Memory service error: {e}")
             raise HTTPException(status_code=502, detail="Memory service unavailable")
+
+
+# ── File upload ─────────────────────────────────────────────
+@app.post("/fazle/files/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    auth_user: dict = Depends(verify_auth),
+):
+    """Upload a file (PDF, DOCX, TXT, images) for RAG ingestion."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type not allowed. Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    # Size guard (20MB)
+    contents = await file.read()
+    if len(contents) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 20MB)")
+
+    user_id = str(auth_user["id"]) if isinstance(auth_user, dict) and auth_user.get("id") != "api-key" else None
+
+    # Extract text based on file type
+    text_content = ""
+    if ext == ".txt":
+        text_content = contents.decode("utf-8", errors="replace")
+    elif ext == ".pdf":
+        try:
+            import io
+            import PyPDF2
+            reader = PyPDF2.PdfReader(io.BytesIO(contents))
+            text_content = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            logger.warning(f"PDF extraction failed: {e}")
+            text_content = f"[PDF file: {file.filename} - text extraction failed]"
+    elif ext == ".docx":
+        try:
+            import io
+            import docx
+            doc = docx.Document(io.BytesIO(contents))
+            text_content = "\n".join(p.text for p in doc.paragraphs)
+        except Exception as e:
+            logger.warning(f"DOCX extraction failed: {e}")
+            text_content = f"[DOCX file: {file.filename} - text extraction failed]"
+    else:
+        # Image files — store metadata
+        text_content = f"[Uploaded image: {file.filename}]"
+
+    # Ingest extracted text into memory/knowledge
+    if text_content.strip():
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                body = {
+                    "text": text_content[:50000],
+                    "source": f"upload:{file.filename}",
+                    "title": file.filename,
+                }
+                if user_id:
+                    body["user_id"] = user_id
+                await client.post(
+                    f"{settings.memory_url}/ingest",
+                    json=body,
+                )
+            except Exception as e:
+                logger.warning(f"Knowledge ingest after upload failed: {e}")
+
+    return {
+        "status": "uploaded",
+        "filename": file.filename,
+        "size": len(contents),
+        "type": ext,
+        "text_extracted": bool(text_content.strip()),
+    }
 
 
 # ── Task proxy ──────────────────────────────────────────────
@@ -412,3 +552,15 @@ async def system_status():
             except Exception:
                 results[name] = "unreachable"
     return {"services": results, "timestamp": datetime.utcnow().isoformat()}
+
+
+# ── Audit log (admin only) ─────────────────────────────────
+@app.get("/fazle/audit")
+async def view_audit_log(
+    limit: int = 100,
+    action: Optional[str] = None,
+    admin: dict = Depends(require_admin),
+):
+    """View audit trail. Admin only."""
+    logs = get_audit_logs(limit=min(limit, 500), action_filter=action)
+    return {"logs": logs}

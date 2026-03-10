@@ -43,7 +43,7 @@ export default function Dashboard() {
   return (
     <div className="flex h-screen">
       <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} user={session.user} />
-      <main className="flex-1 overflow-hidden">{panels[activeTab]}</main>
+      <main className="flex-1 overflow-hidden pb-16 md:pb-0">{panels[activeTab]}</main>
     </div>
   );
 }
