@@ -2,7 +2,7 @@
 # Pydantic schemas for Fazle API Gateway
 # Strict input validation for all endpoints
 # ============================================================
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional
 import re
 
@@ -145,3 +145,90 @@ class TrainRequest(BaseModel):
     transcript: str = Field(..., min_length=1, max_length=MAX_TRANSCRIPT_LEN)
     user: str = Field("Azim", max_length=MAX_USER_LEN)
     session_type: str = Field("conversation", max_length=50, pattern=r"^[a-zA-Z0-9_\-]+$")
+
+
+# ── Authentication ─────────────────────────────────────────
+VALID_RELATIONSHIPS = {"self", "wife", "daughter", "son", "parent", "sibling"}
+VALID_ROLES = {"admin", "member"}
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=255)
+    password: str = Field(..., min_length=8, max_length=128)
+    name: str = Field(..., min_length=1, max_length=100)
+    relationship_to_azim: str = Field("self", max_length=50)
+    role: str = Field("member", max_length=20)
+
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", v):
+            raise ValueError("Invalid email format")
+        return v
+
+    @field_validator("relationship_to_azim")
+    @classmethod
+    def relationship_valid(cls, v: str) -> str:
+        if v not in VALID_RELATIONSHIPS:
+            raise ValueError(f"relationship must be one of: {', '.join(sorted(VALID_RELATIONSHIPS))}")
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def role_valid(cls, v: str) -> str:
+        if v not in VALID_ROLES:
+            raise ValueError(f"role must be one of: {', '.join(sorted(VALID_ROLES))}")
+        return v
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=1, max_length=255)
+    password: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def email_clean(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    name: str
+    relationship_to_azim: str
+    role: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def stringify_id(cls, values):
+        if isinstance(values, dict) and "id" in values:
+            values["id"] = str(values["id"])
+        return values
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+class UpdateUserRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    relationship_to_azim: Optional[str] = Field(None, max_length=50)
+    role: Optional[str] = Field(None, max_length=20)
+    is_active: Optional[bool] = None
+
+    @field_validator("relationship_to_azim")
+    @classmethod
+    def relationship_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_RELATIONSHIPS:
+            raise ValueError(f"relationship must be one of: {', '.join(sorted(VALID_RELATIONSHIPS))}")
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def role_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_ROLES:
+            raise ValueError(f"role must be one of: {', '.join(sorted(VALID_ROLES))}")
+        return v

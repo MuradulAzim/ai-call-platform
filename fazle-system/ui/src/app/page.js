@@ -1,26 +1,24 @@
 "use client";
 
-import { useState } from "react";
-import Sidebar from "../components/Sidebar";
-import ChatPanel from "../components/ChatPanel";
-import MemoryPanel from "../components/MemoryPanel";
-import TasksPanel from "../components/TasksPanel";
-import KnowledgePanel from "../components/KnowledgePanel";
+import { useSession } from "next-auth/react";
+import { useRouter } from "next/navigation";
+import { useEffect } from "react";
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState("chat");
+  const { data: session, status } = useSession();
+  const router = useRouter();
 
-  const panels = {
-    chat: <ChatPanel />,
-    memory: <MemoryPanel />,
-    tasks: <TasksPanel />,
-    knowledge: <KnowledgePanel />,
-  };
+  useEffect(() => {
+    if (status === "authenticated") {
+      router.replace("/dashboard");
+    } else if (status === "unauthenticated") {
+      router.replace("/login");
+    }
+  }, [status, router]);
 
   return (
-    <div className="flex h-screen">
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
-      <main className="flex-1 overflow-hidden">{panels[activeTab]}</main>
+    <div className="min-h-screen flex items-center justify-center bg-[#0a0a0f]">
+      <div className="animate-pulse text-gray-400">Loading...</div>
     </div>
   );
 }

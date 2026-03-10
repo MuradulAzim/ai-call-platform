@@ -1,18 +1,26 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { useSession } from "next-auth/react";
 
 export default function ChatPanel() {
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      content: "Hello Azim. I'm Fazle, your personal AI. How can I help you?",
-    },
-  ]);
+  const { data: session } = useSession();
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const chatEndRef = useRef(null);
   const [conversationId, setConversationId] = useState(null);
+
+  useEffect(() => {
+    if (session?.user) {
+      setMessages([
+        {
+          role: "assistant",
+          content: `Hello ${session.user.name}. How can I help you today?`,
+        },
+      ]);
+    }
+  }, [session]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -30,11 +38,16 @@ export default function ChatPanel() {
     try {
       const res = await fetch("/api/fazle/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.accessToken
+            ? { Authorization: `Bearer ${session.accessToken}` }
+            : {}),
+        },
         body: JSON.stringify({
           message: userMsg,
           conversation_id: conversationId,
-          user: "Azim",
+          user: session?.user?.name || "User",
         }),
       });
 

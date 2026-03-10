@@ -1,17 +1,28 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useSession } from "next-auth/react";
 
 export default function TasksPanel() {
+  const { data: session } = useSession();
   const [tasks, setTasks] = useState([]);
   const [loading, setLoading] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [newTask, setNewTask] = useState({ title: "", description: "", task_type: "reminder", scheduled_at: "" });
 
+  const authHeaders = () => ({
+    "Content-Type": "application/json",
+    ...(session?.accessToken
+      ? { Authorization: `Bearer ${session.accessToken}` }
+      : {}),
+  });
+
   const fetchTasks = async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/fazle/tasks");
+      const res = await fetch("/api/fazle/tasks", {
+        headers: authHeaders(),
+      });
       if (res.ok) {
         const data = await res.json();
         setTasks(data.tasks || []);
@@ -32,7 +43,7 @@ export default function TasksPanel() {
     try {
       const res = await fetch("/api/fazle/tasks", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify(newTask),
       });
       if (res.ok) {

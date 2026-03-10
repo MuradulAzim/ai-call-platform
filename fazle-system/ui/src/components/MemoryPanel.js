@@ -1,22 +1,30 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useSession } from "next-auth/react";
 
 const MEMORY_TYPES = ["all", "preference", "contact", "knowledge", "personal", "conversation"];
 
 export default function MemoryPanel() {
+  const { data: session } = useSession();
   const [memories, setMemories] = useState([]);
   const [selectedType, setSelectedType] = useState("all");
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
 
+  const authHeaders = () => ({
+    "Content-Type": "application/json",
+    ...(session?.accessToken
+      ? { Authorization: `Bearer ${session.accessToken}` }
+      : {}),
+  });
+
   const fetchMemories = async () => {
     setLoading(true);
     try {
-      const typeParam = selectedType !== "all" ? `?memory_type=${selectedType}` : "";
       const res = await fetch(`/api/fazle/memory/search`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
           query: searchQuery || "all memories",
           memory_type: selectedType !== "all" ? selectedType : null,

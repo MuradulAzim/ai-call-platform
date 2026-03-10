@@ -381,6 +381,8 @@ services:
       - /tmp
     environment:
       FAZLE_API_KEY: "${FAZLE_API_KEY:-}"
+      FAZLE_JWT_SECRET: "${FAZLE_JWT_SECRET:-change-me-in-production-min-32-chars}"
+      FAZLE_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-postgres}"
       FAZLE_BRAIN_URL: "http://fazle-brain:8200"
       FAZLE_MEMORY_URL: "http://fazle-memory:8300"
       FAZLE_TASK_URL: "http://fazle-task-engine:8400"
@@ -401,8 +403,12 @@ services:
     ports:
       - "127.0.0.1:8100:8100"
     depends_on:
-      - fazle-brain
-      - fazle-memory
+      postgres:
+        condition: service_healthy
+      fazle-brain:
+        condition: service_healthy
+      fazle-memory:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8100/health').read()\""]
       interval: 30s
@@ -412,6 +418,7 @@ services:
     networks:
       - app-network
       - ai-network
+      - db-network
 
   # ── Fazle Brain — Core Reasoning Engine ────────────────────
   fazle-brain:
@@ -612,6 +619,8 @@ services:
     restart: always
     environment:
       FAZLE_API_URL: "http://fazle-api:8100"
+      NEXTAUTH_URL: "${FAZLE_NEXTAUTH_URL:-https://fazle.iamazim.com}"
+      NEXTAUTH_SECRET: "${FAZLE_JWT_SECRET:-change-me-in-production-min-32-chars}"
       PORT: "3020"
       HOSTNAME: "0.0.0.0"
       NODE_ENV: "production"

@@ -18,6 +18,17 @@ from schemas import (
     TaskCreateRequest,
     WebSearchRequest,
     TrainRequest,
+    RegisterRequest, LoginRequest,
+    TokenResponse, UserResponse, UpdateUserRequest,
+)
+from auth import (
+    hash_password, verify_password, create_access_token,
+    get_current_user, require_admin, get_optional_user,
+)
+from database import (
+    ensure_users_table, create_user, get_user_by_email,
+    get_user_by_id, list_family_members, update_user, delete_user,
+    count_users,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +72,126 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+async def verify_auth(
+    x_api_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Accept either API key (X-API-Key header) or JWT (Authorization: Bearer)."""
+    # Try JWT first
+    if authorization and authorization.startswith("Bearer "):
+        user = await get_current_user(authorization)
+        return user
+
+    # Fall back to API key
+    if x_api_key:
+        if not settings.api_key or settings.api_key == "":
+            raise HTTPException(status_code=500, detail="FAZLE_API_KEY not configured")
+        if x_api_key == settings.api_key:
+            return {"id": "api-key", "email": "system", "name": "API Key", "role": "admin", "relationship_to_azim": "self"}
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+@app.on_event("startup")
+def startup():
+    try:
+        ensure_users_table()
+        logger.info("Database tables ensured on startup")
+    except Exception as e:
+        logger.error(f"Failed to ensure database tables: {e}")
+
+
+# ── Auth endpoints ──────────────────────────────────────────
+@app.post("/auth/register", response_model=TokenResponse)
+async def register(request: RegisterRequest, admin: dict = Depends(require_admin)):
+    """Register a new family member. Admin only."""
+    existing = get_user_by_email(request.email)
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    hashed = hash_password(request.password)
+    user = create_user(
+        email=request.email,
+        hashed_password=hashed,
+        name=request.name,
+        relationship_to_azim=request.relationship_to_azim,
+        role=request.role,
+    )
+    token = create_access_token({"sub": str(user["id"]), "role": user["role"], "rel": user["relationship_to_azim"]})
+    return TokenResponse(access_token=token, user=UserResponse(**user))
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(request: LoginRequest):
+    """Log in with email and password."""
+    user = get_user_by_email(request.email)
+    if not user or not verify_password(request.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Account is deactivated")
+
+    token = create_access_token({"sub": str(user["id"]), "role": user["role"], "rel": user["relationship_to_azim"]})
+    user_resp = {k: v for k, v in user.items() if k != "hashed_password"}
+    return TokenResponse(access_token=token, user=UserResponse(**user_resp))
+
+
+@app.post("/auth/setup", response_model=TokenResponse)
+async def setup_admin(request: RegisterRequest):
+    """Initial admin setup — only works when no users exist."""
+    if count_users() > 0:
+        raise HTTPException(status_code=403, detail="Setup already completed")
+
+    hashed = hash_password(request.password)
+    user = create_user(
+        email=request.email,
+        hashed_password=hashed,
+        name=request.name,
+        relationship_to_azim="self",
+        role="admin",
+    )
+    token = create_access_token({"sub": str(user["id"]), "role": "admin", "rel": "self"})
+    return TokenResponse(access_token=token, user=UserResponse(**user))
+
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_me(user: dict = Depends(get_current_user)):
+    """Get the current authenticated user."""
+    return UserResponse(**user)
+
+
+@app.get("/auth/family", response_model=list[UserResponse])
+async def get_family(admin: dict = Depends(require_admin)):
+    """List all family members. Admin only."""
+    members = list_family_members()
+    return [UserResponse(**m) for m in members]
+
+
+@app.put("/auth/family/{user_id}", response_model=UserResponse)
+async def update_family_member(user_id: str, request: UpdateUserRequest, admin: dict = Depends(require_admin)):
+    """Update a family member. Admin only."""
+    updated = update_user(user_id, **request.model_dump(exclude_unset=True))
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserResponse(**updated)
+
+
+@app.delete("/auth/family/{user_id}")
+async def delete_family_member(user_id: str, admin: dict = Depends(require_admin)):
+    """Delete a family member. Admin only. Cannot delete yourself."""
+    if str(admin["id"]) == user_id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    if not delete_user(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "deleted"}
+
+
+@app.get("/auth/setup-status")
+async def setup_status():
+    """Check if initial setup has been completed."""
+    return {"setup_completed": count_users() > 0}
+
+
 # ── Health ──────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -68,7 +199,7 @@ async def health():
 
 
 # ── Decision endpoint (Dograh integration) ──────────────────
-@app.post("/fazle/decision", response_model=DecisionResponse, dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/decision", response_model=DecisionResponse, dependencies=[Depends(verify_auth)])
 async def make_decision(request: DecisionRequest):
     """Dograh calls this endpoint to get AI decisions for voice interactions."""
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -85,7 +216,7 @@ async def make_decision(request: DecisionRequest):
 
 
 # ── Chat endpoint ───────────────────────────────────────────
-@app.post("/fazle/chat", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/chat", response_model=ChatResponse, dependencies=[Depends(verify_auth)])
 async def chat(request: ChatRequest):
     """Text chat with Fazle."""
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -102,7 +233,7 @@ async def chat(request: ChatRequest):
 
 
 # ── Memory proxy ────────────────────────────────────────────
-@app.post("/fazle/memory", dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/memory", dependencies=[Depends(verify_auth)])
 async def store_memory(request: MemoryStoreRequest):
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -117,7 +248,7 @@ async def store_memory(request: MemoryStoreRequest):
             raise HTTPException(status_code=502, detail="Memory service unavailable")
 
 
-@app.post("/fazle/memory/search", dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/memory/search", dependencies=[Depends(verify_auth)])
 async def search_memory(request: MemorySearchRequest):
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -133,7 +264,7 @@ async def search_memory(request: MemorySearchRequest):
 
 
 # ── Knowledge ingestion proxy ───────────────────────────────
-@app.post("/fazle/knowledge/ingest", dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/knowledge/ingest", dependencies=[Depends(verify_auth)])
 async def ingest_knowledge(request: KnowledgeIngestRequest):
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
@@ -149,7 +280,7 @@ async def ingest_knowledge(request: KnowledgeIngestRequest):
 
 
 # ── Task proxy ──────────────────────────────────────────────
-@app.post("/fazle/tasks", dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/tasks", dependencies=[Depends(verify_auth)])
 async def create_task(request: TaskCreateRequest):
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -164,7 +295,7 @@ async def create_task(request: TaskCreateRequest):
             raise HTTPException(status_code=502, detail="Task service unavailable")
 
 
-@app.get("/fazle/tasks", dependencies=[Depends(verify_api_key)])
+@app.get("/fazle/tasks", dependencies=[Depends(verify_auth)])
 async def list_tasks():
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -177,7 +308,7 @@ async def list_tasks():
 
 
 # ── Web intelligence proxy ──────────────────────────────────
-@app.post("/fazle/web/search", dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/web/search", dependencies=[Depends(verify_auth)])
 async def web_search(request: WebSearchRequest):
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -193,7 +324,7 @@ async def web_search(request: WebSearchRequest):
 
 
 # ── Training proxy ──────────────────────────────────────────
-@app.post("/fazle/train", dependencies=[Depends(verify_api_key)])
+@app.post("/fazle/train", dependencies=[Depends(verify_auth)])
 async def train(request: TrainRequest):
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
@@ -209,7 +340,7 @@ async def train(request: TrainRequest):
 
 
 # ── Service status ──────────────────────────────────────────
-@app.get("/fazle/status", dependencies=[Depends(verify_api_key)])
+@app.get("/fazle/status", dependencies=[Depends(verify_auth)])
 async def system_status():
     services = {
         "brain": settings.brain_url,
