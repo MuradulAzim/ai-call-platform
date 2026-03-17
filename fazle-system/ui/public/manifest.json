@@ -1,0 +1,12 @@
+{
+  "name": "Fazle — Family AI",
+  "short_name": "Fazle",
+  "description": "Your Family's Personal AI — Private & Secure",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#0a0a0f",
+  "theme_color": "#0a0a0f",
+  "orientation": "portrait-primary",
+  "icons": [],
+  "categories": ["productivity", "utilities"]
+}

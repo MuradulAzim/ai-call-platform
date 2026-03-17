@@ -6,3 +6,4 @@ pydantic-settings==2.7.1
 apscheduler==3.10.4
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
+prometheus-fastapi-instrumentator==7.0.2

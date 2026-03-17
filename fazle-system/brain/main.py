@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from prometheus_fastapi_instrumentator import Instrumentator
 import httpx
 import json
 import logging
@@ -15,6 +16,8 @@ from typing import Optional
 import os
 from datetime import datetime
 from memory_manager import conversation_get, conversation_set
+from persona_engine import build_system_prompt, build_system_prompt_async
+from safety import check_content
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-brain")
@@ -29,6 +32,9 @@ class Settings(BaseSettings):
     memory_url: str = "http://fazle-memory:8300"
     tools_url: str = "http://fazle-web-intelligence:8500"
     task_url: str = "http://fazle-task-engine:8400"
+    llm_gateway_url: str = "http://fazle-llm-gateway:8800"
+    learning_engine_url: str = "http://fazle-learning-engine:8900"
+    use_llm_gateway: bool = True
 
     class Config:
         env_prefix = ""
@@ -37,6 +43,8 @@ class Settings(BaseSettings):
 settings = Settings()
 
 app = FastAPI(title="Fazle Brain — Reasoning Engine", version="1.0.0")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
 
@@ -47,7 +55,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SYSTEM_PROMPT = """You are Fazle, a personal AI assistant for Azim. You are intelligent, direct, and helpful.
+# Default system prompt — used as fallback when no user context is provided
+DEFAULT_SYSTEM_PROMPT = """You are Fazle, a personal AI assistant for Azim. You are intelligent, direct, and helpful.
 
 Your capabilities:
 - Remember personal preferences, contacts, and important information
@@ -74,7 +83,7 @@ Respond in JSON with these fields:
 
 
 async def query_openai(messages: list[dict]) -> dict:
-    """Call OpenAI API for reasoning."""
+    """Call OpenAI API for reasoning (direct, used as fallback)."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
@@ -95,7 +104,7 @@ async def query_openai(messages: list[dict]) -> dict:
 
 
 async def query_ollama(messages: list[dict]) -> dict:
-    """Call local Ollama LLM for reasoning."""
+    """Call local Ollama LLM for reasoning (direct, used as fallback)."""
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             f"{settings.ollama_url}/api/chat",
@@ -111,20 +120,44 @@ async def query_ollama(messages: list[dict]) -> dict:
         return json.loads(data["message"]["content"])
 
 
+async def query_gateway(messages: list[dict]) -> dict:
+    """Call LLM Gateway for centralized routing, caching, and fallback."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{settings.llm_gateway_url}/generate",
+            json={
+                "messages": messages,
+                "response_format": "json",
+                "caller": "fazle-brain",
+                "temperature": 0.7,
+            },
+        )
+        resp.raise_for_status()
+        return json.loads(resp.json()["content"])
+
+
 async def query_llm(messages: list[dict]) -> dict:
-    """Route to configured LLM provider."""
+    """Route to LLM Gateway (preferred) or direct provider (fallback)."""
+    if settings.use_llm_gateway:
+        try:
+            return await query_gateway(messages)
+        except Exception as e:
+            logger.warning(f"LLM Gateway unavailable, falling back to direct: {e}")
     if settings.llm_provider == "ollama":
         return await query_ollama(messages)
     return await query_openai(messages)
 
 
-async def retrieve_memories(query: str, memory_type: Optional[str] = None) -> list[dict]:
-    """Retrieve relevant memories from memory service."""
+async def retrieve_memories(query: str, memory_type: Optional[str] = None, user_id: Optional[str] = None) -> list[dict]:
+    """Retrieve relevant memories from memory service, optionally filtered by user."""
+    body: dict = {"query": query, "memory_type": memory_type, "limit": 5}
+    if user_id:
+        body["user_id"] = user_id
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resp = await client.post(
                 f"{settings.memory_url}/search",
-                json={"query": query, "memory_type": memory_type, "limit": 5},
+                json=body,
             )
             if resp.status_code == 200:
                 return resp.json().get("results", [])
@@ -133,19 +166,57 @@ async def retrieve_memories(query: str, memory_type: Optional[str] = None) -> li
     return []
 
 
-async def store_memory_updates(updates: list[dict]):
+async def retrieve_multimodal_memories(query: str, user_id: Optional[str] = None) -> list[dict]:
+    """Retrieve relevant multimodal memories (images, documents with images)."""
+    body: dict = {"query": query, "limit": 3}
+    if user_id:
+        body["user_id"] = user_id
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.memory_url}/search-multimodal",
+                json=body,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("results", [])
+        except Exception as e:
+            logger.warning(f"Multimodal memory retrieval failed: {e}")
+    return []
+
+
+def _format_memory_context(text_memories: list[dict], multimodal_memories: list[dict]) -> str:
+    """Format text and multimodal memories into prompt context."""
+    parts = []
+    if text_memories:
+        parts.append("\nRelevant memories:")
+        for m in text_memories:
+            parts.append(f"- {m.get('text', str(m.get('content', '')))}")
+    if multimodal_memories:
+        parts.append("\nRelevant images in memory:")
+        for m in multimodal_memories:
+            caption = m.get("caption", m.get("text", ""))
+            fname = m.get("original_filename", "")
+            label = f" ({fname})" if fname else ""
+            parts.append(f"<image>{caption}{label}</image>")
+    return "\n".join(parts) if parts else ""
+
+
+async def store_memory_updates(updates: list[dict], user_id: Optional[str] = None, user_name: str = "Azim"):
     """Store memory updates extracted by the LLM."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         for update in updates:
             try:
+                body = {
+                    "type": update.get("type", "personal"),
+                    "user": user_name,
+                    "content": update.get("content", {}),
+                    "text": update.get("text", str(update.get("content", ""))),
+                }
+                if user_id:
+                    body["user_id"] = user_id
                 await client.post(
                     f"{settings.memory_url}/store",
-                    json={
-                        "type": update.get("type", "personal"),
-                        "user": "Azim",
-                        "content": update.get("content", {}),
-                        "text": update.get("text", str(update.get("content", ""))),
-                    },
+                    json=body,
                 )
             except Exception as e:
                 logger.warning(f"Memory store failed: {e}")
@@ -205,7 +276,7 @@ async def decide(request: DecisionRequest):
         )
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
@@ -248,6 +319,9 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
     user: str = "Azim"
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+    relationship: Optional[str] = None
 
 
 @app.post("/chat")
@@ -255,18 +329,42 @@ async def chat(request: ChatRequest):
     """Interactive chat with Fazle."""
     conversation_id = request.conversation_id or str(uuid.uuid4())
 
-    # Retrieve relevant memories
-    memories = await retrieve_memories(request.message)
-    memory_context = ""
-    if memories:
-        memory_context = "\n\nRelevant memories:\n" + "\n".join(
-            f"- {m.get('text', str(m.get('content', '')))}" for m in memories
-        )
+    # Determine user context for persona
+    user_name = request.user_name or request.user or "Azim"
+    relationship = request.relationship or "self"
+    user_id = request.user_id
+
+    # Content safety check on user input
+    safety_result = await check_content(
+        request.message,
+        openai_api_key=settings.openai_api_key,
+        relationship=relationship,
+    )
+    if not safety_result["safe"]:
+        logger.info(f"Input blocked for user={user_name} reason={safety_result['reason']}")
+        return {
+            "reply": safety_result["blocked_reply"],
+            "conversation_id": conversation_id,
+            "memory_updates": [],
+        }
+
+    # Build persona-aware system prompt (with dynamic evolution overrides)
+    system_prompt = await build_system_prompt_async(
+        user_name=user_name,
+        relationship=relationship,
+        user_id=user_id,
+        learning_engine_url=settings.learning_engine_url,
+    )
+
+    # Retrieve relevant memories (filtered by user_id for privacy)
+    memories = await retrieve_memories(request.message, user_id=user_id)
+    mm_memories = await retrieve_multimodal_memories(request.message, user_id=user_id)
+    memory_context = _format_memory_context(memories, mm_memories)
 
     # Build conversation history
     history = conversation_get(conversation_id)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + memory_context},
+        {"role": "system", "content": system_prompt + memory_context},
         *history[-10:],  # Keep last 10 turns
         {"role": "user", "content": request.message},
     ]
@@ -281,6 +379,18 @@ async def chat(request: ChatRequest):
     memory_updates = result.get("memory_updates", [])
     actions = result.get("actions", [])
 
+    # Content safety check on LLM output
+    output_safety = await check_content(
+        reply,
+        openai_api_key=settings.openai_api_key,
+        relationship=relationship,
+    )
+    if not output_safety["safe"]:
+        logger.info(f"Output blocked for user={user_name} reason={output_safety['reason']}")
+        reply = output_safety["blocked_reply"]
+        memory_updates = []
+        actions = []
+
     # Update conversation history in Redis
     history.append({"role": "user", "content": request.message})
     history.append({"role": "assistant", "content": reply})
@@ -288,24 +398,41 @@ async def chat(request: ChatRequest):
 
     # Process side effects
     if memory_updates:
-        await store_memory_updates(memory_updates)
+        await store_memory_updates(memory_updates, user_id=user_id, user_name=user_name)
     if actions:
         await execute_actions(actions)
 
-    # Store conversation memory
+    # Store conversation memory (tagged with user_id for privacy isolation)
+    conv_body: dict = {
+        "type": "conversation",
+        "user": user_name,
+        "content": {"message": request.message, "reply": reply, "conversation_id": conversation_id},
+        "text": f"{user_name} said: {request.message}. Azim replied: {reply}",
+    }
+    if user_id:
+        conv_body["user_id"] = user_id
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             await client.post(
                 f"{settings.memory_url}/store",
-                json={
-                    "type": "conversation",
-                    "user": request.user,
-                    "content": {"message": request.message, "reply": reply, "conversation_id": conversation_id},
-                    "text": f"User said: {request.message}. Fazle replied: {reply}",
-                },
+                json=conv_body,
             )
         except Exception:
             pass
+
+    # Trigger async learning from this conversation
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as learn_client:
+            await learn_client.post(
+                f"{settings.learning_engine_url}/learn",
+                json={
+                    "transcript": f"{user_name}: {request.message}\nAzim: {reply}",
+                    "user": user_name,
+                    "conversation_id": conversation_id,
+                },
+            )
+    except Exception:
+        pass  # Non-critical — learning is best-effort
 
     return {
         "reply": reply,

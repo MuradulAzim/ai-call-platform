@@ -34,3 +34,10 @@ scrape_configs:
   - job_name: "loki"
     static_configs:
       - targets: ["loki:3100"]
+
+  # ── Fazle API Gateway ────────────────────────────────────
+  - job_name: "fazle-api"
+    static_configs:
+      - targets: ["fazle-api:8100"]
+        labels:
+          service: "fazle-api"

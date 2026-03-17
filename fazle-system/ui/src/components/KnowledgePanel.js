@@ -1,8 +1,10 @@
 "use client";
 
 import { useState } from "react";
+import { useSession } from "next-auth/react";
 
 export default function KnowledgePanel() {
+  const { data: session } = useSession();
   const [text, setText] = useState("");
   const [source, setSource] = useState("manual");
   const [title, setTitle] = useState("");
@@ -11,6 +13,13 @@ export default function KnowledgePanel() {
   const [result, setResult] = useState(null);
   const [mode, setMode] = useState("text"); // "text" or "url"
 
+  const authHeaders = () => ({
+    "Content-Type": "application/json",
+    ...(session?.accessToken
+      ? { Authorization: `Bearer ${session.accessToken}` }
+      : {}),
+  });
+
   const ingestText = async (e) => {
     e.preventDefault();
     setLoading(true);
@@ -18,7 +27,7 @@ export default function KnowledgePanel() {
     try {
       const res = await fetch("/api/fazle/knowledge/ingest", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({ text, source, title }),
       });
       if (res.ok) {
@@ -43,7 +52,7 @@ export default function KnowledgePanel() {
     try {
       const res = await fetch("/api/fazle/web/search", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({ query: url, max_results: 1 }),
       });
       if (res.ok) {
