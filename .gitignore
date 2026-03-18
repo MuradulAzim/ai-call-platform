@@ -22,6 +22,12 @@ __pycache__/
 *.pyc
 .venv/
 
+# Logs
+logs/
+*.log
+*.tmp
+*.bak
+
 # OS
 .DS_Store
 Thumbs.db
@@ -29,3 +35,4 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+backups/
