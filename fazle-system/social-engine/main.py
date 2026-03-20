@@ -2,7 +2,7 @@
 # Fazle Social Engine — WhatsApp + Facebook Automation
 # Microservice for social media interactions with AI persona
 # ============================================================
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 import httpx
@@ -16,6 +16,12 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
+from auth import encrypt_value, decrypt_value, mask_secret
+from webhooks import handle_whatsapp_webhook, handle_facebook_webhook
+from tasks import trigger_workflow, check_keyword_rules
+import whatsapp as wa_module
+import facebook as fb_module
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-social-engine")
 
@@ -26,6 +32,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@postgres:5432/postgres"
     brain_url: str = "http://fazle-brain:8200"
     redis_url: str = "redis://redis:6379/5"
+    workflow_engine_url: str = "http://fazle-workflow-engine:9700"
+    encryption_key: str = ""
+    # Fallback env-based creds (overridden by DB integrations when available)
     whatsapp_api_url: str = ""
     whatsapp_api_token: str = ""
     whatsapp_phone_number_id: str = ""
@@ -38,7 +47,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-app = FastAPI(title="Fazle Social Engine", version="1.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="Fazle Social Engine", version="2.0.0", docs_url=None, redoc_url=None)
 
 # ── Database ────────────────────────────────────────────────
 _pool = None
@@ -65,26 +74,48 @@ def ensure_tables():
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS fazle_social_integrations (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    platform VARCHAR(20) NOT NULL,
+                    app_id VARCHAR(500) DEFAULT '',
+                    app_secret TEXT DEFAULT '',
+                    access_token TEXT DEFAULT '',
+                    page_id VARCHAR(500) DEFAULT '',
+                    phone_number VARCHAR(50) DEFAULT '',
+                    phone_number_id VARCHAR(200) DEFAULT '',
+                    waba_id VARCHAR(200) DEFAULT '',
+                    verify_token VARCHAR(200) DEFAULT '',
+                    webhook_url TEXT DEFAULT '',
+                    enabled BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(platform)
+                );
+
                 CREATE TABLE IF NOT EXISTS fazle_social_contacts (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     name VARCHAR(200) NOT NULL,
                     platform VARCHAR(20) NOT NULL,
                     identifier VARCHAR(200) NOT NULL,
+                    phone_number VARCHAR(50) DEFAULT '',
+                    profile_link TEXT DEFAULT '',
                     metadata JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(platform, identifier)
                 );
                 CREATE INDEX IF NOT EXISTS idx_social_contacts_platform
                     ON fazle_social_contacts (platform);
-                CREATE INDEX IF NOT EXISTS idx_social_contacts_identifier
-                    ON fazle_social_contacts (identifier);
 
                 CREATE TABLE IF NOT EXISTS fazle_social_messages (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     platform VARCHAR(20) NOT NULL,
                     direction VARCHAR(10) NOT NULL,
+                    sender_id VARCHAR(200) DEFAULT '',
                     contact_id UUID REFERENCES fazle_social_contacts(id) ON DELETE SET NULL,
                     contact_identifier VARCHAR(200),
-                    content TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    ai_response TEXT DEFAULT '',
+                    content TEXT NOT NULL DEFAULT '',
                     metadata JSONB DEFAULT '{}',
                     status VARCHAR(20) DEFAULT 'sent',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -144,10 +175,46 @@ def startup():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "fazle-social-engine", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "service": "fazle-social-engine", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# ── Brain integration ──────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────
+def _get_integration_creds(platform: str) -> dict:
+    """Get decrypted credentials for a platform from DB or env fallback."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM fazle_social_integrations WHERE platform = %s AND enabled = TRUE",
+                (platform,),
+            )
+            row = cur.fetchone()
+    if row:
+        creds = dict(row)
+        # Decrypt secrets
+        for field in ("app_secret", "access_token"):
+            if creds.get(field):
+                try:
+                    creds[field] = decrypt_value(creds[field])
+                except Exception:
+                    pass
+        creds["id"] = str(creds["id"])
+        return creds
+    # Fallback to env-based creds
+    if platform == "whatsapp":
+        return {
+            "whatsapp_api_url": settings.whatsapp_api_url,
+            "access_token": settings.whatsapp_api_token,
+            "phone_number_id": settings.whatsapp_phone_number_id,
+        }
+    elif platform == "facebook":
+        return {
+            "page_access_token": settings.facebook_page_access_token or "",
+            "access_token": settings.facebook_page_access_token or "",
+            "page_id": settings.facebook_page_id,
+        }
+    return {}
+
+
 async def generate_ai_reply(message: str, context: str = "") -> str:
     """Use Fazle Brain to generate a persona-aware response."""
     try:
@@ -168,6 +235,233 @@ async def generate_ai_reply(message: str, context: str = "") -> str:
     return ""
 
 
+# ── Integration Management ─────────────────────────────────
+
+@app.get("/integrations")
+async def list_integrations():
+    """List all platform integrations with masked secrets."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM fazle_social_integrations ORDER BY platform")
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["id"] = str(r["id"])
+        r["app_secret"] = mask_secret(r.get("app_secret", ""))
+        r["access_token"] = mask_secret(r.get("access_token", ""))
+    return {"integrations": rows}
+
+
+@app.post("/integrations/save")
+async def save_integration(body: dict):
+    """Save or update a platform integration. Secrets are encrypted."""
+    platform = body.get("platform", "").lower()
+    if platform not in ("whatsapp", "facebook"):
+        raise HTTPException(status_code=400, detail="Platform must be 'whatsapp' or 'facebook'")
+
+    # Encrypt secrets before storage
+    app_secret = body.get("app_secret", "")
+    access_token = body.get("access_token", "")
+    if app_secret and settings.encryption_key:
+        app_secret = encrypt_value(app_secret)
+    if access_token and settings.encryption_key:
+        access_token = encrypt_value(access_token)
+
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """INSERT INTO fazle_social_integrations
+                   (platform, app_id, app_secret, access_token, page_id,
+                    phone_number, phone_number_id, waba_id, verify_token, webhook_url, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                   ON CONFLICT (platform) DO UPDATE SET
+                     app_id = EXCLUDED.app_id,
+                     app_secret = EXCLUDED.app_secret,
+                     access_token = EXCLUDED.access_token,
+                     page_id = EXCLUDED.page_id,
+                     phone_number = EXCLUDED.phone_number,
+                     phone_number_id = EXCLUDED.phone_number_id,
+                     waba_id = EXCLUDED.waba_id,
+                     verify_token = EXCLUDED.verify_token,
+                     webhook_url = EXCLUDED.webhook_url,
+                     updated_at = NOW()
+                   RETURNING id, platform, enabled""",
+                (platform,
+                 body.get("app_id", ""),
+                 app_secret,
+                 access_token,
+                 body.get("page_id", ""),
+                 body.get("phone_number", ""),
+                 body.get("phone_number_id", ""),
+                 body.get("waba_id", ""),
+                 body.get("verify_token", ""),
+                 body.get("webhook_url", "")),
+            )
+            conn.commit()
+            row = dict(cur.fetchone())
+            row["id"] = str(row["id"])
+    return {"status": "saved", **row}
+
+
+@app.post("/integrations/test")
+async def test_integration(body: dict):
+    """Test connectivity for a saved integration."""
+    platform = body.get("platform", "").lower()
+    creds = _get_integration_creds(platform)
+
+    if platform == "whatsapp":
+        api_url = creds.get("whatsapp_api_url") or settings.whatsapp_api_url
+        token = creds.get("access_token", "")
+        phone_id = creds.get("phone_number_id", "")
+        if not api_url or not token:
+            return {"connected": False, "error": "WhatsApp credentials not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{api_url}/{phone_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                return {"connected": resp.status_code == 200, "status_code": resp.status_code}
+        except Exception as e:
+            return {"connected": False, "error": str(e)}
+
+    elif platform == "facebook":
+        token = creds.get("page_access_token") or creds.get("access_token", "")
+        page_id = creds.get("page_id", "")
+        if not token:
+            return {"connected": False, "error": "Facebook credentials not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://graph.facebook.com/v19.0/{page_id}",
+                    params={"access_token": token, "fields": "id,name"},
+                )
+                if resp.status_code == 200:
+                    return {"connected": True, "page": resp.json()}
+                return {"connected": False, "status_code": resp.status_code}
+        except Exception as e:
+            return {"connected": False, "error": str(e)}
+
+    return {"connected": False, "error": "Unknown platform"}
+
+
+@app.post("/integrations/enable")
+async def enable_integration(body: dict):
+    """Enable a platform integration."""
+    platform = body.get("platform", "").lower()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fazle_social_integrations SET enabled = TRUE, updated_at = NOW() WHERE platform = %s",
+                (platform,),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Integration not found")
+        conn.commit()
+    return {"status": "enabled", "platform": platform}
+
+
+@app.post("/integrations/disable")
+async def disable_integration(body: dict):
+    """Disable a platform integration."""
+    platform = body.get("platform", "").lower()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fazle_social_integrations SET enabled = FALSE, updated_at = NOW() WHERE platform = %s",
+                (platform,),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Integration not found")
+        conn.commit()
+    return {"status": "disabled", "platform": platform}
+
+
+# ── Integration Status (Testing) ───────────────────────────
+
+@app.get("/integration/status")
+async def integration_status():
+    """Return connected platforms, webhook status, last message timestamp."""
+    platforms = []
+    for p in ("whatsapp", "facebook"):
+        with _get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT platform, enabled, webhook_url FROM fazle_social_integrations WHERE platform = %s",
+                    (p,),
+                )
+                row = cur.fetchone()
+                cur.execute(
+                    "SELECT MAX(created_at) as last_message FROM fazle_social_messages WHERE platform = %s",
+                    (p,),
+                )
+                last_msg = cur.fetchone()
+        platforms.append({
+            "platform": p,
+            "connected": bool(row and row["enabled"]),
+            "webhook_url": (row or {}).get("webhook_url", ""),
+            "last_message_at": str(last_msg["last_message"]) if last_msg and last_msg["last_message"] else None,
+        })
+    return {"platforms": platforms, "service": "fazle-social-engine", "version": "2.0.0"}
+
+
+# ── Webhook Endpoints ──────────────────────────────────────
+
+@app.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(request: Request):
+    """WhatsApp webhook verification (GET). Meta sends hub.challenge."""
+    params = request.query_params
+    mode = params.get("hub.mode", "")
+    token = params.get("hub.verify_token", "")
+    challenge = params.get("hub.challenge", "")
+
+    # Check verify_token against DB or env
+    creds = _get_integration_creds("whatsapp")
+    expected_token = creds.get("verify_token", "")
+    if not expected_token:
+        raise HTTPException(status_code=403, detail="Verify token not configured")
+
+    if mode == "subscribe" and token == expected_token:
+        return int(challenge) if challenge.isdigit() else challenge
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook_receive(request: Request):
+    """Receive incoming WhatsApp messages via Meta webhook."""
+    payload = await request.json()
+    result = await handle_whatsapp_webhook(payload, _get_conn, settings.brain_url, _get_integration_creds)
+    # Trigger workflow automation
+    await trigger_workflow(settings.workflow_engine_url, "whatsapp.message.received", result)
+    return {"status": "ok"}
+
+
+@app.get("/facebook/webhook")
+async def facebook_webhook_verify(request: Request):
+    """Facebook webhook verification (GET)."""
+    params = request.query_params
+    mode = params.get("hub.mode", "")
+    token = params.get("hub.verify_token", "")
+    challenge = params.get("hub.challenge", "")
+
+    creds = _get_integration_creds("facebook")
+    expected_token = creds.get("verify_token", "")
+    if not expected_token:
+        raise HTTPException(status_code=403, detail="Verify token not configured")
+
+    if mode == "subscribe" and token == expected_token:
+        return int(challenge) if challenge.isdigit() else challenge
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/facebook/webhook")
+async def facebook_webhook_receive(request: Request):
+    """Receive incoming Facebook events via webhook."""
+    payload = await request.json()
+    result = await handle_facebook_webhook(payload, _get_conn, settings.brain_url, _get_integration_creds)
+    await trigger_workflow(settings.workflow_engine_url, "facebook.comment.received", result)
+    return {"status": "ok"}
+
+
 # ── WhatsApp endpoints ─────────────────────────────────────
 
 @app.post("/whatsapp/send")
@@ -180,7 +474,6 @@ async def whatsapp_send(body: dict):
     if not to or not message:
         raise HTTPException(status_code=400, detail="'to' and 'message' are required")
 
-    # If auto_reply, use Brain to generate response
     if auto_reply:
         ai_reply = await generate_ai_reply(message)
         if ai_reply:
@@ -190,32 +483,22 @@ async def whatsapp_send(body: dict):
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO fazle_social_messages (platform, direction, contact_identifier, content, metadata, status)
-                   VALUES ('whatsapp', 'outgoing', %s, %s, %s, 'queued')""",
-                (to, message, psycopg2.extras.Json(body.get("metadata", {}))),
+                """INSERT INTO fazle_social_messages
+                   (platform, direction, contact_identifier, message_text, content, metadata, status)
+                   VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s, 'queued')""",
+                (to, message, message, psycopg2.extras.Json(body.get("metadata", {}))),
             )
         conn.commit()
 
-    # Send via WhatsApp Business API if configured
-    sent = False
-    if settings.whatsapp_api_url and settings.whatsapp_api_token:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"{settings.whatsapp_api_url}/{settings.whatsapp_phone_number_id}/messages",
-                    headers={"Authorization": f"Bearer {settings.whatsapp_api_token}"},
-                    json={
-                        "messaging_product": "whatsapp",
-                        "to": to,
-                        "type": "text",
-                        "text": {"body": message},
-                    },
-                )
-                sent = resp.status_code == 200
-        except Exception as e:
-            logger.error(f"WhatsApp API send failed: {e}")
+    # Send via WhatsApp Business API
+    creds = _get_integration_creds("whatsapp")
+    api_url = creds.get("whatsapp_api_url") or settings.whatsapp_api_url
+    token = creds.get("access_token") or settings.whatsapp_api_token
+    phone_id = creds.get("phone_number_id") or settings.whatsapp_phone_number_id
 
-    return {"status": "sent" if sent else "queued", "to": to, "message": message}
+    result = await wa_module.send_message(api_url, token, phone_id, to, message)
+
+    return {"status": "sent" if result.get("sent") else "queued", "to": to, "message": message}
 
 
 @app.post("/whatsapp/schedule")
@@ -250,7 +533,6 @@ async def whatsapp_broadcast(body: dict):
     if not contacts or not message:
         raise HTTPException(status_code=400, detail="'contacts' and 'message' are required")
 
-    # Store as campaign
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -258,12 +540,14 @@ async def whatsapp_broadcast(body: dict):
                    (name, platform, campaign_type, config, status)
                    VALUES (%s, 'whatsapp', 'broadcast', %s, 'running')
                    RETURNING id""",
-                (body.get("name", f"Broadcast {datetime.utcnow().strftime('%Y-%m-%d')}"),
+                (body.get("name", f"Broadcast {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"),
                  psycopg2.extras.Json({"contacts": contacts, "message": message})),
             )
             conn.commit()
             campaign_id = str(cur.fetchone()["id"])
 
+    await trigger_workflow(settings.workflow_engine_url, "social.campaign.started",
+                           {"campaign_id": campaign_id, "platform": "whatsapp"})
     return {"status": "broadcast_queued", "campaign_id": campaign_id, "contact_count": len(contacts)}
 
 
@@ -272,7 +556,7 @@ async def whatsapp_messages(limit: int = 50):
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """SELECT id, direction, contact_identifier, content, status, created_at
+                """SELECT id, direction, contact_identifier, content, message_text, ai_response, status, created_at
                    FROM fazle_social_messages
                    WHERE platform = 'whatsapp'
                    ORDER BY created_at DESC LIMIT %s""",
@@ -319,7 +603,6 @@ async def facebook_post(body: dict):
         raise HTTPException(status_code=400, detail="Content is required")
 
     if schedule_at:
-        # Schedule the post
         with _get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
@@ -334,22 +617,12 @@ async def facebook_post(body: dict):
                 row["id"] = str(row["id"])
         return {"status": "scheduled", **row}
 
-    # Post immediately via Graph API if configured
-    post_id = None
-    if settings.facebook_page_access_token and settings.facebook_page_id:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                payload = {"message": content, "access_token": settings.facebook_page_access_token}
-                if body.get("image_url"):
-                    payload["url"] = body["image_url"]
-                    endpoint = f"https://graph.facebook.com/v19.0/{settings.facebook_page_id}/photos"
-                else:
-                    endpoint = f"https://graph.facebook.com/v19.0/{settings.facebook_page_id}/feed"
-                resp = await client.post(endpoint, data=payload)
-                if resp.status_code == 200:
-                    post_id = resp.json().get("id")
-        except Exception as e:
-            logger.error(f"Facebook API post failed: {e}")
+    # Post immediately via Graph API
+    creds = _get_integration_creds("facebook")
+    token = creds.get("page_access_token") or creds.get("access_token", "")
+    page_id = creds.get("page_id") or settings.facebook_page_id
+    result = await fb_module.create_post(page_id, token, content, body.get("image_url"))
+    post_id = result.get("post_id")
 
     # Store in DB
     with _get_conn() as conn:
@@ -363,6 +636,8 @@ async def facebook_post(body: dict):
             conn.commit()
             db_id = str(cur.fetchone()["id"])
 
+    await trigger_workflow(settings.workflow_engine_url, "facebook.post.created",
+                           {"post_id": post_id, "content": content[:200]})
     return {"status": "published" if post_id else "draft", "id": db_id, "post_id": post_id, "content": content}
 
 
@@ -386,20 +661,12 @@ async def facebook_comment(body: dict):
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
-    sent = False
     target = comment_id or post_id
-    if settings.facebook_page_access_token:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"https://graph.facebook.com/v19.0/{target}/comments",
-                    data={"message": message, "access_token": settings.facebook_page_access_token},
-                )
-                sent = resp.status_code == 200
-        except Exception as e:
-            logger.error(f"Facebook comment API failed: {e}")
+    creds = _get_integration_creds("facebook")
+    token = creds.get("page_access_token") or creds.get("access_token", "")
+    result = await fb_module.reply_to_comment(target, token, message)
 
-    return {"status": "sent" if sent else "queued", "target": target, "message": message}
+    return {"status": "sent" if result.get("sent") else "queued", "target": target, "message": message}
 
 
 @app.post("/facebook/react")
@@ -411,23 +678,11 @@ async def facebook_react(body: dict):
     if not target_id:
         raise HTTPException(status_code=400, detail="'target_id' is required")
 
-    valid_reactions = {"LIKE", "LOVE", "HAHA", "WOW", "SAD", "ANGRY"}
-    if reaction_type.upper() not in valid_reactions:
-        raise HTTPException(status_code=400, detail=f"Invalid reaction. Must be one of: {', '.join(valid_reactions)}")
+    creds = _get_integration_creds("facebook")
+    token = creds.get("page_access_token") or creds.get("access_token", "")
+    result = await fb_module.react_to_post(target_id, token, reaction_type)
 
-    sent = False
-    if settings.facebook_page_access_token:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"https://graph.facebook.com/v19.0/{target_id}/reactions",
-                    data={"type": reaction_type.upper(), "access_token": settings.facebook_page_access_token},
-                )
-                sent = resp.status_code == 200
-        except Exception as e:
-            logger.error(f"Facebook react API failed: {e}")
-
-    return {"status": "sent" if sent else "queued", "target_id": target_id, "reaction": reaction_type}
+    return {"status": "sent" if result.get("sent") else "queued", "target_id": target_id, "reaction": reaction_type}
 
 
 @app.get("/facebook/posts")
@@ -497,10 +752,14 @@ async def add_contact(body: dict):
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """INSERT INTO fazle_social_contacts (name, platform, identifier, metadata)
-                   VALUES (%s, %s, %s, %s)
+                """INSERT INTO fazle_social_contacts
+                   (name, platform, identifier, phone_number, profile_link, metadata)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (platform, identifier) DO UPDATE SET name = EXCLUDED.name
                    RETURNING id, name, platform, identifier""",
-                (name, platform, identifier, psycopg2.extras.Json(body.get("metadata", {}))),
+                (name, platform, identifier,
+                 body.get("phone_number", ""), body.get("profile_link", ""),
+                 psycopg2.extras.Json(body.get("metadata", {}))),
             )
             conn.commit()
             contact = dict(cur.fetchone())

@@ -15,17 +15,19 @@ import {
   type SocialContact,
   type Campaign,
   type ScheduledItem,
+  type SocialIntegration,
 } from '@/services/social';
 import {
   MessageCircle, Facebook, Send, Clock, Users, Megaphone,
   Loader2, RefreshCw, Plus, CheckCircle2, XCircle, Bot,
-  CalendarClock, BarChart3, UserPlus,
+  CalendarClock, BarChart3, UserPlus, Settings, Plug,
+  Power, PowerOff, TestTube, Eye, EyeOff, Shield,
 } from 'lucide-react';
 
-type Tab = 'whatsapp' | 'facebook' | 'campaigns';
+type Tab = 'integrations' | 'whatsapp' | 'facebook';
 
 export default function SocialPage() {
-  const [tab, setTab] = React.useState<Tab>('whatsapp');
+  const [tab, setTab] = React.useState<Tab>('integrations');
   const [stats, setStats] = React.useState<SocialStats | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [message, setMessage] = React.useState<{ text: string; type: 'success' | 'error' } | null>(null);
@@ -129,9 +131,9 @@ export default function SocialPage() {
       {/* Tabs */}
       <div className="flex gap-1 border-b">
         {([
+          { key: 'integrations' as const, label: 'Integrations', icon: Settings },
           { key: 'whatsapp' as const, label: 'WhatsApp Bot', icon: MessageCircle },
           { key: 'facebook' as const, label: 'Facebook Bot', icon: Facebook },
-          { key: 'campaigns' as const, label: 'Campaigns', icon: Megaphone },
         ]).map((t) => (
           <button
             key={t.key}
@@ -149,9 +151,335 @@ export default function SocialPage() {
       </div>
 
       {/* Tab Content */}
+      {tab === 'integrations' && <IntegrationsTab onMsg={showMsg} />}
       {tab === 'whatsapp' && <WhatsAppTab onMsg={showMsg} />}
       {tab === 'facebook' && <FacebookTab onMsg={showMsg} />}
-      {tab === 'campaigns' && <CampaignsTab onMsg={showMsg} />}
+    </div>
+  );
+}
+
+/* ─── Integrations Tab ─────────────────────────────────── */
+
+function IntegrationsTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'error') => void }) {
+  const [integrations, setIntegrations] = React.useState<SocialIntegration[]>([]);
+  const [loadingInt, setLoadingInt] = React.useState(true);
+  const [showSecrets, setShowSecrets] = React.useState<Record<string, boolean>>({});
+  const [testing, setTesting] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState<string | null>(null);
+
+  // WhatsApp form
+  const [waForm, setWaForm] = React.useState({
+    app_id: '', app_secret: '', access_token: '', phone_number: '',
+    phone_number_id: '', waba_id: '', verify_token: '', webhook_url: '',
+  });
+
+  // Facebook form
+  const [fbForm, setFbForm] = React.useState({
+    app_id: '', app_secret: '', access_token: '', page_id: '',
+    verify_token: '', webhook_url: '',
+  });
+
+  const fetchIntegrations = React.useCallback(async () => {
+    try {
+      const data = await socialService.listIntegrations();
+      setIntegrations(data.integrations || []);
+      // Pre-fill forms from existing integrations
+      const wa = data.integrations?.find((i: SocialIntegration) => i.platform === 'whatsapp');
+      if (wa) {
+        setWaForm({
+          app_id: wa.app_id || '',
+          app_secret: '', // masked — don't pre-fill secrets
+          access_token: '',
+          phone_number: wa.phone_number || '',
+          phone_number_id: wa.phone_number_id || '',
+          waba_id: wa.waba_id || '',
+          verify_token: wa.verify_token || '',
+          webhook_url: wa.webhook_url || '',
+        });
+      }
+      const fb = data.integrations?.find((i: SocialIntegration) => i.platform === 'facebook');
+      if (fb) {
+        setFbForm({
+          app_id: fb.app_id || '',
+          app_secret: '',
+          access_token: '',
+          page_id: fb.page_id || '',
+          verify_token: fb.verify_token || '',
+          webhook_url: fb.webhook_url || '',
+        });
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      setLoadingInt(false);
+    }
+  }, []);
+
+  React.useEffect(() => { fetchIntegrations(); }, [fetchIntegrations]);
+
+  const handleSave = async (platform: string) => {
+    setSaving(platform);
+    try {
+      const data = platform === 'whatsapp'
+        ? { platform, ...waForm }
+        : { platform, ...fbForm };
+      // Remove empty secret fields so we don't overwrite with empty
+      const cleaned: Record<string, string> = { platform };
+      for (const [k, v] of Object.entries(data)) {
+        if (v) cleaned[k] = v;
+      }
+      await socialService.saveIntegration(cleaned);
+      onMsg(`${platform} integration saved`);
+      fetchIntegrations();
+    } catch {
+      onMsg(`Failed to save ${platform} integration`, 'error');
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const handleTest = async (platform: string) => {
+    setTesting(platform);
+    try {
+      const result = await socialService.testIntegration(platform);
+      if (result.connected) {
+        onMsg(`${platform} connection successful!`);
+      } else {
+        onMsg(`${platform} connection failed: ${result.error || 'Unknown error'}`, 'error');
+      }
+    } catch {
+      onMsg(`${platform} test failed`, 'error');
+    } finally {
+      setTesting(null);
+    }
+  };
+
+  const handleToggle = async (platform: string, enabled: boolean) => {
+    try {
+      if (enabled) {
+        await socialService.disableIntegration(platform);
+        onMsg(`${platform} disabled`);
+      } else {
+        await socialService.enableIntegration(platform);
+        onMsg(`${platform} enabled`);
+      }
+      fetchIntegrations();
+    } catch {
+      onMsg(`Failed to toggle ${platform}`, 'error');
+    }
+  };
+
+  const getIntegration = (platform: string) => integrations.find(i => i.platform === platform);
+
+  if (loadingInt) {
+    return <div className="flex justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* WhatsApp Integration */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2">
+              <MessageCircle className="h-5 w-5 text-green-500" />
+              WhatsApp Business Integration
+            </CardTitle>
+            <div className="flex items-center gap-2">
+              {getIntegration('whatsapp') && (
+                <>
+                  <Badge variant={getIntegration('whatsapp')?.enabled ? 'default' : 'secondary'}>
+                    {getIntegration('whatsapp')?.enabled ? <Power className="mr-1 h-3 w-3" /> : <PowerOff className="mr-1 h-3 w-3" />}
+                    {getIntegration('whatsapp')?.enabled ? 'Enabled' : 'Disabled'}
+                  </Badge>
+                  <Button
+                    variant="outline" size="sm"
+                    onClick={() => handleToggle('whatsapp', getIntegration('whatsapp')!.enabled)}
+                  >
+                    {getIntegration('whatsapp')?.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <Label>App ID</Label>
+              <Input value={waForm.app_id} onChange={(e) => setWaForm({ ...waForm, app_id: e.target.value })} placeholder="Meta App ID" />
+            </div>
+            <div>
+              <Label className="flex items-center gap-1">
+                App Secret <Shield className="h-3 w-3 text-muted-foreground" />
+              </Label>
+              <div className="relative">
+                <Input
+                  type={showSecrets['wa_secret'] ? 'text' : 'password'}
+                  value={waForm.app_secret}
+                  onChange={(e) => setWaForm({ ...waForm, app_secret: e.target.value })}
+                  placeholder="Leave empty to keep existing"
+                />
+                <button
+                  onClick={() => setShowSecrets(s => ({ ...s, wa_secret: !s.wa_secret }))}
+                  className="absolute right-2 top-2.5 text-muted-foreground hover:text-foreground"
+                  type="button"
+                >
+                  {showSecrets['wa_secret'] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+            <div>
+              <Label className="flex items-center gap-1">
+                Access Token <Shield className="h-3 w-3 text-muted-foreground" />
+              </Label>
+              <div className="relative">
+                <Input
+                  type={showSecrets['wa_token'] ? 'text' : 'password'}
+                  value={waForm.access_token}
+                  onChange={(e) => setWaForm({ ...waForm, access_token: e.target.value })}
+                  placeholder="Leave empty to keep existing"
+                />
+                <button
+                  onClick={() => setShowSecrets(s => ({ ...s, wa_token: !s.wa_token }))}
+                  className="absolute right-2 top-2.5 text-muted-foreground hover:text-foreground"
+                  type="button"
+                >
+                  {showSecrets['wa_token'] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+            <div>
+              <Label>Phone Number</Label>
+              <Input value={waForm.phone_number} onChange={(e) => setWaForm({ ...waForm, phone_number: e.target.value })} placeholder="+880..." />
+            </div>
+            <div>
+              <Label>Phone Number ID</Label>
+              <Input value={waForm.phone_number_id} onChange={(e) => setWaForm({ ...waForm, phone_number_id: e.target.value })} placeholder="Meta Phone Number ID" />
+            </div>
+            <div>
+              <Label>WABA ID</Label>
+              <Input value={waForm.waba_id} onChange={(e) => setWaForm({ ...waForm, waba_id: e.target.value })} placeholder="WhatsApp Business Account ID" />
+            </div>
+            <div>
+              <Label>Verify Token</Label>
+              <Input value={waForm.verify_token} onChange={(e) => setWaForm({ ...waForm, verify_token: e.target.value })} placeholder="Webhook verify token" />
+            </div>
+            <div>
+              <Label>Webhook URL</Label>
+              <Input value={waForm.webhook_url} onChange={(e) => setWaForm({ ...waForm, webhook_url: e.target.value })} placeholder="https://yourdomain.com/api/fazle/social/whatsapp/webhook" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button onClick={() => handleSave('whatsapp')} disabled={saving === 'whatsapp'}>
+              {saving === 'whatsapp' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plug className="mr-2 h-4 w-4" />}
+              Save WhatsApp
+            </Button>
+            <Button variant="outline" onClick={() => handleTest('whatsapp')} disabled={testing === 'whatsapp'}>
+              {testing === 'whatsapp' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <TestTube className="mr-2 h-4 w-4" />}
+              Test Connection
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Facebook Integration */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Facebook className="h-5 w-5 text-blue-500" />
+              Facebook Page Integration
+            </CardTitle>
+            <div className="flex items-center gap-2">
+              {getIntegration('facebook') && (
+                <>
+                  <Badge variant={getIntegration('facebook')?.enabled ? 'default' : 'secondary'}>
+                    {getIntegration('facebook')?.enabled ? <Power className="mr-1 h-3 w-3" /> : <PowerOff className="mr-1 h-3 w-3" />}
+                    {getIntegration('facebook')?.enabled ? 'Enabled' : 'Disabled'}
+                  </Badge>
+                  <Button
+                    variant="outline" size="sm"
+                    onClick={() => handleToggle('facebook', getIntegration('facebook')!.enabled)}
+                  >
+                    {getIntegration('facebook')?.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <Label>App ID</Label>
+              <Input value={fbForm.app_id} onChange={(e) => setFbForm({ ...fbForm, app_id: e.target.value })} placeholder="Facebook App ID" />
+            </div>
+            <div>
+              <Label className="flex items-center gap-1">
+                App Secret <Shield className="h-3 w-3 text-muted-foreground" />
+              </Label>
+              <div className="relative">
+                <Input
+                  type={showSecrets['fb_secret'] ? 'text' : 'password'}
+                  value={fbForm.app_secret}
+                  onChange={(e) => setFbForm({ ...fbForm, app_secret: e.target.value })}
+                  placeholder="Leave empty to keep existing"
+                />
+                <button
+                  onClick={() => setShowSecrets(s => ({ ...s, fb_secret: !s.fb_secret }))}
+                  className="absolute right-2 top-2.5 text-muted-foreground hover:text-foreground"
+                  type="button"
+                >
+                  {showSecrets['fb_secret'] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+            <div>
+              <Label className="flex items-center gap-1">
+                Page Access Token <Shield className="h-3 w-3 text-muted-foreground" />
+              </Label>
+              <div className="relative">
+                <Input
+                  type={showSecrets['fb_token'] ? 'text' : 'password'}
+                  value={fbForm.access_token}
+                  onChange={(e) => setFbForm({ ...fbForm, access_token: e.target.value })}
+                  placeholder="Leave empty to keep existing"
+                />
+                <button
+                  onClick={() => setShowSecrets(s => ({ ...s, fb_token: !s.fb_token }))}
+                  className="absolute right-2 top-2.5 text-muted-foreground hover:text-foreground"
+                  type="button"
+                >
+                  {showSecrets['fb_token'] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+            <div>
+              <Label>Page ID</Label>
+              <Input value={fbForm.page_id} onChange={(e) => setFbForm({ ...fbForm, page_id: e.target.value })} placeholder="Facebook Page ID" />
+            </div>
+            <div>
+              <Label>Verify Token</Label>
+              <Input value={fbForm.verify_token} onChange={(e) => setFbForm({ ...fbForm, verify_token: e.target.value })} placeholder="Webhook verify token" />
+            </div>
+            <div>
+              <Label>Webhook URL</Label>
+              <Input value={fbForm.webhook_url} onChange={(e) => setFbForm({ ...fbForm, webhook_url: e.target.value })} placeholder="https://yourdomain.com/api/fazle/social/facebook/webhook" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button onClick={() => handleSave('facebook')} disabled={saving === 'facebook'}>
+              {saving === 'facebook' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plug className="mr-2 h-4 w-4" />}
+              Save Facebook
+            </Button>
+            <Button variant="outline" onClick={() => handleTest('facebook')} disabled={testing === 'facebook'}>
+              {testing === 'facebook' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <TestTube className="mr-2 h-4 w-4" />}
+              Test Connection
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -175,6 +503,12 @@ function WhatsAppTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
   const [schedTo, setSchedTo] = React.useState('');
   const [schedMsg, setSchedMsg] = React.useState('');
   const [schedAt, setSchedAt] = React.useState('');
+
+  // Broadcast form
+  const [showBroadcast, setShowBroadcast] = React.useState(false);
+  const [broadcastMsg, setBroadcastMsg] = React.useState('');
+  const [broadcastContacts, setBroadcastContacts] = React.useState<string[]>([]);
+  const [broadcastName, setBroadcastName] = React.useState('');
 
   // Add contact
   const [showAddContact, setShowAddContact] = React.useState(false);
@@ -230,6 +564,24 @@ function WhatsAppTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
     }
   };
 
+  const handleBroadcast = async () => {
+    if (broadcastContacts.length === 0 || !broadcastMsg.trim()) return;
+    try {
+      await socialService.whatsappBroadcast({
+        contacts: broadcastContacts,
+        message: broadcastMsg.trim(),
+        name: broadcastName.trim() || undefined,
+      });
+      onMsg(`Broadcast queued to ${broadcastContacts.length} contacts`);
+      setShowBroadcast(false);
+      setBroadcastMsg('');
+      setBroadcastContacts([]);
+      setBroadcastName('');
+    } catch {
+      onMsg('Broadcast failed', 'error');
+    }
+  };
+
   const handleAddContact = async () => {
     if (!newContact.name.trim() || !newContact.identifier.trim()) return;
     try {
@@ -274,6 +626,9 @@ function WhatsAppTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
             <Button variant="outline" onClick={() => setShowSchedule(!showSchedule)}>
               <Clock className="mr-2 h-4 w-4" /> Schedule
             </Button>
+            <Button variant="outline" onClick={() => setShowBroadcast(!showBroadcast)}>
+              <Megaphone className="mr-2 h-4 w-4" /> Broadcast
+            </Button>
             <Button variant="outline" onClick={() => setShowAddContact(!showAddContact)}>
               <UserPlus className="mr-2 h-4 w-4" /> Add Contact
             </Button>
@@ -296,6 +651,51 @@ function WhatsAppTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
                 <CalendarClock className="mr-2 h-4 w-4" /> Schedule
               </Button>
               <Button variant="outline" onClick={() => setShowSchedule(false)}>Cancel</Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Broadcast Form */}
+      {showBroadcast && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">Broadcast Message</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <div>
+              <Label>Campaign Name (optional)</Label>
+              <Input value={broadcastName} onChange={(e) => setBroadcastName(e.target.value)} placeholder="Weekly Update" />
+            </div>
+            <Textarea value={broadcastMsg} onChange={(e) => setBroadcastMsg(e.target.value)} placeholder="Broadcast message..." rows={2} />
+            <div>
+              <Label>Select Contacts ({broadcastContacts.length} selected)</Label>
+              <div className="border rounded-lg p-2 max-h-40 overflow-y-auto space-y-1 mt-1">
+                {contacts.length === 0 ? (
+                  <p className="text-sm text-muted-foreground text-center py-2">No contacts. Add contacts first.</p>
+                ) : contacts.map((c) => (
+                  <label key={c.id} className="flex items-center gap-2 text-sm cursor-pointer py-1 px-1 hover:bg-muted rounded">
+                    <input
+                      type="checkbox"
+                      checked={broadcastContacts.includes(c.identifier)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setBroadcastContacts([...broadcastContacts, c.identifier]);
+                        } else {
+                          setBroadcastContacts(broadcastContacts.filter(id => id !== c.identifier));
+                        }
+                      }}
+                      className="rounded"
+                    />
+                    <span className="font-medium">{c.name}</span>
+                    <span className="text-xs text-muted-foreground">{c.identifier}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <Button onClick={handleBroadcast} disabled={broadcastContacts.length === 0 || !broadcastMsg.trim()}>
+                <Megaphone className="mr-2 h-4 w-4" /> Send Broadcast
+              </Button>
+              <Button variant="outline" onClick={() => setShowBroadcast(false)}>Cancel</Button>
             </div>
           </CardContent>
         </Card>
@@ -376,7 +776,12 @@ function WhatsAppTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
                     <span className="text-xs font-medium">{m.direction === 'outgoing' ? 'Sent' : 'Received'} → {m.contact_identifier}</span>
                     <Badge variant="outline" className="text-xs">{m.status}</Badge>
                   </div>
-                  <p>{m.content}</p>
+                  <p>{m.content || m.message_text}</p>
+                  {m.ai_response && (
+                    <div className="mt-1 pt-1 border-t text-xs text-muted-foreground">
+                      <Bot className="inline h-3 w-3 mr-1" />AI: {m.ai_response}
+                    </div>
+                  )}
                   <p className="text-xs text-muted-foreground mt-1">{new Date(m.created_at).toLocaleString()}</p>
                 </div>
               ))}
@@ -402,6 +807,17 @@ function FacebookTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
   const [prompt, setPrompt] = React.useState('');
   const [scheduleAt, setScheduleAt] = React.useState('');
   const [posting, setPosting] = React.useState(false);
+
+  // Comment form
+  const [showComment, setShowComment] = React.useState(false);
+  const [commentTarget, setCommentTarget] = React.useState('');
+  const [commentMsg, setCommentMsg] = React.useState('');
+  const [commentAutoReply, setCommentAutoReply] = React.useState(false);
+
+  // React form
+  const [showReact, setShowReact] = React.useState(false);
+  const [reactTarget, setReactTarget] = React.useState('');
+  const [reactType, setReactType] = React.useState('LIKE');
 
   const fetchAll = React.useCallback(async () => {
     try {
@@ -445,6 +861,36 @@ function FacebookTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
     }
   };
 
+  const handleComment = async () => {
+    if (!commentTarget.trim() || (!commentMsg.trim() && !commentAutoReply)) return;
+    try {
+      await socialService.facebookComment({
+        post_id: commentTarget.trim(),
+        message: commentMsg.trim() || undefined,
+        auto_reply: commentAutoReply,
+        original_comment: commentAutoReply ? commentMsg.trim() : undefined,
+      });
+      onMsg('Comment sent');
+      setShowComment(false);
+      setCommentTarget('');
+      setCommentMsg('');
+    } catch {
+      onMsg('Comment failed', 'error');
+    }
+  };
+
+  const handleReact = async () => {
+    if (!reactTarget.trim()) return;
+    try {
+      await socialService.facebookReact(reactTarget.trim(), reactType);
+      onMsg(`Reacted with ${reactType}`);
+      setShowReact(false);
+      setReactTarget('');
+    } catch {
+      onMsg('React failed', 'error');
+    }
+  };
+
   if (loadingPosts) {
     return <div className="flex justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
   }
@@ -483,12 +929,84 @@ function FacebookTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
             </div>
           </div>
 
-          <Button onClick={handlePost} disabled={posting || (aiGenerate ? !prompt.trim() : !content.trim())}>
-            {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Send className="mr-2 h-4 w-4" />}
-            {scheduleAt ? 'Schedule Post' : 'Publish Now'}
-          </Button>
+          <div className="flex gap-2">
+            <Button onClick={handlePost} disabled={posting || (aiGenerate ? !prompt.trim() : !content.trim())}>
+              {posting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Send className="mr-2 h-4 w-4" />}
+              {scheduleAt ? 'Schedule Post' : 'Publish Now'}
+            </Button>
+            <Button variant="outline" onClick={() => setShowComment(!showComment)}>
+              <MessageCircle className="mr-2 h-4 w-4" /> Comment
+            </Button>
+            <Button variant="outline" onClick={() => setShowReact(!showReact)}>
+              <Plus className="mr-2 h-4 w-4" /> React
+            </Button>
+          </div>
         </CardContent>
       </Card>
+
+      {/* Comment Form */}
+      {showComment && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">Reply to Comment</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 md:grid-cols-2">
+              <div>
+                <Label>Post/Comment ID</Label>
+                <Input value={commentTarget} onChange={(e) => setCommentTarget(e.target.value)} placeholder="Post or Comment ID" />
+              </div>
+              <div className="flex items-end">
+                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                  <input type="checkbox" checked={commentAutoReply} onChange={(e) => setCommentAutoReply(e.target.checked)} className="rounded" />
+                  <Bot className="h-4 w-4" /> AI Auto-Reply
+                </label>
+              </div>
+            </div>
+            <Textarea value={commentMsg} onChange={(e) => setCommentMsg(e.target.value)} placeholder={commentAutoReply ? "Original comment text for AI to reply to..." : "Your reply..."} rows={2} />
+            <div className="flex gap-2">
+              <Button onClick={handleComment} disabled={!commentTarget.trim()}>
+                <Send className="mr-2 h-4 w-4" /> Send Reply
+              </Button>
+              <Button variant="outline" onClick={() => setShowComment(false)}>Cancel</Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* React Form */}
+      {showReact && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">React to Post</CardTitle></CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 md:grid-cols-2">
+              <div>
+                <Label>Post/Comment ID</Label>
+                <Input value={reactTarget} onChange={(e) => setReactTarget(e.target.value)} placeholder="Target ID" />
+              </div>
+              <div>
+                <Label>Reaction</Label>
+                <select
+                  value={reactType}
+                  onChange={(e) => setReactType(e.target.value)}
+                  className="w-full border rounded px-3 py-2 text-sm bg-background"
+                >
+                  <option value="LIKE">LIKE</option>
+                  <option value="LOVE">LOVE</option>
+                  <option value="HAHA">HAHA</option>
+                  <option value="WOW">WOW</option>
+                  <option value="SAD">SAD</option>
+                  <option value="ANGRY">ANGRY</option>
+                </select>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <Button onClick={handleReact} disabled={!reactTarget.trim()}>
+                React
+              </Button>
+              <Button variant="outline" onClick={() => setShowReact(false)}>Cancel</Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid gap-4 md:grid-cols-2">
         {/* Scheduled */}
@@ -550,133 +1068,13 @@ function FacebookTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'erro
                   </div>
                   <p className="line-clamp-3">{p.content}</p>
                   {p.image_url && <p className="text-xs text-blue-500 mt-1 truncate">{p.image_url}</p>}
+                  {p.post_id && <p className="text-xs text-muted-foreground mt-1">ID: {p.post_id}</p>}
                 </div>
               ))}
             </div>
           )}
         </CardContent>
       </Card>
-    </div>
-  );
-}
-
-/* ─── Campaigns Tab ────────────────────────────────────── */
-
-function CampaignsTab({ onMsg }: { onMsg: (text: string, type?: 'success' | 'error') => void }) {
-  const [campaigns, setCampaigns] = React.useState<Campaign[]>([]);
-  const [loadingCampaigns, setLoadingCampaigns] = React.useState(true);
-  const [showCreate, setShowCreate] = React.useState(false);
-  const [creating, setCreating] = React.useState(false);
-  const [newCampaign, setNewCampaign] = React.useState({ name: '', platform: 'whatsapp', campaign_type: 'broadcast' });
-
-  const fetchCampaigns = React.useCallback(async () => {
-    try {
-      const data = await socialService.listCampaigns();
-      setCampaigns(data.campaigns || []);
-    } catch {
-      /* ignore */
-    } finally {
-      setLoadingCampaigns(false);
-    }
-  }, []);
-
-  React.useEffect(() => { fetchCampaigns(); }, [fetchCampaigns]);
-
-  const handleCreate = async () => {
-    if (!newCampaign.name.trim()) return;
-    setCreating(true);
-    try {
-      await socialService.createCampaign(newCampaign);
-      onMsg('Campaign created');
-      setNewCampaign({ name: '', platform: 'whatsapp', campaign_type: 'broadcast' });
-      setShowCreate(false);
-      fetchCampaigns();
-    } catch {
-      onMsg('Failed to create campaign', 'error');
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  if (loadingCampaigns) {
-    return <div className="flex justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>;
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="flex justify-end">
-        <Button size="sm" onClick={() => setShowCreate(!showCreate)}>
-          <Plus className="mr-2 h-4 w-4" /> New Campaign
-        </Button>
-      </div>
-
-      {showCreate && (
-        <Card>
-          <CardHeader><CardTitle className="text-base">Create Campaign</CardTitle></CardHeader>
-          <CardContent className="space-y-3">
-            <div className="grid gap-3 md:grid-cols-3">
-              <div>
-                <Label>Campaign Name</Label>
-                <Input value={newCampaign.name} onChange={(e) => setNewCampaign({ ...newCampaign, name: e.target.value })} placeholder="e.g. Weekly Update" />
-              </div>
-              <div>
-                <Label>Platform</Label>
-                <select value={newCampaign.platform} onChange={(e) => setNewCampaign({ ...newCampaign, platform: e.target.value })} className="w-full border rounded px-3 py-2 text-sm bg-background">
-                  <option value="whatsapp">WhatsApp</option>
-                  <option value="facebook">Facebook</option>
-                </select>
-              </div>
-              <div>
-                <Label>Type</Label>
-                <select value={newCampaign.campaign_type} onChange={(e) => setNewCampaign({ ...newCampaign, campaign_type: e.target.value })} className="w-full border rounded px-3 py-2 text-sm bg-background">
-                  <option value="broadcast">Broadcast</option>
-                  <option value="drip">Drip</option>
-                  <option value="engagement">Engagement</option>
-                </select>
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <Button onClick={handleCreate} disabled={creating || !newCampaign.name.trim()}>
-                {creating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                Create
-              </Button>
-              <Button variant="outline" onClick={() => setShowCreate(false)}>Cancel</Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {campaigns.length === 0 ? (
-        <Card>
-          <CardContent className="py-12 text-center text-muted-foreground">
-            <Megaphone className="h-12 w-12 mx-auto mb-4 opacity-40" />
-            <p>No campaigns yet. Create one to get started.</p>
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="space-y-3">
-          {campaigns.map((c) => (
-            <Card key={c.id}>
-              <CardContent className="py-4">
-                <div className="flex items-center gap-3">
-                  <Megaphone className="h-5 w-5 text-muted-foreground flex-shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{c.name}</p>
-                    <p className="text-sm text-muted-foreground">{c.campaign_type} · {new Date(c.created_at).toLocaleDateString()}</p>
-                  </div>
-                  <Badge variant={c.platform === 'whatsapp' ? 'default' : 'secondary'}>
-                    {c.platform === 'whatsapp' ? <MessageCircle className="mr-1 h-3 w-3" /> : <Facebook className="mr-1 h-3 w-3" />}
-                    {c.platform}
-                  </Badge>
-                  <Badge variant={c.status === 'running' ? 'default' : c.status === 'completed' ? 'outline' : 'secondary'}>
-                    {c.status}
-                  </Badge>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

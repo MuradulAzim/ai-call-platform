@@ -2,7 +2,7 @@
 # Fazle API — Social Engine Proxy Routes
 # WhatsApp + Facebook automation via Social Engine microservice
 # ============================================================
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import httpx
 import logging
 from typing import Optional
@@ -20,79 +20,149 @@ def _get_settings():
     return settings
 
 
+async def _proxy(method: str, path: str, **kwargs):
+    """Helper to proxy requests to the social engine."""
+    settings = _get_settings()
+    url = f"{settings.social_engine_url}{path}"
+    async with httpx.AsyncClient(timeout=kwargs.pop("timeout", 15.0)) as client:
+        try:
+            resp = await getattr(client, method)(url, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPError as e:
+            logger.error(f"Social engine error [{method.upper()} {path}]: {e}")
+            raise HTTPException(status_code=502, detail="Social engine unavailable")
+
+
+# ── Integration Management ─────────────────────────────────
+
+@router.get("/integrations")
+async def list_integrations(user: dict = Depends(require_admin)):
+    """List all social platform integrations (secrets masked)."""
+    return await _proxy("get", "/integrations")
+
+
+@router.post("/integrations/save")
+async def save_integration(body: dict, user: dict = Depends(require_admin)):
+    """Save or update a platform integration (WhatsApp or Facebook)."""
+    result = await _proxy("post", "/integrations/save", json=body, timeout=15.0)
+    log_action(user, "save_integration", target_type="social", detail=body.get("platform", ""))
+    return result
+
+
+@router.post("/integrations/test")
+async def test_integration(body: dict, user: dict = Depends(require_admin)):
+    """Test connectivity for a saved integration."""
+    return await _proxy("post", "/integrations/test", json=body, timeout=15.0)
+
+
+@router.post("/integrations/enable")
+async def enable_integration(body: dict, user: dict = Depends(require_admin)):
+    """Enable a platform integration."""
+    result = await _proxy("post", "/integrations/enable", json=body)
+    log_action(user, "enable_integration", target_type="social", detail=body.get("platform", ""))
+    return result
+
+
+@router.post("/integrations/disable")
+async def disable_integration(body: dict, user: dict = Depends(require_admin)):
+    """Disable a platform integration."""
+    result = await _proxy("post", "/integrations/disable", json=body)
+    log_action(user, "disable_integration", target_type="social", detail=body.get("platform", ""))
+    return result
+
+
+@router.get("/integration/status")
+async def integration_status(user: dict = Depends(require_admin)):
+    """Return connected platforms, webhook status, last message timestamp."""
+    return await _proxy("get", "/integration/status")
+
+
+# ── Webhook Passthrough (public — no auth for Meta verification) ──
+
+@router.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(request: Request):
+    """Public endpoint: Meta sends GET for WhatsApp webhook verification."""
+    settings = _get_settings()
+    params = dict(request.query_params)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{settings.social_engine_url}/whatsapp/webhook", params=params)
+            # Return raw response (could be plain int for challenge)
+            if resp.status_code == 200:
+                return resp.json()
+            raise HTTPException(status_code=resp.status_code, detail="Verification failed")
+        except httpx.HTTPError as e:
+            logger.error(f"WhatsApp webhook verify error: {e}")
+            raise HTTPException(status_code=502, detail="Social engine unavailable")
+
+
+@router.post("/whatsapp/webhook")
+async def whatsapp_webhook_receive(request: Request):
+    """Public endpoint: Meta sends POST for incoming WhatsApp messages."""
+    payload = await request.json()
+    return await _proxy("post", "/whatsapp/webhook", json=payload, timeout=30.0)
+
+
+@router.get("/facebook/webhook")
+async def facebook_webhook_verify(request: Request):
+    """Public endpoint: Meta sends GET for Facebook webhook verification."""
+    settings = _get_settings()
+    params = dict(request.query_params)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{settings.social_engine_url}/facebook/webhook", params=params)
+            if resp.status_code == 200:
+                return resp.json()
+            raise HTTPException(status_code=resp.status_code, detail="Verification failed")
+        except httpx.HTTPError as e:
+            logger.error(f"Facebook webhook verify error: {e}")
+            raise HTTPException(status_code=502, detail="Social engine unavailable")
+
+
+@router.post("/facebook/webhook")
+async def facebook_webhook_receive(request: Request):
+    """Public endpoint: Meta sends POST for incoming Facebook events."""
+    payload = await request.json()
+    return await _proxy("post", "/facebook/webhook", json=payload, timeout=30.0)
+
+
 # ── WhatsApp ────────────────────────────────────────────────
 
 @router.post("/whatsapp/send")
 async def whatsapp_send(body: dict, user: dict = Depends(require_admin)):
     """Send a WhatsApp message."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/whatsapp/send", json=body)
-            resp.raise_for_status()
-            log_action(user, "whatsapp_send", target_type="social", detail=body.get("to", ""))
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine WhatsApp send error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/whatsapp/send", json=body, timeout=30.0)
+    log_action(user, "whatsapp_send", target_type="social", detail=body.get("to", ""))
+    return result
 
 
 @router.post("/whatsapp/schedule")
 async def whatsapp_schedule(body: dict, user: dict = Depends(require_admin)):
     """Schedule a WhatsApp message."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/whatsapp/schedule", json=body)
-            resp.raise_for_status()
-            log_action(user, "whatsapp_schedule", target_type="social")
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine WhatsApp schedule error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/whatsapp/schedule", json=body)
+    log_action(user, "whatsapp_schedule", target_type="social")
+    return result
 
 
 @router.post("/whatsapp/broadcast")
 async def whatsapp_broadcast(body: dict, user: dict = Depends(require_admin)):
     """Broadcast a message to multiple WhatsApp contacts."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/whatsapp/broadcast", json=body)
-            resp.raise_for_status()
-            log_action(user, "whatsapp_broadcast", target_type="social")
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine WhatsApp broadcast error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/whatsapp/broadcast", json=body, timeout=30.0)
+    log_action(user, "whatsapp_broadcast", target_type="social")
+    return result
 
 
 @router.get("/whatsapp/messages")
 async def whatsapp_messages(limit: int = Query(50, ge=1, le=200), user: dict = Depends(require_admin)):
     """Get recent WhatsApp messages."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.social_engine_url}/whatsapp/messages", params={"limit": limit})
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine WhatsApp messages error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("get", "/whatsapp/messages", params={"limit": limit})
 
 
 @router.get("/whatsapp/scheduled")
 async def whatsapp_scheduled(user: dict = Depends(require_admin)):
     """Get scheduled WhatsApp messages."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.social_engine_url}/whatsapp/scheduled")
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine WhatsApp scheduled error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("get", "/whatsapp/scheduled")
 
 
 # ── Facebook ───────────────────────────────────────────────
@@ -100,73 +170,35 @@ async def whatsapp_scheduled(user: dict = Depends(require_admin)):
 @router.post("/facebook/post")
 async def facebook_post(body: dict, user: dict = Depends(require_admin)):
     """Create or schedule a Facebook post."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/facebook/post", json=body)
-            resp.raise_for_status()
-            log_action(user, "facebook_post", target_type="social")
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine Facebook post error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/facebook/post", json=body, timeout=30.0)
+    log_action(user, "facebook_post", target_type="social")
+    return result
 
 
 @router.post("/facebook/comment")
 async def facebook_comment(body: dict, user: dict = Depends(require_admin)):
     """Reply to a Facebook comment."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/facebook/comment", json=body)
-            resp.raise_for_status()
-            log_action(user, "facebook_comment", target_type="social")
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine Facebook comment error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/facebook/comment", json=body)
+    log_action(user, "facebook_comment", target_type="social")
+    return result
 
 
 @router.post("/facebook/react")
 async def facebook_react(body: dict, user: dict = Depends(require_admin)):
     """React to a Facebook post or comment."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/facebook/react", json=body)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine Facebook react error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("post", "/facebook/react", json=body)
 
 
 @router.get("/facebook/posts")
 async def facebook_posts(limit: int = Query(50, ge=1, le=200), user: dict = Depends(require_admin)):
     """Get recent Facebook posts."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.social_engine_url}/facebook/posts", params={"limit": limit})
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine Facebook posts error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("get", "/facebook/posts", params={"limit": limit})
 
 
 @router.get("/facebook/scheduled")
 async def facebook_scheduled(user: dict = Depends(require_admin)):
     """Get scheduled Facebook posts."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.social_engine_url}/facebook/scheduled")
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine Facebook scheduled error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("get", "/facebook/scheduled")
 
 
 # ── Contacts ───────────────────────────────────────────────
@@ -177,33 +209,18 @@ async def list_contacts(
     user: dict = Depends(require_admin),
 ):
     """List social contacts."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            params = {}
-            if platform:
-                params["platform"] = platform
-            resp = await client.get(f"{settings.social_engine_url}/contacts", params=params)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine contacts error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    params = {}
+    if platform:
+        params["platform"] = platform
+    return await _proxy("get", "/contacts", params=params)
 
 
 @router.post("/contacts")
 async def add_contact(body: dict, user: dict = Depends(require_admin)):
     """Add a social contact."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/contacts", json=body)
-            resp.raise_for_status()
-            log_action(user, "add_contact", target_type="social")
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine add contact error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/contacts", json=body)
+    log_action(user, "add_contact", target_type="social")
+    return result
 
 
 # ── Campaigns ──────────────────────────────────────────────
@@ -211,30 +228,15 @@ async def add_contact(body: dict, user: dict = Depends(require_admin)):
 @router.get("/campaigns")
 async def list_campaigns(user: dict = Depends(require_admin)):
     """List social campaigns."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.social_engine_url}/campaigns")
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine campaigns error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("get", "/campaigns")
 
 
 @router.post("/campaigns")
 async def create_campaign(body: dict, user: dict = Depends(require_admin)):
     """Create a social campaign."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.post(f"{settings.social_engine_url}/campaigns", json=body)
-            resp.raise_for_status()
-            log_action(user, "create_campaign", target_type="social")
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine create campaign error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    result = await _proxy("post", "/campaigns", json=body)
+    log_action(user, "create_campaign", target_type="social")
+    return result
 
 
 # ── Stats ──────────────────────────────────────────────────
@@ -242,12 +244,4 @@ async def create_campaign(body: dict, user: dict = Depends(require_admin)):
 @router.get("/stats")
 async def social_stats(user: dict = Depends(require_admin)):
     """Get social engine stats."""
-    settings = _get_settings()
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.social_engine_url}/stats")
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Social engine stats error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+    return await _proxy("get", "/stats")

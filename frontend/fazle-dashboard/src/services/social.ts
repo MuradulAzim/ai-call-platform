@@ -13,6 +13,8 @@ export interface SocialContact {
   name: string;
   platform: string;
   identifier: string;
+  phone_number?: string;
+  profile_link?: string;
   metadata: Record<string, unknown>;
   created_at: string;
 }
@@ -22,6 +24,8 @@ export interface SocialMessage {
   direction: string;
   contact_identifier: string;
   content: string;
+  message_text?: string;
+  ai_response?: string;
   status: string;
   created_at: string;
 }
@@ -54,9 +58,51 @@ export interface Campaign {
   created_at: string;
 }
 
+export interface SocialIntegration {
+  id: string;
+  platform: string;
+  app_id: string;
+  app_secret: string;
+  access_token: string;
+  page_id: string;
+  phone_number: string;
+  phone_number_id: string;
+  waba_id: string;
+  verify_token: string;
+  webhook_url: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IntegrationStatus {
+  platforms: {
+    platform: string;
+    connected: boolean;
+    webhook_url: string;
+    last_message_at: string | null;
+  }[];
+  service: string;
+  version: string;
+}
+
 export const socialService = {
   // Stats
   getStats: () => apiGet<SocialStats>('/social/stats'),
+
+  // Integrations
+  listIntegrations: () =>
+    apiGet<{ integrations: SocialIntegration[] }>('/social/integrations'),
+  saveIntegration: (data: Partial<SocialIntegration> & { platform: string }) =>
+    apiPost<{ status: string; platform: string }>('/social/integrations/save', data),
+  testIntegration: (platform: string) =>
+    apiPost<{ connected: boolean; error?: string }>('/social/integrations/test', { platform }),
+  enableIntegration: (platform: string) =>
+    apiPost<{ status: string }>('/social/integrations/enable', { platform }),
+  disableIntegration: (platform: string) =>
+    apiPost<{ status: string }>('/social/integrations/disable', { platform }),
+  integrationStatus: () =>
+    apiGet<IntegrationStatus>('/social/integration/status'),
 
   // WhatsApp
   whatsappSend: (to: string, message: string, autoReply = false) =>
