@@ -41,9 +41,13 @@ export default function AISafetyPage() {
 
   // Create policy form
   const [showCreate, setShowCreate] = React.useState(false);
-  const [newPolicy, setNewPolicy] = React.useState({
-    name: '', description: '', category: 'content', severity: 'medium' as const,
-    rule_type: 'keyword' as const, rule_config: '{}',
+  const [newPolicy, setNewPolicy] = React.useState<{
+    name: string; description: string; category: string;
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    rule_type: string; rule_config: string;
+  }>({
+    name: '', description: '', category: 'content', severity: 'medium',
+    rule_type: 'keyword', rule_config: '{}',
   });
   const [creating, setCreating] = React.useState(false);
 
