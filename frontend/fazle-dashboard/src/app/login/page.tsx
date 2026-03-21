@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -53,7 +54,7 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+    <div className="flex min-h-screen flex-col items-center justify-center bg-background p-4">
       <Card className="w-full max-w-md">
         <CardHeader className="text-center">
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
@@ -85,6 +86,11 @@ export default function LoginPage() {
           </form>
         </CardContent>
       </Card>
+      <div className="mt-6 flex gap-4 text-sm text-muted-foreground">
+        <Link href="/terms-services" className="hover:text-foreground transition-colors">Terms of Service</Link>
+        <span>·</span>
+        <Link href="/privacy-policy" className="hover:text-foreground transition-colors">Privacy Policy</Link>
+      </div>
     </div>
   );
 }
