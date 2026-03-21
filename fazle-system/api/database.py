@@ -688,6 +688,7 @@ def ensure_gdpr_tables():
     """Create GDPR-related tables (idempotent)."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
+            # Create base tables (without indexes on columns that may not exist yet)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS gdpr_requests (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -705,8 +706,6 @@ def ensure_gdpr_tables():
                     scheduled_at TIMESTAMPTZ
                 );
                 CREATE INDEX IF NOT EXISTS idx_gdpr_req_user ON gdpr_requests (user_id);
-                CREATE INDEX IF NOT EXISTS idx_gdpr_req_code ON gdpr_requests (confirmation_code);
-                CREATE INDEX IF NOT EXISTS idx_gdpr_req_status ON gdpr_requests (status);
 
                 CREATE TABLE IF NOT EXISTS gdpr_audit_logs (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -760,6 +759,11 @@ def ensure_gdpr_tables():
                     cur.execute(f"RELEASE SAVEPOINT sp_{col}")
                 except Exception:
                     cur.execute(f"ROLLBACK TO SAVEPOINT sp_{col}")
+            # Create indexes on columns that now exist
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_gdpr_req_code ON gdpr_requests (confirmation_code);
+                CREATE INDEX IF NOT EXISTS idx_gdpr_req_status ON gdpr_requests (status);
+            """)
         conn.commit()
     logger.info("GDPR tables ensured (gdpr_requests, gdpr_audit_logs, user_consents, user_identities)")
 
