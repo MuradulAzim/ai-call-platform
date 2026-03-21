@@ -23,6 +23,7 @@ import {
   GitBranch,
   Store,
   Shield,
+  ShieldCheck,
   Users,
   MessageCircle,
 } from 'lucide-react';
@@ -48,6 +49,7 @@ const navItems = [
   { href: '/dashboard/fazle/watchdog', label: 'Watchdog', icon: Shield },
   { href: '/dashboard/fazle/users', label: 'Users', icon: Users },
   { href: '/dashboard/fazle/social', label: 'Social', icon: MessageCircle },
+  { href: '/dashboard/fazle/privacy', label: 'Privacy', icon: ShieldCheck },
   { href: '/dashboard/fazle/logs', label: 'Logs', icon: ScrollText },
   { href: '/dashboard/fazle/settings', label: 'Settings', icon: Settings },
 ];

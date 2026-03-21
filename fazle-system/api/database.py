@@ -680,3 +680,203 @@ def mark_reset_token_used(token_id: str) -> None:
                 (token_id,),
             )
             conn.commit()
+
+
+# ── GDPR Compliance Tables ──────────────────────────────────
+
+def ensure_gdpr_tables():
+    """Create GDPR-related tables (idempotent)."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gdpr_requests (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES fazle_users(id) ON DELETE CASCADE,
+                    request_type VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_gdpr_req_user ON gdpr_requests (user_id);
+
+                CREATE TABLE IF NOT EXISTS gdpr_audit_logs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL,
+                    action VARCHAR(100) NOT NULL,
+                    details TEXT DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_gdpr_audit_user ON gdpr_audit_logs (user_id);
+
+                CREATE TABLE IF NOT EXISTS user_consents (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES fazle_users(id) ON DELETE CASCADE,
+                    terms_accepted BOOLEAN NOT NULL DEFAULT false,
+                    privacy_accepted BOOLEAN NOT NULL DEFAULT false,
+                    accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(user_id)
+                );
+            """)
+        conn.commit()
+    logger.info("GDPR tables ensured (gdpr_requests, gdpr_audit_logs, user_consents)")
+
+
+def create_gdpr_request(user_id: str, request_type: str) -> dict:
+    """Create a new GDPR request (access/export/delete)."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO gdpr_requests (user_id, request_type)
+                VALUES (%s, %s)
+                RETURNING id, user_id, request_type, status, created_at, completed_at
+                """,
+                (user_id, request_type),
+            )
+            conn.commit()
+            return dict(cur.fetchone())
+
+
+def complete_gdpr_request(request_id: str, status: str = "completed") -> None:
+    """Mark a GDPR request as completed or failed."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE gdpr_requests SET status = %s, completed_at = NOW() WHERE id = %s",
+                (status, request_id),
+            )
+            conn.commit()
+
+
+def get_gdpr_requests(user_id: str) -> list[dict]:
+    """Get all GDPR requests for a user."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, request_type, status, created_at, completed_at FROM gdpr_requests WHERE user_id = %s ORDER BY created_at DESC",
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def log_gdpr_action(user_id: str, action: str, details: str = "") -> None:
+    """Log a GDPR audit action."""
+    try:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO gdpr_audit_logs (user_id, action, details) VALUES (%s, %s, %s)",
+                    (user_id, action, details[:2000]),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.error(f"GDPR audit log write failed: {e}")
+
+
+def save_consent(user_id: str, terms: bool, privacy: bool) -> dict:
+    """Upsert user consent record."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO user_consents (user_id, terms_accepted, privacy_accepted, accepted_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                    SET terms_accepted = EXCLUDED.terms_accepted,
+                        privacy_accepted = EXCLUDED.privacy_accepted,
+                        accepted_at = NOW()
+                RETURNING id, user_id, terms_accepted, privacy_accepted, accepted_at
+                """,
+                (user_id, terms, privacy),
+            )
+            conn.commit()
+            return dict(cur.fetchone())
+
+
+def get_consent(user_id: str) -> Optional[dict]:
+    """Get user consent record."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT terms_accepted, privacy_accepted, accepted_at FROM user_consents WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_user_all_data(user_id: str) -> dict:
+    """Collect all data associated with a user for GDPR access/export."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Profile
+            cur.execute(
+                "SELECT id, email, name, relationship_to_azim, role, is_active, created_at FROM fazle_users WHERE id = %s",
+                (user_id,),
+            )
+            profile = cur.fetchone()
+            if not profile:
+                return {}
+            profile = dict(profile)
+
+            # Conversations + messages
+            cur.execute(
+                """
+                SELECT c.conversation_id, c.title, c.created_at,
+                       json_agg(json_build_object('role', m.role, 'content', m.content, 'created_at', m.created_at) ORDER BY m.created_at) AS messages
+                FROM fazle_conversations c
+                LEFT JOIN fazle_messages m ON m.conversation_id = c.id
+                WHERE c.user_id = %s
+                GROUP BY c.id ORDER BY c.created_at
+                """,
+                (user_id,),
+            )
+            conversations = [dict(r) for r in cur.fetchall()]
+
+            # Consent
+            cur.execute(
+                "SELECT terms_accepted, privacy_accepted, accepted_at FROM user_consents WHERE user_id = %s",
+                (user_id,),
+            )
+            consent_row = cur.fetchone()
+            consent = dict(consent_row) if consent_row else None
+
+            # Audit logs
+            cur.execute(
+                "SELECT action, details, created_at FROM gdpr_audit_logs WHERE user_id = %s ORDER BY created_at",
+                (user_id,),
+            )
+            audit_logs = [dict(r) for r in cur.fetchall()]
+
+            return {
+                "profile": profile,
+                "conversations": conversations,
+                "consent": consent,
+                "audit_logs": audit_logs,
+            }
+
+
+def delete_user_all_data(user_id: str) -> bool:
+    """Delete all data associated with a user (GDPR right to erasure)."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            # Social data (if tables exist)
+            for table in ("social_messages", "social_contacts"):
+                try:
+                    cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                except Exception:
+                    conn.rollback()
+
+            # Consent
+            cur.execute("DELETE FROM user_consents WHERE user_id = %s", (user_id,))
+            # GDPR audit logs (keep for legal compliance, anonymize)
+            cur.execute(
+                "UPDATE gdpr_audit_logs SET details = '[REDACTED]' WHERE user_id = %s",
+                (user_id,),
+            )
+            # Conversations + messages (cascade)
+            cur.execute("DELETE FROM fazle_conversations WHERE user_id = %s", (user_id,))
+            # User record
+            cur.execute("DELETE FROM fazle_users WHERE id = %s", (user_id,))
+            conn.commit()
+            return True

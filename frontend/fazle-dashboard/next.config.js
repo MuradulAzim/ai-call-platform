@@ -8,6 +8,10 @@ const nextConfig = {
         source: '/api/fazle/:path*',
         destination: `${process.env.FAZLE_API_URL || 'http://fazle-api:8100'}/fazle/:path*`,
       },
+      {
+        source: '/api/facebook/:path*',
+        destination: `${process.env.FAZLE_API_URL || 'http://fazle-api:8100'}/fazle/gdpr/facebook-deletion`,
+      },
     ];
   },
 };

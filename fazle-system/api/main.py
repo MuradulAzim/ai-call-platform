@@ -33,6 +33,7 @@ from schemas import (
 from watchdog_routes import router as watchdog_router
 from user_routes import router as user_router
 from social_routes import router as social_router
+from gdpr_routes import router as gdpr_router
 from auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, require_admin, get_optional_user,
@@ -45,6 +46,7 @@ from database import (
     ensure_admin_tables, ensure_password_reset_table,
     update_user_password, create_password_reset_token,
     get_valid_reset_token, mark_reset_token_used,
+    ensure_gdpr_tables,
 )
 from audit import ensure_audit_table, log_action, get_audit_logs
 from admin_routes import router as admin_router
@@ -111,6 +113,7 @@ app.include_router(admin_router)
 app.include_router(watchdog_router)
 app.include_router(user_router)
 app.include_router(social_router)
+app.include_router(gdpr_router)
 
 
 async def verify_api_key(x_api_key: Optional[str] = Header(None)):
@@ -154,6 +157,7 @@ def startup():
         ensure_audit_table()
         ensure_admin_tables()
         ensure_password_reset_table()
+        ensure_gdpr_tables()
         logger.info("Database tables ensured on startup")
     except Exception as e:
         logger.error(f"Failed to ensure database tables: {e}")
