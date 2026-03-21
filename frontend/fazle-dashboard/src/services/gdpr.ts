@@ -17,6 +17,7 @@ export interface UserConsent {
 export interface UserDataExport {
   status: string;
   request_id: string;
+  filename: string;
   data: Record<string, unknown>;
 }
 
@@ -25,7 +26,7 @@ export const gdprService = {
 
   exportMyData: () => apiPost<UserDataExport>('/gdpr/export'),
 
-  deleteMyData: () => apiPost<{ status: string; message: string; request_id: string }>('/gdpr/delete'),
+  deleteMyData: () => apiPost<{ status: string; message: string; request_id: string; deleted_from: string[] }>('/gdpr/delete'),
 
   getRequests: () => apiGet<{ requests: GdprRequest[] }>('/gdpr/status'),
 

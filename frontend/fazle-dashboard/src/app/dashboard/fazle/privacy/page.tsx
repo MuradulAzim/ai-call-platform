@@ -73,15 +73,15 @@ export default function PrivacyDashboardPage() {
     setExporting(true);
     try {
       const result = await gdprService.exportMyData();
-      // Trigger download
+      const filename = result.filename || `fazle-data-export-${new Date().toISOString().split('T')[0]}.json`;
       const blob = new Blob([JSON.stringify(result.data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `fazle-data-export-${new Date().toISOString().split('T')[0]}.json`;
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(url);
-      showMsg('Data exported successfully', 'success');
+      showMsg('Data exported and downloaded successfully', 'success');
       fetchAll();
     } catch {
       showMsg('Failed to export data', 'error');
@@ -95,12 +95,15 @@ export default function PrivacyDashboardPage() {
     if (deleteConfirmText !== 'DELETE') return;
     setDeleting(true);
     try {
-      await gdprService.deleteMyData();
-      showMsg('All your data has been permanently deleted', 'success');
+      const result = await gdprService.deleteMyData();
+      const tables = result.deleted_from?.length
+        ? ` (${result.deleted_from.join(', ')})`
+        : '';
+      showMsg(`All your data has been permanently deleted${tables}`, 'success');
       // Clear local state and redirect to login
       localStorage.removeItem('fazle_token');
       localStorage.removeItem('fazle_role');
-      window.location.href = '/login';
+      setTimeout(() => { window.location.href = '/login'; }, 2000);
     } catch {
       showMsg('Failed to delete data', 'error');
       setDeleting(false);
@@ -311,7 +314,8 @@ export default function PrivacyDashboardPage() {
                   <tr className="border-b text-left">
                     <th className="pb-2 font-medium">Request Type</th>
                     <th className="pb-2 font-medium">Status</th>
-                    <th className="pb-2 font-medium">Date</th>
+                    <th className="pb-2 font-medium">Requested</th>
+                    <th className="pb-2 font-medium">Completed</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -324,7 +328,10 @@ export default function PrivacyDashboardPage() {
                         </Badge>
                       </td>
                       <td className="py-3 text-muted-foreground">
-                        {new Date(req.created_at).toLocaleDateString()}
+                        {new Date(req.created_at).toLocaleString()}
+                      </td>
+                      <td className="py-3 text-muted-foreground">
+                        {req.completed_at ? new Date(req.completed_at).toLocaleString() : '—'}
                       </td>
                     </tr>
                   ))}

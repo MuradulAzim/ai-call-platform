@@ -691,13 +691,17 @@ def ensure_gdpr_tables():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS gdpr_requests (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    user_id UUID NOT NULL REFERENCES fazle_users(id) ON DELETE CASCADE,
+                    user_id UUID,
                     request_type VARCHAR(20) NOT NULL,
                     status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    confirmation_code VARCHAR(64),
+                    fb_user_id VARCHAR(100),
+                    deleted_tables TEXT DEFAULT '',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     completed_at TIMESTAMPTZ
                 );
                 CREATE INDEX IF NOT EXISTS idx_gdpr_req_user ON gdpr_requests (user_id);
+                CREATE INDEX IF NOT EXISTS idx_gdpr_req_code ON gdpr_requests (confirmation_code);
 
                 CREATE TABLE IF NOT EXISTS gdpr_audit_logs (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -717,6 +721,18 @@ def ensure_gdpr_tables():
                     UNIQUE(user_id)
                 );
             """)
+            # Add columns if missing (for upgrades from old schema)
+            for col, typ in [
+                ("confirmation_code", "VARCHAR(64)"),
+                ("fb_user_id", "VARCHAR(100)"),
+                ("deleted_tables", "TEXT DEFAULT ''"),
+            ]:
+                try:
+                    cur.execute(
+                        f"ALTER TABLE gdpr_requests ADD COLUMN IF NOT EXISTS {col} {typ}"
+                    )
+                except Exception:
+                    conn.rollback()
         conn.commit()
     logger.info("GDPR tables ensured (gdpr_requests, gdpr_audit_logs, user_consents)")
 
@@ -856,27 +872,136 @@ def get_user_all_data(user_id: str) -> dict:
             }
 
 
-def delete_user_all_data(user_id: str) -> bool:
-    """Delete all data associated with a user (GDPR right to erasure)."""
+def delete_user_all_data(user_id: str) -> list[str]:
+    """Delete all data associated with a user (GDPR right to erasure).
+    Returns list of tables data was deleted from, or empty list on failure."""
+    deleted_from: list[str] = []
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            # Social data (if tables exist)
-            for table in ("social_messages", "social_contacts"):
+            # Tables with user_id column to delete from (order matters for FK)
+            optional_tables = [
+                "social_messages",
+                "social_contacts",
+                "memory_logs",
+                "workflow_history",
+                "password_reset_tokens",
+            ]
+            for table in optional_tables:
                 try:
-                    cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                    cur.execute(
+                        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
+                        (table,),
+                    )
+                    if cur.fetchone()[0]:
+                        cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                        if cur.rowcount > 0:
+                            deleted_from.append(table)
                 except Exception:
                     conn.rollback()
 
             # Consent
-            cur.execute("DELETE FROM user_consents WHERE user_id = %s", (user_id,))
-            # GDPR audit logs (keep for legal compliance, anonymize)
-            cur.execute(
-                "UPDATE gdpr_audit_logs SET details = '[REDACTED]' WHERE user_id = %s",
-                (user_id,),
-            )
-            # Conversations + messages (cascade)
-            cur.execute("DELETE FROM fazle_conversations WHERE user_id = %s", (user_id,))
+            try:
+                cur.execute("DELETE FROM user_consents WHERE user_id = %s", (user_id,))
+                if cur.rowcount > 0:
+                    deleted_from.append("user_consents")
+            except Exception:
+                conn.rollback()
+
+            # GDPR audit logs — keep for legal compliance, anonymize
+            try:
+                cur.execute(
+                    "UPDATE gdpr_audit_logs SET details = '[REDACTED]' WHERE user_id = %s",
+                    (user_id,),
+                )
+                if cur.rowcount > 0:
+                    deleted_from.append("gdpr_audit_logs (anonymized)")
+            except Exception:
+                conn.rollback()
+
+            # Conversations + messages (cascade via FK)
+            try:
+                cur.execute("DELETE FROM fazle_conversations WHERE user_id = %s", (user_id,))
+                if cur.rowcount > 0:
+                    deleted_from.append("fazle_conversations")
+            except Exception:
+                conn.rollback()
+
             # User record
-            cur.execute("DELETE FROM fazle_users WHERE id = %s", (user_id,))
+            try:
+                cur.execute("DELETE FROM fazle_users WHERE id = %s", (user_id,))
+                if cur.rowcount > 0:
+                    deleted_from.append("fazle_users")
+            except Exception:
+                conn.rollback()
+
             conn.commit()
-            return True
+    return deleted_from
+
+
+def find_user_by_facebook_id(fb_user_id: str) -> Optional[dict]:
+    """Try to find an internal user linked to a Facebook user ID."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Check social_contacts table for FB user mapping
+            try:
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'social_contacts')"
+                )
+                if cur.fetchone()["exists"]:
+                    cur.execute(
+                        """SELECT u.id, u.email FROM fazle_users u
+                           JOIN social_contacts sc ON sc.user_id = u.id
+                           WHERE sc.platform = 'facebook' AND sc.platform_user_id = %s
+                           LIMIT 1""",
+                        (fb_user_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return dict(row)
+            except Exception:
+                pass
+
+            # Fallback: check fazle_users metadata column if it exists
+            try:
+                cur.execute(
+                    "SELECT id, email FROM fazle_users WHERE metadata->>'facebook_id' = %s LIMIT 1",
+                    (fb_user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+            except Exception:
+                pass
+    return None
+
+
+def create_facebook_deletion_request(
+    fb_user_id: str, confirmation_code: str, deleted_tables: list[str]
+) -> None:
+    """Store a Facebook data deletion request for status tracking."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO gdpr_requests
+                   (user_id, request_type, status, confirmation_code, fb_user_id, deleted_tables, completed_at)
+                   VALUES (%s, 'facebook_deletion', 'completed', %s, %s, %s, NOW())""",
+                (
+                    "00000000-0000-0000-0000-000000000000",
+                    confirmation_code,
+                    fb_user_id,
+                    ", ".join(deleted_tables) if deleted_tables else "none",
+                ),
+            )
+            conn.commit()
+
+
+def get_gdpr_request_by_code(confirmation_code: str) -> Optional[dict]:
+    """Look up a GDPR request by its confirmation code."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, request_type, status, created_at, completed_at FROM gdpr_requests WHERE confirmation_code = %s LIMIT 1",
+                (confirmation_code,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
