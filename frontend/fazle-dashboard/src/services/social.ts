@@ -1,4 +1,4 @@
-import { apiGet, apiPost } from './api';
+import { apiGet, apiPost, apiPut, apiDelete } from './api';
 
 export interface SocialStats {
   total_contacts: number;
@@ -55,6 +55,22 @@ export interface Campaign {
   campaign_type: string;
   config: Record<string, unknown>;
   status: string;
+  created_at: string;
+}
+
+export interface ContactBookEntry {
+  id: string;
+  phone: string;
+  name: string;
+  relation: string;
+  notes: string;
+  company: string;
+  personality_hint: string;
+  platform: string;
+  interaction_count: number;
+  interest_level: string;
+  last_seen: string;
+  last_updated: string;
   created_at: string;
 }
 
@@ -128,11 +144,30 @@ export const socialService = {
   facebookScheduled: () =>
     apiGet<{ scheduled: ScheduledItem[] }>('/social/facebook/scheduled'),
 
-  // Contacts
+  // Contacts (social contacts table)
   listContacts: (platform?: string) =>
     apiGet<{ contacts: SocialContact[] }>(`/social/contacts${platform ? `?platform=${platform}` : ''}`),
   addContact: (data: { name: string; platform: string; identifier: string }) =>
     apiPost<{ status: string; contact: SocialContact }>('/social/contacts', data),
+
+  // Contact Book (fazle_contacts — personal contact intelligence)
+  listContactBook: (params?: { platform?: string; search?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.platform) qs.set('platform', params.platform);
+    if (params?.search) qs.set('search', params.search);
+    if (params?.limit) qs.set('limit', String(params.limit));
+    if (params?.offset) qs.set('offset', String(params.offset));
+    const q = qs.toString();
+    return apiGet<{ contacts: ContactBookEntry[]; total: number }>(`/social/contacts/book${q ? `?${q}` : ''}`);
+  },
+  getContactBookEntry: (id: string) =>
+    apiGet<{ contact: ContactBookEntry }>(`/social/contacts/book/${id}`),
+  updateContactBookEntry: (id: string, data: Partial<ContactBookEntry>) =>
+    apiPut<{ status: string }>(`/social/contacts/book/${id}`, data),
+  deleteContactBookEntry: (id: string) =>
+    apiDelete<{ status: string }>(`/social/contacts/book/${id}`),
+  importContactsCsv: (csvText: string) =>
+    apiPost<{ status: string; imported: number; errors: string[] }>('/social/contacts/import', { csv: csvText }),
 
   // Campaigns
   listCampaigns: () => apiGet<{ campaigns: Campaign[] }>('/social/campaigns'),

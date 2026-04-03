@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings
 import hashlib
 import hmac
 import httpx
+import io
 import json
 import logging
 import uuid
@@ -46,6 +47,9 @@ class Settings(BaseSettings):
     # Webhook security
     verify_token: str = ""  # SOCIAL_VERIFY_TOKEN
     meta_app_secret: str = ""  # SOCIAL_META_APP_SECRET — used for HMAC validation
+    # Owner detection — messages from this phone/id skip AI and train the model
+    owner_phone: str = ""  # SOCIAL_OWNER_PHONE — owner's WhatsApp phone number
+    learning_engine_url: str = "http://fazle-learning-engine:8900"
 
     class Config:
         env_prefix = "SOCIAL_"
@@ -166,15 +170,669 @@ def ensure_tables():
                 );
                 CREATE INDEX IF NOT EXISTS idx_social_posts_platform
                     ON fazle_social_posts (platform, created_at DESC);
+
+                -- Keyword auto-reply system (no LLM usage)
+                CREATE TABLE IF NOT EXISTS fazle_keyword_responses (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    keywords TEXT[] NOT NULL,
+                    response TEXT NOT NULL,
+                    category VARCHAR(100) DEFAULT '',
+                    language VARCHAR(10) DEFAULT 'bn',
+                    priority INT DEFAULT 50,
+                    platform VARCHAR(20) DEFAULT 'all',
+                    enabled BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_keyword_responses_enabled
+                    ON fazle_keyword_responses (enabled, priority DESC);
+
+                -- Contact book system
+                CREATE TABLE IF NOT EXISTS fazle_contacts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    phone VARCHAR(50) NOT NULL,
+                    name VARCHAR(200) DEFAULT '',
+                    relation VARCHAR(100) DEFAULT 'unknown',
+                    notes TEXT DEFAULT '',
+                    company VARCHAR(300) DEFAULT '',
+                    personality_hint VARCHAR(200) DEFAULT '',
+                    platform VARCHAR(20) DEFAULT 'whatsapp',
+                    interaction_count INT DEFAULT 0,
+                    interest_level VARCHAR(20) DEFAULT 'unknown',
+                    last_seen TIMESTAMPTZ DEFAULT NOW(),
+                    last_updated TIMESTAMPTZ DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(phone, platform)
+                );
+                CREATE INDEX IF NOT EXISTS idx_contacts_phone
+                    ON fazle_contacts (phone);
+
+                -- Migration: add columns if missing (idempotent)
+                DO $$ BEGIN
+                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS company VARCHAR(300) DEFAULT '';
+                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS personality_hint VARCHAR(200) DEFAULT '';
+                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ DEFAULT NOW();
+                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS interest_level VARCHAR(20) DEFAULT 'unknown';
+                EXCEPTION WHEN OTHERS THEN NULL;
+                END $$;
+
+                -- Chat reply reuse system (Steps 11, 12, 18, 19)
+                CREATE TABLE IF NOT EXISTS fazle_chat_replies (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    query_hash VARCHAR(64) NOT NULL,
+                    query_text TEXT NOT NULL,
+                    reply_text TEXT NOT NULL,
+                    category VARCHAR(100) DEFAULT '',
+                    language VARCHAR(10) DEFAULT 'bn',
+                    quality_score FLOAT DEFAULT 0.5,
+                    usage_count INT DEFAULT 1,
+                    source VARCHAR(20) DEFAULT 'llm',
+                    platform VARCHAR(20) DEFAULT 'whatsapp',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_used TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_replies_hash
+                    ON fazle_chat_replies (query_hash);
+                CREATE INDEX IF NOT EXISTS idx_chat_replies_quality
+                    ON fazle_chat_replies (quality_score DESC, usage_count DESC);
+
+                -- Owner audio profiles (Steps 13, 14)
+                CREATE TABLE IF NOT EXISTS fazle_owner_audio_profiles (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    transcript TEXT NOT NULL,
+                    transcript_hash VARCHAR(64) NOT NULL,
+                    audio_context VARCHAR(200) DEFAULT '',
+                    tone VARCHAR(50) DEFAULT 'normal',
+                    language VARCHAR(10) DEFAULT 'bn',
+                    usage_count INT DEFAULT 1,
+                    platform VARCHAR(20) DEFAULT 'whatsapp',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_audio_profiles_hash
+                    ON fazle_owner_audio_profiles (transcript_hash);
+
+                -- Conversation summaries (Step 16)
+                CREATE TABLE IF NOT EXISTS fazle_conversation_summaries (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    conversation_id VARCHAR(200) NOT NULL,
+                    user_phone VARCHAR(50) DEFAULT '',
+                    user_name VARCHAR(200) DEFAULT '',
+                    summary TEXT NOT NULL,
+                    message_count INT DEFAULT 0,
+                    key_topics TEXT[] DEFAULT '{}',
+                    platform VARCHAR(20) DEFAULT 'whatsapp',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_summaries_conv
+                    ON fazle_conversation_summaries (conversation_id);
+
+                -- Multimodal learning storage (Step 15)
+                CREATE TABLE IF NOT EXISTS fazle_multimodal_learning (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    media_type VARCHAR(20) NOT NULL,
+                    extracted_text TEXT DEFAULT '',
+                    description TEXT DEFAULT '',
+                    sender_phone VARCHAR(50) DEFAULT '',
+                    context TEXT DEFAULT '',
+                    category VARCHAR(100) DEFAULT '',
+                    platform VARCHAR(20) DEFAULT 'whatsapp',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_multimodal_sender
+                    ON fazle_multimodal_learning (sender_phone);
+
+                -- Owner feedback on AI replies (Step 6)
+                CREATE TABLE IF NOT EXISTS fazle_owner_feedback (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    original_query TEXT DEFAULT '',
+                    ai_reply TEXT DEFAULT '',
+                    feedback_type VARCHAR(20) DEFAULT 'correction',
+                    correction TEXT DEFAULT '',
+                    rating INT DEFAULT 0,
+                    customer_phone VARCHAR(50) DEFAULT '',
+                    platform VARCHAR(20) DEFAULT 'whatsapp',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
             """)
         conn.commit()
     logger.info("Social engine tables ensured")
+
+
+# ── Keyword auto-reply seeding ─────────────────────────────
+_KEYWORD_SEED = [
+    {
+        "keywords": ["hi", "hello", "assalamu", "assalamualaikum", "আসসালামু আলাইকুম", "salam", "slm"],
+        "response": (
+            "ধন্যবাদ আমাদের সাথে যোগাযোগ করার জন্য 🙏\n\n"
+            "👉 Survey Scout পদে নিয়োগ চলছে\n\n"
+            "📌 কাজ: জাহাজে মালামাল তদারকি\n"
+            "🕐 ডিউটি: ৬–৮ ঘণ্টা\n"
+            "💰 বেতন: ১০,০০০ – ১৮,০০০ টাকা\n\n"
+            "📄 আবেদন করতে পাঠান:\n"
+            "নাম | বয়স | শিক্ষাগত যোগ্যতা | ঠিকানা\n\n"
+            "⚠️ Limited Vacancy"
+        ),
+        "category": "greeting",
+        "priority": 90,
+    },
+    {
+        "keywords": ["kaj", "কাজ", "ki kaj", "কি কাজ", "kaj ki", "কাজ কি", "details", "বিস্তারিত",
+                      "info", "তথ্য", "duty", "ডিউটি", "কয় ঘন্টা", "koto ghonta", "ki korte hobe",
+                      "কি করতে হবে", "description", "কাজের বিস্তারিত", "duty time"],
+        "response": (
+            "📌 কাজের বিস্তারিত:\n\n"
+            "✔ জাহাজে মালামাল তদারকি\n"
+            "✔ লোড–আনলোড হিসাব রাখা\n"
+            "✔ চুরি/নষ্ট হওয়া প্রতিরোধ\n\n"
+            "🕐 ডিউটি: ৬–৮ ঘণ্টা\n\n"
+            "✔ সহজ কাজ, ট্রেনিং দেয়া হবে\n\n"
+            "📲 আবেদন করতে পাঠান:\nনাম | বয়স | শিক্ষাগত যোগ্যতা | ঠিকানা"
+        ),
+        "category": "details",
+        "priority": 80,
+    },
+    {
+        "keywords": ["salary", "beton", "বেতন", "taka", "টাকা", "income", "ইনকাম",
+                      "koto taka", "কত টাকা", "koto beton", "কত বেতন", "payment",
+                      "পেমেন্ট", "masik beton", "মাসিক বেতন"],
+        "response": (
+            "💰 বেতন কাঠামো:\n\n"
+            "🔹 ট্রেনিং (৪৫ দিন): ১০–১৫ হাজার\n"
+            "🔹 পরে: ১২–১৮ হাজার\n\n"
+            "✔ কাজের দক্ষতার উপর বেতন বাড়ে"
+        ),
+        "category": "salary",
+        "priority": 80,
+    },
+    {
+        "keywords": ["location", "লোকেশন", "address", "ঠিকানা", "koi", "কোথায়", "kothay",
+                      "office koi", "অফিস কোথায়", "map", "ম্যাপ", "location den",
+                      "লোকেশন দেন", "kothay aste hobe", "কোথায় আসতে হবে"],
+        "response": (
+            "📍 অফিস:\n\n"
+            "আল-আকসা সিকিউরিটি সার্ভিস\n"
+            "ভিক্টোরিয়া গেইট, একে খান মোড়, পাহাড়তলী, চট্টগ্রাম\n\n"
+            "🕘 সময়: ৯টা – ৫টা\n\n"
+            "✔ আসার আগে মেসেজ দিন"
+        ),
+        "category": "location",
+        "priority": 80,
+    },
+    {
+        "keywords": ["interested", "আগ্রহী", "ami interested", "আমি আগ্রহী", "chai", "চাই",
+                      "korte chai", "করতে চাই", "apply", "আবেদন", "join", "জয়েন",
+                      "join korte chai", "জয়েন করতে চাই", "ami parbo", "আমি পারবো",
+                      "kaj korte chai"],
+        "response": (
+            "ধন্যবাদ 🙏\n\n"
+            "📄 আবেদন করতে পাঠান:\n"
+            "1. নাম\n"
+            "2. বয়স\n"
+            "3. শিক্ষাগত যোগ্যতা\n"
+            "4. বর্তমান ঠিকানা\n\n"
+            "✔ দ্রুত যোগাযোগ করা হবে"
+        ),
+        "category": "apply",
+        "priority": 85,
+    },
+    {
+        "keywords": ["ki lagbe", "কি লাগবে", "lagbe", "লাগবে", "requirement", "রিকোয়ারমেন্ট",
+                      "documents", "ডকুমেন্ট", "ki ki lagbe", "কি কি লাগবে", "ki dorkar",
+                      "কি দরকার", "paper lagbe", "কাগজ লাগবে", "certificate"],
+        "response": (
+            "📌 প্রয়োজন:\n\n"
+            "✔ ১ কপি ছবি\n"
+            "✔ NID / জন্ম নিবন্ধন\n"
+            "✔ ন্যূনতম অষ্টম শ্রেণি\n\n"
+            "✔ অভিজ্ঞতা লাগবে না (ট্রেনিং দেয়া হবে)"
+        ),
+        "category": "requirements",
+        "priority": 75,
+    },
+    {
+        "keywords": ["taka lage", "টাকা লাগে", "fee", "ফি", "charge", "চার্জ", "registration fee",
+                      "scam", "স্ক্যাম", "fake", "ফেক", "batpar", "বাটপার", "fraud", "ধোকা",
+                      "dhoka", "প্রতারণা"],
+        "response": (
+            "✔ অনলাইনে কোন টাকা নেওয়া হয় না\n\n"
+            "👉 অফিসে এসে যাচাই করে তারপর সিদ্ধান্ত নিন\n\n"
+            "✔ স্বচ্ছ প্রসেস\n"
+            "✔ সরাসরি জয়েন\n\n"
+            "📍 আগে এসে যাচাই করুন"
+        ),
+        "category": "fees_scam",
+        "priority": 85,
+    },
+    {
+        "keywords": ["call", "কল", "phone", "ফোন", "call den", "কল দেন", "phone den",
+                      "ফোন দেন", "knock den", "নক দেন", "contact", "যোগাযোগ",
+                      "amar number", "আমার নাম্বার", "call koren"],
+        "response": (
+            "📲 শুধুমাত্র WhatsApp মেসেজ\n\n"
+            "❌ কল করা হয় না\n\n"
+            "👉 আপনার তথ্য পাঠান, আমরা রিপ্লাই দিব"
+        ),
+        "category": "call_request",
+        "priority": 70,
+    },
+    {
+        "keywords": ["vacancy", "ভ্যাকান্সি", "seat", "সিট", "ase", "আছে", "ase naki",
+                      "আছে নাকি", "available", "এভেইলেবল", "lok lagbe", "লোক লাগবে",
+                      "chance ase", "চান্স আছে"],
+        "response": (
+            "⚠️ Limited Vacancy\n\n"
+            "✔ এখনো লোক নেয়া হচ্ছে\n"
+            "✔ আগে এলে আগে সুযোগ\n\n"
+            "👉 দ্রুত আবেদন করুন বা অফিসে আসুন"
+        ),
+        "category": "vacancy",
+        "priority": 75,
+    },
+    {
+        "keywords": ["parbo", "পারবো", "ami parbo", "আমি পারবো", "education", "এডুকেশন",
+                      "pora lekha", "পড়ালেখা", "ssc nai", "এসএসসি নাই", "madrasa", "মাদ্রাসা",
+                      "kom pora", "কম পড়া", "experience nai"],
+        "response": (
+            "✔ হ্যাঁ, সমস্যা নেই 👍\n\n"
+            "📌 ন্যূনতম অষ্টম শ্রেণি হলেই চলবে\n"
+            "✔ অভিজ্ঞতা লাগবে না\n"
+            "✔ সম্পূর্ণ কাজ শিখানো হবে\n\n"
+            "👉 আগ্রহী হলে আপনার তথ্য পাঠান"
+        ),
+        "category": "education",
+        "priority": 75,
+    },
+    {
+        "keywords": ["inbox", "ইনবক্স", "inbox koren", "ইনবক্স করেন", "dm", "msg", "message",
+                      "pm", "private", "personal", "inbox den", "ইনবক্স দেন"],
+        "response": (
+            "📲 দয়া করে সরাসরি WhatsApp-এ মেসেজ করুন:\n\n"
+            "01958 122300\n"
+            "01958 122322\n\n"
+            "✔ Only Message (No Call)"
+        ),
+        "category": "inbox",
+        "priority": 70,
+    },
+    {
+        "keywords": ["salary dey na", "বেতন দেয় না", "taka mare", "টাকা মারে", "police",
+                      "পুলিশ", "case", "মামলা", "প্রতারক", "dhokabaj", "ধোকাবাজ"],
+        "response": (
+            "আপনার মতামতের জন্য ধন্যবাদ\n\n"
+            "✔ আমরা সবাইকে সরাসরি অফিসে এসে যাচাই করার অনুরোধ করি\n\n"
+            "📍 যাচাই করে সিদ্ধান্ত নিন"
+        ),
+        "category": "negative",
+        "priority": 60,
+    },
+    {
+        "keywords": ["keno", "eto lok", "hiring", "sara bochor", "সারা বছর",
+                      "vacancy shesh hoy na", "always recruitment"],
+        "response": (
+            "✔ কাজটি জাহাজ ভিত্তিক, তাই নিয়মিত লোক প্রয়োজন হয়\n\n"
+            "✔ অনেকেই অন্য কাজে চলে যায় / শিফট পরিবর্তন হয়\n\n"
+            "👉 তাই সারা বছর নিয়োগ চলতে পারে\n\n"
+            "✔ আগ্রহী হলে দ্রুত আবেদন করুন"
+        ),
+        "category": "suspicion",
+        "priority": 65,
+    },
+]
+
+
+def _seed_keyword_responses():
+    """Seed keyword_responses table if empty."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM fazle_keyword_responses")
+            count = cur.fetchone()[0]
+            if count > 0:
+                logger.info(f"Keyword responses already seeded ({count} rows)")
+                return
+            for entry in _KEYWORD_SEED:
+                cur.execute(
+                    """INSERT INTO fazle_keyword_responses (keywords, response, category, language, priority)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (entry["keywords"], entry["response"], entry["category"], "bn", entry["priority"]),
+                )
+        conn.commit()
+    logger.info(f"Seeded {len(_KEYWORD_SEED)} keyword responses")
+
+
+def match_keyword_response(db_conn_fn, message: str, platform: str = "all") -> str | None:
+    """Check if message matches any keyword rule. Returns response text or None."""
+    msg_lower = message.strip().lower()
+    if len(msg_lower) < 2:
+        return None
+    best_response = None
+    best_priority = -1
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT keywords, response, priority FROM fazle_keyword_responses
+                   WHERE enabled = TRUE AND (platform = %s OR platform = 'all')
+                   ORDER BY priority DESC""",
+                (platform,),
+            )
+            for row in cur.fetchall():
+                for kw in row["keywords"]:
+                    if kw.lower() in msg_lower and row["priority"] > best_priority:
+                        best_response = row["response"]
+                        best_priority = row["priority"]
+                        break
+    return best_response
+
+
+def upsert_contact(db_conn_fn, phone: str, name: str = "", platform: str = "whatsapp",
+                   relation: str = "unknown", notes: str = "",
+                   company: str = "", personality_hint: str = "") -> None:
+    """Create or update a contact in the contact book."""
+    norm_phone = phone.lstrip("+").replace(" ", "").strip()
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fazle_contacts (phone, name, relation, platform, notes, company, personality_hint, interaction_count, last_seen, last_updated)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 1, NOW(), NOW())
+                   ON CONFLICT (phone, platform) DO UPDATE SET
+                     name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name ELSE fazle_contacts.name END,
+                     relation = CASE WHEN EXCLUDED.relation != 'unknown' THEN EXCLUDED.relation ELSE fazle_contacts.relation END,
+                     notes = CASE WHEN EXCLUDED.notes != '' THEN EXCLUDED.notes ELSE fazle_contacts.notes END,
+                     company = CASE WHEN EXCLUDED.company != '' THEN EXCLUDED.company ELSE fazle_contacts.company END,
+                     personality_hint = CASE WHEN EXCLUDED.personality_hint != '' THEN EXCLUDED.personality_hint ELSE fazle_contacts.personality_hint END,
+                     interaction_count = fazle_contacts.interaction_count + 1,
+                     last_seen = NOW(),
+                     last_updated = NOW()""",
+                (norm_phone, name, relation, platform, notes, company, personality_hint),
+            )
+        conn.commit()
+
+
+def get_contact(db_conn_fn, phone: str, platform: str = "whatsapp") -> dict | None:
+    """Retrieve contact info for prompt injection."""
+    norm_phone = phone.lstrip("+").replace(" ", "").strip()
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT phone, name, relation, notes, company, personality_hint,
+                          interaction_count, interest_level, last_seen, last_updated
+                   FROM fazle_contacts
+                   WHERE phone = %s AND platform = %s""",
+                (norm_phone, platform),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def list_all_contacts(db_conn_fn, platform: str | None = None, search: str = "",
+                      limit: int = 100, offset: int = 0) -> list[dict]:
+    """List contacts with optional platform filter and search."""
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            where_parts = []
+            params: list = []
+            if platform:
+                where_parts.append("platform = %s")
+                params.append(platform)
+            if search:
+                where_parts.append("(name ILIKE %s OR phone ILIKE %s OR relation ILIKE %s OR company ILIKE %s)")
+                like = f"%{search}%"
+                params.extend([like, like, like, like])
+            where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+            params.extend([limit, offset])
+            cur.execute(
+                f"""SELECT id, phone, name, relation, notes, company, personality_hint,
+                           platform, interaction_count, interest_level, last_seen, last_updated
+                    FROM fazle_contacts {where_clause}
+                    ORDER BY last_seen DESC NULLS LAST
+                    LIMIT %s OFFSET %s""",
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def update_contact(db_conn_fn, contact_id: str, updates: dict) -> bool:
+    """Update specific fields of a contact by ID."""
+    allowed = {"name", "relation", "notes", "company", "personality_hint", "interest_level"}
+    fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    if not fields:
+        return False
+    set_clause = ", ".join(f"{k} = %s" for k in fields)
+    values = list(fields.values()) + [contact_id]
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE fazle_contacts SET {set_clause}, last_updated = NOW() WHERE id = %s",
+                values,
+            )
+        conn.commit()
+    return True
+
+
+def delete_contact(db_conn_fn, contact_id: str) -> bool:
+    """Delete a contact by ID."""
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM fazle_contacts WHERE id = %s", (contact_id,))
+            deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
+def update_contact_interest(db_conn_fn, phone: str, platform: str, interest: str) -> None:
+    """Update interest level for a contact (hot/warm/cold/risk)."""
+    norm_phone = phone.lstrip("+").replace(" ", "").strip()
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fazle_contacts SET interest_level = %s, last_updated = NOW() WHERE phone = %s AND platform = %s",
+                (interest, norm_phone, platform),
+            )
+        conn.commit()
+
+
+# ── Chat Reply Reuse System (Steps 11, 12, 18) ────────────
+
+def _query_hash(text: str) -> str:
+    """Generate a normalized hash for query text to enable reply reuse."""
+    import re
+    normalized = re.sub(r'\s+', ' ', text.strip().lower())
+    # Remove common greetings/fillers for better matching
+    for filler in ["assalamu alaikum", "আসসালামু আলাইকুম", "hi", "hello", "hey", "please", "plz"]:
+        normalized = normalized.replace(filler, "").strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()[:32]
+
+
+def find_cached_reply(db_conn_fn, query: str, platform: str = "whatsapp") -> str | None:
+    """Find a high-quality cached reply for a similar query. Returns reply text or None."""
+    qhash = _query_hash(query)
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT reply_text, usage_count FROM fazle_chat_replies
+                   WHERE query_hash = %s AND quality_score >= 0.6
+                   AND (platform = %s OR platform = 'all')
+                   ORDER BY quality_score DESC, usage_count DESC LIMIT 1""",
+                (qhash, platform),
+            )
+            row = cur.fetchone()
+            if row:
+                # Increment usage count
+                cur.execute(
+                    "UPDATE fazle_chat_replies SET usage_count = usage_count + 1, last_used = NOW() WHERE query_hash = %s",
+                    (qhash,),
+                )
+                conn.commit()
+                return row["reply_text"]
+    return None
+
+
+def save_chat_reply(db_conn_fn, query: str, reply: str, category: str = "",
+                    platform: str = "whatsapp", source: str = "llm",
+                    quality_score: float = 0.5) -> None:
+    """Store a chat reply for future reuse."""
+    qhash = _query_hash(query)
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fazle_chat_replies (query_hash, query_text, reply_text, category, platform, source, quality_score)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                (qhash, query[:500], reply[:2000], category, platform, source, quality_score),
+            )
+        conn.commit()
+
+
+def boost_reply_quality(db_conn_fn, query: str, boost: float = 0.1) -> None:
+    """Boost quality score of a cached reply (owner approved it)."""
+    qhash = _query_hash(query)
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fazle_chat_replies SET quality_score = LEAST(quality_score + %s, 1.0) WHERE query_hash = %s",
+                (boost, qhash),
+            )
+        conn.commit()
+
+
+def penalize_reply_quality(db_conn_fn, query: str, penalty: float = 0.2) -> None:
+    """Penalize quality score of a cached reply (owner corrected it)."""
+    qhash = _query_hash(query)
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE fazle_chat_replies SET quality_score = GREATEST(quality_score - %s, 0.0) WHERE query_hash = %s",
+                (penalty, qhash),
+            )
+        conn.commit()
+
+
+# ── Owner Audio Profile System (Steps 13, 14) ──────────────
+
+def save_owner_audio_profile(db_conn_fn, transcript: str, context: str = "",
+                             tone: str = "normal", platform: str = "whatsapp") -> None:
+    """Store owner's voice message transcript for learning tone/style."""
+    thash = hashlib.sha256(transcript.strip().lower().encode()).hexdigest()[:32]
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fazle_owner_audio_profiles (transcript, transcript_hash, audio_context, tone, platform)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                (transcript[:2000], thash, context[:200], tone, platform),
+            )
+        conn.commit()
+
+
+def get_owner_audio_examples(db_conn_fn, limit: int = 5) -> list[dict]:
+    """Get recent owner voice transcripts for style learning."""
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT transcript, tone, audio_context FROM fazle_owner_audio_profiles ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ── Conversation Summary System (Step 16) ──────────────────
+
+def save_conversation_summary(db_conn_fn, conversation_id: str, summary: str,
+                               user_phone: str = "", user_name: str = "",
+                               message_count: int = 0, key_topics: list = None,
+                               platform: str = "whatsapp") -> None:
+    """Store a conversation summary for memory efficiency."""
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fazle_conversation_summaries
+                   (conversation_id, summary, user_phone, user_name, message_count, key_topics, platform)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (conversation_id, summary[:2000], user_phone, user_name, message_count,
+                 key_topics or [], platform),
+            )
+        conn.commit()
+
+
+def get_conversation_summaries(db_conn_fn, user_phone: str = "", limit: int = 5) -> list[dict]:
+    """Get recent conversation summaries for a user."""
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if user_phone:
+                cur.execute(
+                    "SELECT * FROM fazle_conversation_summaries WHERE user_phone = %s ORDER BY created_at DESC LIMIT %s",
+                    (user_phone.lstrip("+").replace(" ", "").strip(), limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM fazle_conversation_summaries ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ── Multimodal Learning Storage (Step 15) ──────────────────
+
+def save_multimodal_learning(db_conn_fn, media_type: str, extracted_text: str,
+                             sender_phone: str = "", context: str = "",
+                             description: str = "", category: str = "",
+                             platform: str = "whatsapp") -> None:
+    """Store multimodal content (image/audio/document) for learning."""
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fazle_multimodal_learning
+                   (media_type, extracted_text, sender_phone, context, description, category, platform)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (media_type, extracted_text[:3000], sender_phone, context[:500],
+                 description[:500], category, platform),
+            )
+        conn.commit()
+
+
+# ── Owner Feedback System (Step 6) ─────────────────────────
+
+def save_owner_feedback(db_conn_fn, original_query: str, ai_reply: str,
+                        feedback_type: str = "correction", correction: str = "",
+                        rating: int = 0, customer_phone: str = "",
+                        platform: str = "whatsapp") -> None:
+    """Store owner feedback on an AI reply."""
+    with db_conn_fn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO fazle_owner_feedback
+                   (original_query, ai_reply, feedback_type, correction, rating, customer_phone, platform)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (original_query[:1000], ai_reply[:2000], feedback_type, correction[:2000],
+                 rating, customer_phone, platform),
+            )
+        conn.commit()
+
+
+def get_reply_stats(db_conn_fn) -> dict:
+    """Get reply reuse statistics."""
+    with db_conn_fn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) as total, SUM(usage_count) as total_uses FROM fazle_chat_replies")
+            replies = dict(cur.fetchone())
+            cur.execute("SELECT COUNT(*) as total FROM fazle_owner_feedback")
+            feedback = dict(cur.fetchone())
+            cur.execute("SELECT COUNT(*) as total FROM fazle_conversation_summaries")
+            summaries = dict(cur.fetchone())
+            cur.execute("SELECT COUNT(*) as total FROM fazle_multimodal_learning")
+            multimodal = dict(cur.fetchone())
+            return {
+                "cached_replies": replies.get("total", 0),
+                "total_reuses": replies.get("total_uses", 0),
+                "owner_feedback": feedback.get("total", 0),
+                "summaries": summaries.get("total", 0),
+                "multimodal_items": multimodal.get("total", 0),
+            }
 
 
 @app.on_event("startup")
 def startup():
     try:
         ensure_tables()
+        _seed_keyword_responses()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
 
@@ -234,7 +892,7 @@ def _get_integration_creds(platform: str) -> dict:
 async def generate_ai_reply(message: str, context: str = "") -> str:
     """Use Fazle Brain to generate a persona-aware response."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{settings.brain_url}/chat",
                 json={
@@ -331,7 +989,8 @@ async def test_integration(body: dict):
         if not api_url or not token:
             return {"connected": False, "error": "WhatsApp credentials not configured"}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+            async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
                 resp = await client.get(
                     f"{api_url}/{phone_id}",
                     headers={"Authorization": f"Bearer {token}"},
@@ -346,7 +1005,8 @@ async def test_integration(body: dict):
         if not token:
             return {"connected": False, "error": "Facebook credentials not configured"}
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+            async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
                 resp = await client.get(
                     f"https://graph.facebook.com/v19.0/{page_id}",
                     params={"access_token": token, "fields": "id,name"},
@@ -452,7 +1112,10 @@ async def whatsapp_webhook_receive(request: Request):
         logger.warning("WhatsApp webhook: invalid or missing HMAC signature")
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
     payload = json.loads(raw_body)
-    result = await handle_whatsapp_webhook(payload, _get_conn, settings.brain_url, _get_integration_creds)
+    result = await handle_whatsapp_webhook(
+        payload, _get_conn, settings.brain_url, _get_integration_creds,
+        owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
+    )
     # Trigger workflow automation
     await trigger_workflow(settings.workflow_engine_url, "whatsapp.message.received", result)
     return {"status": "ok"}
@@ -487,7 +1150,10 @@ async def facebook_webhook_receive(request: Request):
         logger.warning("Facebook webhook: invalid or missing HMAC signature")
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
     payload = json.loads(raw_body)
-    result = await handle_facebook_webhook(payload, _get_conn, settings.brain_url, _get_integration_creds)
+    result = await handle_facebook_webhook(
+        payload, _get_conn, settings.brain_url, _get_integration_creds,
+        owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
+    )
     await trigger_workflow(settings.workflow_engine_url, "facebook.comment.received", result)
     return {"status": "ok"}
 
@@ -798,6 +1464,110 @@ async def add_contact(body: dict):
     return {"status": "created", "contact": contact}
 
 
+# ── Contact Lookup (used by brain for persona injection) ──
+
+@app.get("/contacts/lookup")
+async def contact_lookup(phone: str, platform: str = "whatsapp"):
+    """Lookup a contact by phone+platform. Used by brain service internally."""
+    contact = get_contact(_get_conn, phone, platform)
+    return {"contact": contact}
+
+
+# ── Contact Book (fazle_contacts) — full management ───────
+
+@app.get("/contacts/book")
+async def contacts_book_list(
+    platform: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """List contacts from contact book with optional search/filter."""
+    contacts = list_all_contacts(_get_conn, platform, search or "", limit, offset)
+    for c in contacts:
+        c["id"] = str(c["id"])
+        if c.get("last_seen"):
+            c["last_seen"] = c["last_seen"].isoformat()
+        if c.get("last_updated"):
+            c["last_updated"] = c["last_updated"].isoformat()
+    return {"contacts": contacts}
+
+
+@app.get("/contacts/book/{contact_id}")
+async def contacts_book_get(contact_id: str):
+    """Get a single contact by ID."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM fazle_contacts WHERE id = %s", (contact_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Contact not found")
+            c = dict(row)
+            c["id"] = str(c["id"])
+            if c.get("last_seen"):
+                c["last_seen"] = c["last_seen"].isoformat()
+            if c.get("last_updated"):
+                c["last_updated"] = c["last_updated"].isoformat()
+            if c.get("created_at"):
+                c["created_at"] = c["created_at"].isoformat()
+    return c
+
+
+@app.put("/contacts/book/{contact_id}")
+async def contacts_book_update(contact_id: str, body: dict):
+    """Update contact fields (name, relation, notes, company, personality_hint, interest_level)."""
+    ok = update_contact(_get_conn, contact_id, body)
+    if not ok:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    return {"status": "updated"}
+
+
+@app.delete("/contacts/book/{contact_id}")
+async def contacts_book_delete(contact_id: str):
+    """Delete a contact."""
+    ok = delete_contact(_get_conn, contact_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return {"status": "deleted"}
+
+
+@app.post("/contacts/import")
+async def contacts_import(request: Request):
+    """Import contacts from CSV. Columns: phone, name, relation, notes, company (optional).
+    Accepts raw CSV text in the request body with Content-Type text/csv,
+    or a JSON body with a 'csv' field containing the CSV text."""
+    import csv as csv_mod
+    content_type = request.headers.get("content-type", "")
+    if "text/csv" in content_type:
+        raw = (await request.body()).decode("utf-8", errors="replace")
+    else:
+        body = await request.json()
+        raw = body.get("csv", "")
+    if not raw.strip():
+        raise HTTPException(status_code=400, detail="No CSV data provided")
+
+    reader = csv_mod.DictReader(io.StringIO(raw))
+    imported = 0
+    errors = []
+    for i, row in enumerate(reader, start=2):
+        phone = (row.get("phone") or "").strip()
+        if not phone:
+            errors.append(f"Row {i}: missing phone")
+            continue
+        name = (row.get("name") or "").strip()
+        relation = (row.get("relation") or "unknown").strip()
+        notes = (row.get("notes") or "").strip()
+        company = (row.get("company") or "").strip()
+        personality = (row.get("personality_hint") or row.get("personality") or "").strip()
+        platform = (row.get("platform") or "whatsapp").strip()
+        try:
+            upsert_contact(_get_conn, phone, name, platform, relation, notes, company, personality)
+            imported += 1
+        except Exception as e:
+            errors.append(f"Row {i}: {e}")
+    return {"status": "imported", "imported": imported, "errors": errors}
+
+
 # ── Campaigns ──────────────────────────────────────────────
 
 @app.get("/campaigns")
@@ -841,27 +1611,127 @@ async def create_campaign(body: dict):
 
 @app.get("/stats")
 async def social_stats():
-    with _get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT COUNT(*) as total FROM fazle_social_contacts")
-            total_contacts = cur.fetchone()["total"]
+    try:
+        with _get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT COUNT(*) as total FROM fazle_social_contacts")
+                total_contacts = cur.fetchone()["total"]
 
-            cur.execute("SELECT COUNT(*) as total FROM fazle_social_messages WHERE platform = 'whatsapp'")
-            whatsapp_messages = cur.fetchone()["total"]
+                cur.execute("SELECT COUNT(*) as total FROM fazle_social_messages WHERE platform = 'whatsapp'")
+                whatsapp_messages = cur.fetchone()["total"]
 
-            cur.execute("SELECT COUNT(*) as total FROM fazle_social_posts WHERE platform = 'facebook'")
-            facebook_posts = cur.fetchone()["total"]
+                cur.execute("SELECT COUNT(*) as total FROM fazle_social_posts WHERE platform = 'facebook'")
+                facebook_posts = cur.fetchone()["total"]
 
-            cur.execute("SELECT COUNT(*) as total FROM fazle_social_scheduled WHERE status = 'pending'")
-            pending_scheduled = cur.fetchone()["total"]
+                cur.execute("SELECT COUNT(*) as total FROM fazle_social_scheduled WHERE status = 'pending'")
+                pending_scheduled = cur.fetchone()["total"]
 
-            cur.execute("SELECT COUNT(*) as total FROM fazle_social_campaigns WHERE status = 'running'")
-            active_campaigns = cur.fetchone()["total"]
+                cur.execute("SELECT COUNT(*) as total FROM fazle_social_campaigns WHERE status = 'running'")
+                active_campaigns = cur.fetchone()["total"]
 
-    return {
-        "total_contacts": total_contacts,
-        "whatsapp_messages": whatsapp_messages,
-        "facebook_posts": facebook_posts,
-        "pending_scheduled": pending_scheduled,
-        "active_campaigns": active_campaigns,
-    }
+        return {
+            "total_contacts": total_contacts,
+            "whatsapp_messages": whatsapp_messages,
+            "facebook_posts": facebook_posts,
+            "pending_scheduled": pending_scheduled,
+            "active_campaigns": active_campaigns,
+        }
+    except Exception as e:
+        logger.error(f"Stats query failed: {e}")
+        return {
+            "total_contacts": 0,
+            "whatsapp_messages": 0,
+            "facebook_posts": 0,
+            "pending_scheduled": 0,
+            "active_campaigns": 0,
+        }
+
+
+# ── Reply Reuse & Learning Stats (Steps 11, 12, 16, 18) ───
+
+@app.get("/reply-stats")
+async def reply_stats():
+    """Get reply reuse, feedback, summary, and multimodal stats."""
+    try:
+        stats = get_reply_stats(_get_conn)
+        return stats
+    except Exception as e:
+        logger.error(f"Reply stats query failed: {e}")
+        return {
+            "cached_replies": 0,
+            "total_reuses": 0,
+            "owner_feedback": 0,
+            "summaries": 0,
+            "multimodal_items": 0,
+        }
+
+
+@app.get("/summaries")
+async def list_summaries(phone: str = "", limit: int = 20):
+    """Get conversation summaries, optionally filtered by phone."""
+    try:
+        summaries = get_conversation_summaries(_get_conn, user_phone=phone, limit=limit)
+        for s in summaries:
+            s["id"] = str(s["id"])
+            if s.get("created_at"):
+                s["created_at"] = s["created_at"].isoformat()
+        return {"summaries": summaries}
+    except Exception as e:
+        logger.error(f"Summaries query failed: {e}")
+        return {"summaries": []}
+
+
+@app.get("/owner/audio-examples")
+async def owner_audio_examples(limit: int = 10):
+    """Get recent owner audio transcripts for style learning."""
+    try:
+        examples = get_owner_audio_examples(_get_conn, limit=limit)
+        return {"examples": examples}
+    except Exception as e:
+        logger.error(f"Owner audio examples query failed: {e}")
+        return {"examples": []}
+
+
+@app.get("/feedback")
+async def list_feedback(limit: int = 50):
+    """Get owner feedback on AI replies."""
+    try:
+        with _get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM fazle_owner_feedback ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                for r in rows:
+                    r["id"] = str(r["id"])
+                    if r.get("created_at"):
+                        r["created_at"] = r["created_at"].isoformat()
+        return {"feedback": rows}
+    except Exception as e:
+        logger.error(f"Feedback query failed: {e}")
+        return {"feedback": []}
+
+
+# ── Internal Endpoints (called by Brain service) ──────────
+
+@app.post("/internal/save-summary")
+async def internal_save_summary(request: Request):
+    """Save a conversation summary (called by brain /chat/summarize)."""
+    data = await request.json()
+    conversation_id = data.get("conversation_id", "")
+    user_phone = data.get("user_phone", "")
+    summary = data.get("summary", "")
+    message_count = data.get("message_count", 0)
+    key_topics = data.get("key_topics", [])
+    if not summary:
+        return {"ok": False, "error": "summary is required"}
+    save_conversation_summary(
+        _get_conn,
+        conversation_id=conversation_id,
+        user_phone=user_phone,
+        summary=summary,
+        message_count=message_count,
+        key_topics=key_topics,
+    )
+    return {"ok": True}

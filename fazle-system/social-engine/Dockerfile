@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+# Install tesseract-ocr (Bangla + English) and ffmpeg (for whisper)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-ben tesseract-ocr-eng ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt .

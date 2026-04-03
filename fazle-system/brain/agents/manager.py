@@ -2,6 +2,10 @@
 # Agent Manager — Orchestrates multi-agent reasoning pipeline
 # Routes queries to appropriate agents, merges results,
 # and feeds enriched context to the LLM for final response
+#
+# TWO-TIER ARCHITECTURE:
+#   Strategy layer (domain): social, voice, system, learning agents
+#   Utility layer: memory, research, task, tool, conversation agents
 # ============================================================
 import asyncio
 import logging
@@ -13,6 +17,12 @@ from .memory_agent import MemoryAgent
 from .research import ResearchAgent
 from .task_agent import TaskAgent
 from .tool_agent import ToolAgent
+from .identity_core import IdentityProfile, get_identity
+from .strategy_agent import StrategyAgent, DomainRoute
+from .social_agent import SocialAgent
+from .voice_agent import VoiceAgent
+from .system_agent import SystemAgent
+from .learning_agent import LearningAgent
 
 logger = logging.getLogger("fazle-agents.manager")
 
@@ -40,7 +50,12 @@ _COMPLEX_KEYWORDS = frozenset([
 
 
 class AgentManager:
-    """Orchestrates the multi-agent system for Fazle AI."""
+    """Orchestrates the multi-agent system for Fazle AI.
+
+    Two-tier architecture:
+    - Strategy tier: StrategyAgent coordinates domain agents (social, voice, system, learning)
+    - Utility tier: Memory, research, task, tool agents for enrichment
+    """
 
     def __init__(
         self,
@@ -50,7 +65,47 @@ class AgentManager:
         memory_url: str,
         tools_url: str,
         task_url: str,
+        learning_engine_url: str = "",
+        autonomy_engine_url: str = "",
+        redis_url: str = "",
     ):
+        # ── Identity Core ─────────────────────────────────
+        self.identity = get_identity(redis_url)
+
+        # ── Strategy Agent (coordinator) ──────────────────
+        self.strategy = StrategyAgent(self.identity)
+
+        # ── Domain Agents ─────────────────────────────────
+        self.social_agent = SocialAgent(
+            llm_gateway_url=llm_gateway_url,
+            memory_url=memory_url,
+            learning_engine_url=learning_engine_url,
+            identity=self.identity,
+        )
+        self.voice_agent = VoiceAgent(
+            ollama_url=ollama_url,
+            voice_fast_model=voice_fast_model,
+            llm_gateway_url=llm_gateway_url,
+            learning_engine_url=learning_engine_url,
+            identity=self.identity,
+        )
+        self.system_agent = SystemAgent(
+            autonomy_engine_url=autonomy_engine_url,
+            identity=self.identity,
+        )
+        self.learning_agent_domain = LearningAgent(
+            learning_engine_url=learning_engine_url,
+            memory_url=memory_url,
+            identity=self.identity,
+        )
+
+        # Register domain agents with strategy
+        self.strategy.register_agent("social", self.social_agent)
+        self.strategy.register_agent("voice", self.voice_agent)
+        self.strategy.register_agent("system", self.system_agent)
+        self.strategy.register_agent("learning", self.learning_agent_domain)
+
+        # ── Utility Agents (existing) ─────────────────────
         self.conversation_agent = ConversationAgent(
             ollama_url=ollama_url,
             voice_fast_model=voice_fast_model,
@@ -69,12 +124,53 @@ class AgentManager:
             self.conversation_agent,  # Always last (fallback)
         ]
 
+        logger.info(
+            "AgentManager initialized: identity_core + strategy + "
+            "4 domain agents + 5 utility agents"
+        )
+
     @property
     def agents(self):
         return self._agents
 
+    # ── Strategy-level routing (domain) ───────────────────
+
+    def route_domain(self, ctx: AgentContext) -> DomainRoute:
+        """Route to a domain agent via strategy agent."""
+        return self.strategy.route(ctx)
+
+    async def process_domain(self, ctx: AgentContext) -> dict:
+        """Process through the strategy/domain layer.
+
+        Returns dict with:
+            - route: str (domain route)
+            - tasks_executed: list[str]
+            - results: dict per agent
+            - identity_enforced: bool
+            - system_prompt: str (identity-enhanced, if produced by domain agent)
+        """
+        domain_route = self.route_domain(ctx)
+        coord_result = await self.strategy.coordinate(ctx, domain_route)
+
+        # Extract system prompt if a domain agent produced one
+        system_prompt = None
+        for agent_name, agent_result in coord_result.get("results", {}).items():
+            if isinstance(agent_result, dict):
+                sp = agent_result.get("metadata", {}).get("system_prompt")
+                if sp:
+                    system_prompt = sp
+                    break
+
+        coord_result["system_prompt"] = system_prompt
+        coord_result["identity_prompt"] = self.strategy.get_identity_prompt(
+            ctx.relationship
+        )
+        return coord_result
+
+    # ── Utility-level routing (existing) ──────────────────
+
     def route_query(self, message: str, source: str = "text") -> QueryRoute:
-        """Classify query into a routing path.
+        """Classify query into a utility routing path.
 
         Returns:
             FAST_VOICE: For simple greetings/acknowledgments via voice
@@ -97,7 +193,7 @@ class AgentManager:
         return QueryRoute.CONVERSATION
 
     async def process(self, ctx: AgentContext, route: QueryRoute | None = None) -> dict:
-        """Process a query through the appropriate agent pipeline.
+        """Process a query through the utility agent pipeline.
 
         Returns dict with:
             - reply: str

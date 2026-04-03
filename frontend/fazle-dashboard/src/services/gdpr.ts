@@ -20,6 +20,8 @@ export interface UserDataExport {
   status: string;
   request_id: string;
   message: string;
+  filename?: string;
+  data?: unknown;
 }
 
 export interface ExportStatus {
@@ -66,7 +68,7 @@ export const gdprService = {
     apiGet<ExportStatus>(`/gdpr/export/${requestId}`),
 
   deleteMyData: () =>
-    apiPost<{ status: string; message: string; request_id: string; grace_period_days: number }>('/gdpr/delete'),
+    apiPost<{ status: string; message: string; request_id: string; grace_period_days: number; deleted_from?: string[] }>('/gdpr/delete'),
 
   cancelDeletion: () =>
     apiPost<{ status: string; message: string }>('/gdpr/cancel-deletion'),

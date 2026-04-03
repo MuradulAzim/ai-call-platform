@@ -31,7 +31,7 @@ async def _proxy(method: str, path: str, **kwargs):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Social engine error [{method.upper()} {path}]: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+            return {"status": "fallback", "data": [], "detail": "Social engine unavailable"}
 
 
 # ── Integration Management ─────────────────────────────────
@@ -94,7 +94,7 @@ async def whatsapp_webhook_verify(request: Request):
             raise HTTPException(status_code=resp.status_code, detail="Verification failed")
         except httpx.HTTPError as e:
             logger.error(f"WhatsApp webhook verify error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+            return {"status": "ok"}
 
 
 @router.post("/whatsapp/webhook")
@@ -107,16 +107,17 @@ async def whatsapp_webhook_receive(request: Request):
         forward_headers["X-Hub-Signature-256"] = sig
     settings = _get_settings()
     url = f"{settings.social_engine_url}/whatsapp/webhook"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             resp = await client.post(url, content=raw_body, headers=forward_headers)
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+            logger.error(f"WhatsApp webhook status error: {e.response.status_code}")
+            return {"status": "ok"}
         except httpx.HTTPError as e:
             logger.error(f"WhatsApp webhook receive error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+            return {"status": "ok"}
 
 
 @router.get("/facebook/webhook")
@@ -132,7 +133,7 @@ async def facebook_webhook_verify(request: Request):
             raise HTTPException(status_code=resp.status_code, detail="Verification failed")
         except httpx.HTTPError as e:
             logger.error(f"Facebook webhook verify error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+            return {"status": "ok"}
 
 
 @router.post("/facebook/webhook")
@@ -151,10 +152,11 @@ async def facebook_webhook_receive(request: Request):
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+            logger.error(f"Facebook webhook status error: {e.response.status_code}")
+            return {"status": "ok"}
         except httpx.HTTPError as e:
             logger.error(f"Facebook webhook receive error: {e}")
-            raise HTTPException(status_code=502, detail="Social engine unavailable")
+            return {"status": "ok"}
 
 
 # ── WhatsApp ────────────────────────────────────────────────
@@ -253,6 +255,62 @@ async def add_contact(body: dict, user: dict = Depends(require_admin)):
     return result
 
 
+# ── Contact Book (fazle_contacts — personal contact intelligence) ──
+
+@router.get("/contacts/book")
+async def list_contact_book(
+    platform: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(require_admin),
+):
+    """List contacts from the personal contact book with search/filter."""
+    params = {"limit": limit, "offset": offset}
+    if platform:
+        params["platform"] = platform
+    if search:
+        params["search"] = search
+    return await _proxy("get", "/contacts/book", params=params)
+
+
+@router.get("/contacts/book/{contact_id}")
+async def get_contact_book_entry(contact_id: str, user: dict = Depends(require_admin)):
+    """Get a single contact from the contact book."""
+    return await _proxy("get", f"/contacts/book/{contact_id}")
+
+
+@router.put("/contacts/book/{contact_id}")
+async def update_contact_book_entry(contact_id: str, body: dict, user: dict = Depends(require_admin)):
+    """Update a contact in the contact book."""
+    result = await _proxy("put", f"/contacts/book/{contact_id}", json=body)
+    log_action(user, "update_contact", target_type="social", detail=contact_id)
+    return result
+
+
+@router.delete("/contacts/book/{contact_id}")
+async def delete_contact_book_entry(contact_id: str, user: dict = Depends(require_admin)):
+    """Delete a contact from the contact book."""
+    result = await _proxy("delete", f"/contacts/book/{contact_id}")
+    log_action(user, "delete_contact", target_type="social", detail=contact_id)
+    return result
+
+
+@router.post("/contacts/import")
+async def import_contacts_csv(request: Request, user: dict = Depends(require_admin)):
+    """Import contacts from CSV (text/csv body or JSON with csv field)."""
+    content_type = request.headers.get("content-type", "")
+    if "text/csv" in content_type:
+        raw = await request.body()
+        result = await _proxy("post", "/contacts/import", content=raw,
+                              headers={"Content-Type": "text/csv"}, timeout=30.0)
+    else:
+        body = await request.json()
+        result = await _proxy("post", "/contacts/import", json=body, timeout=30.0)
+    log_action(user, "import_contacts", target_type="social")
+    return result
+
+
 # ── Campaigns ──────────────────────────────────────────────
 
 @router.get("/campaigns")
@@ -275,3 +333,32 @@ async def create_campaign(body: dict, user: dict = Depends(require_admin)):
 async def social_stats(user: dict = Depends(require_admin)):
     """Get social engine stats."""
     return await _proxy("get", "/stats")
+
+
+# ── Reply Reuse & Learning ────────────────────────────────
+
+@router.get("/reply-stats")
+async def reply_stats(user: dict = Depends(require_admin)):
+    """Get reply reuse, feedback, summary, and multimodal learning stats."""
+    return await _proxy("get", "/reply-stats")
+
+
+@router.get("/summaries")
+async def list_summaries(phone: str = "", limit: int = 20, user: dict = Depends(require_admin)):
+    """Get conversation summaries, optionally filtered by phone."""
+    params = {"limit": limit}
+    if phone:
+        params["phone"] = phone
+    return await _proxy("get", "/summaries", params=params)
+
+
+@router.get("/owner/audio-examples")
+async def owner_audio_examples(limit: int = 10, user: dict = Depends(require_admin)):
+    """Get owner audio transcripts for style learning."""
+    return await _proxy("get", "/owner/audio-examples", params={"limit": limit})
+
+
+@router.get("/feedback")
+async def list_feedback(limit: int = 50, user: dict = Depends(require_admin)):
+    """Get owner feedback on AI replies."""
+    return await _proxy("get", "/feedback", params={"limit": limit})

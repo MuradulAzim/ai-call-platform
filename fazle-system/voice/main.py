@@ -2,7 +2,10 @@
 # Fazle Voice Agent — LiveKit-based voice interface
 # Joins rooms, transcribes speech, queries Brain, speaks reply
 # Uses OpenAI Realtime or Whisper STT + TTS pipeline
+# Enhanced with VoiceBrainManager for session management,
+# interrupt handling, chunked speech output, and silence detection
 # ============================================================
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +24,8 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai, silero
 from pydantic_settings import BaseSettings
 
+from voice_brain import VoiceBrainManager, SpeakingState
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-voice")
 
@@ -36,6 +41,10 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
     fast_mode: bool = True
+    redis_url: str = "redis://redis:6379/1"
+    silence_prompt_sec: float = 8.0
+    silence_hangup_sec: float = 15.0
+    max_history: int = 10
 
     class Config:
         env_prefix = "FAZLE_VOICE_"
@@ -50,6 +59,24 @@ TTS_ENGINE = settings.tts_engine or os.getenv("FAZLE_VOICE_TTS_ENGINE", "piper")
 VOICE_MODEL = settings.voice_model or os.getenv("FAZLE_VOICE_VOICE_MODEL", "en_US-lessac-medium")
 VOICE_MODEL_DIR = settings.voice_model_dir or os.getenv("FAZLE_VOICE_VOICE_MODEL_DIR", "/models")
 
+# ── ElevenLabs (optional, hybrid TTS) ───────────────────────
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+
+if ELEVENLABS_API_KEY:
+    logger.info("ElevenLabs API key detected — hybrid TTS available")
+else:
+    logger.info("No ElevenLabs API key — using Piper/OpenAI TTS only")
+
+# ── Global Voice Brain Manager (shared across sessions) ─────
+voice_brain = VoiceBrainManager(
+    brain_url=BRAIN_URL,
+    redis_url=settings.redis_url or os.getenv("REDIS_URL", ""),
+    max_history=settings.max_history,
+    silence_prompt_sec=settings.silence_prompt_sec,
+    silence_hangup_sec=settings.silence_hangup_sec,
+)
+
 
 def build_tts():
     """Build the TTS engine — Piper (local) or OpenAI (remote)."""
@@ -61,6 +88,34 @@ def build_tts():
     else:
         logger.info(f"Using OpenAI TTS: voice={settings.tts_voice}")
         return openai.TTS(api_key=OPENAI_API_KEY, voice=settings.tts_voice)
+
+
+def build_piper_tts():
+    """Build Piper TTS (always available as fallback)."""
+    from piper_tts import PiperTTS
+    model_path = os.path.join(VOICE_MODEL_DIR, f"{VOICE_MODEL}.onnx")
+    return PiperTTS(model_path=model_path)
+
+
+def build_session_tts(piper, voice_id: str = ""):
+    """Build per-session TTS with ElevenLabs hybrid support.
+
+    Priority: ElevenLabs cloned voice > ElevenLabs default voice > Piper.
+    """
+    if TTS_ENGINE == "openai":
+        return openai.TTS(api_key=OPENAI_API_KEY, voice=settings.tts_voice)
+
+    el_voice_id = voice_id or ELEVENLABS_VOICE_ID
+    if ELEVENLABS_API_KEY and el_voice_id:
+        from piper_tts import ElevenLabsTTS
+        logger.info(f"Session TTS: ElevenLabs hybrid (voice_id={el_voice_id})")
+        return ElevenLabsTTS(
+            api_key=ELEVENLABS_API_KEY,
+            voice_id=el_voice_id,
+            piper_fallback=piper,
+        )
+
+    return piper
 
 
 async def query_brain(message: str, user_id: str, user_name: str, relationship: str) -> str:
@@ -174,10 +229,11 @@ async def query_brain_stream(message: str, user_id: str, user_name: str, relatio
 
 
 class FazleLLM(llm.LLM):
-    """Custom LLM adapter that routes through Fazle Brain instead of direct OpenAI."""
+    """Custom LLM adapter that routes through VoiceBrainManager + Fazle Brain."""
 
     def __init__(self):
         super().__init__()
+        self._session_id = ""
         self._user_id = ""
         self._user_name = "User"
         self._relationship = "self"
@@ -186,6 +242,9 @@ class FazleLLM(llm.LLM):
         self._user_id = user_id
         self._user_name = user_name
         self._relationship = relationship
+
+    def set_session_id(self, session_id: str):
+        self._session_id = session_id
 
     async def chat(
         self,
@@ -200,30 +259,20 @@ class FazleLLM(llm.LLM):
                 last_message = msg.content
                 break
 
-        # Smart routing: fast path for simple queries, full agent pipeline for complex
-        endpoint = route_query(last_message)
-        if endpoint == "/chat/fast":
-            return _FastBrainResponse(last_message, chat_ctx)
-
-        # Full agent pipeline via /chat/agent/stream
-        return _StreamingBrainResponse(
-            last_message,
-            self._user_id,
-            self._user_name,
-            self._relationship,
-            chat_ctx,
+        return _VoiceBrainStream(
+            session_id=self._session_id,
+            message=last_message,
+            chat_ctx=chat_ctx,
         )
 
 
-class _StreamingBrainResponse(llm.LLMStream):
-    """Streams text chunks from Brain /chat/stream as an LLM stream for TTS."""
+class _VoiceBrainStream(llm.LLMStream):
+    """Streams voice brain response chunks as an LLM stream for TTS."""
 
-    def __init__(self, message: str, user_id: str, user_name: str, relationship: str, chat_ctx: llm.ChatContext):
+    def __init__(self, session_id: str, message: str, chat_ctx: llm.ChatContext):
         super().__init__(chat_ctx=chat_ctx)
+        self._session_id = session_id
         self._message = message
-        self._user_id = user_id
-        self._user_name = user_name
-        self._relationship = relationship
         self._gen = None
         self._done = False
 
@@ -231,36 +280,9 @@ class _StreamingBrainResponse(llm.LLMStream):
         if self._done:
             raise StopAsyncIteration
         if self._gen is None:
-            self._gen = query_brain_stream(
-                self._message, self._user_id, self._user_name, self._relationship
+            self._gen = voice_brain.handle_user_speech(
+                self._session_id, self._message, is_final=True
             )
-        try:
-            text = await self._gen.__anext__()
-            delta = llm.ChoiceDelta(role="assistant", content=text)
-            choice = llm.Choice(delta=delta, index=0)
-            return llm.ChatChunk(choices=[choice])
-        except StopAsyncIteration:
-            self._done = True
-            raise
-
-    async def aclose(self):
-        self._done = True
-
-
-class _FastBrainResponse(llm.LLMStream):
-    """Streams text chunks from Brain /chat/fast (ultra-low latency)."""
-
-    def __init__(self, message: str, chat_ctx: llm.ChatContext):
-        super().__init__(chat_ctx=chat_ctx)
-        self._message = message
-        self._gen = None
-        self._done = False
-
-    async def __anext__(self) -> llm.ChatChunk:
-        if self._done:
-            raise StopAsyncIteration
-        if self._gen is None:
-            self._gen = query_brain_fast(self._message)
         try:
             text = await self._gen.__anext__()
             delta = llm.ChoiceDelta(role="assistant", content=text)
@@ -297,7 +319,8 @@ class _SingleResponseStream(llm.LLMStream):
 def prewarm(proc: JobProcess):
     """Preload VAD + TTS models for faster startup."""
     proc.userdata["vad"] = silero.VAD.load()
-    proc.userdata["tts"] = build_tts()
+    proc.userdata["piper_tts"] = build_piper_tts()
+    logger.info("Prewarmed: VAD + Piper TTS")
 
 
 async def entrypoint(ctx: JobContext):
@@ -311,13 +334,36 @@ async def entrypoint(ctx: JobContext):
     participant = await ctx.wait_for_participant()
     user_id = participant.identity or "unknown"
     user_name = participant.name or "User"
-    relationship = participant.metadata or "self"
 
-    logger.info(f"Voice session: user={user_name}, relationship={relationship}, id={user_id}")
+    # Parse metadata — supports JSON (new) and plain string (legacy)
+    raw_metadata = participant.metadata or ""
+    try:
+        meta = json.loads(raw_metadata)
+        relationship = meta.get("relationship", "self")
+        session_voice_id = meta.get("voice_id", "")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        relationship = raw_metadata or "self"
+        session_voice_id = ""
 
-    # Build the voice pipeline
+    logger.info(f"Voice session: user={user_name}, relationship={relationship}, id={user_id}, voice_id={session_voice_id or 'none'}")
+
+    # Create a voice brain session for this call
+    session = voice_brain.create_session(
+        user_id=user_id,
+        user_name=user_name,
+        relationship=relationship,
+        session_id=ctx.room.name,
+        voice_id=session_voice_id,
+    )
+
+    # Build per-session TTS (ElevenLabs hybrid if available, else Piper)
+    piper_tts = ctx.proc.userdata["piper_tts"]
+    session_tts = build_session_tts(piper_tts, voice_id=session_voice_id)
+
+    # Build the voice pipeline with brain-backed LLM
     fazle_llm = FazleLLM()
     fazle_llm.set_user_context(user_id, user_name, relationship)
+    fazle_llm.set_session_id(session.session_id)
 
     initial_ctx = llm.ChatContext()
     initial_ctx.append(
@@ -325,7 +371,8 @@ async def entrypoint(ctx: JobContext):
         text=(
             f"You are Azim speaking to {user_name} (your {relationship}). "
             "Keep responses concise and natural for voice conversation. "
-            "Speak warmly and directly."
+            "Max 1-2 sentences per response. Speak warmly and directly. "
+            "Use natural spoken Bangla. No bullet points or long explanations."
         ),
     )
 
@@ -333,16 +380,57 @@ async def entrypoint(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
         stt=openai.STT(api_key=OPENAI_API_KEY),
         llm=fazle_llm,
-        tts=ctx.proc.userdata["tts"],
+        tts=session_tts,
         chat_ctx=initial_ctx,
         min_endpointing_delay=0.5,
+        allow_interruptions=True,
     )
 
     agent.start(ctx.room, participant)
 
-    # Greet the user
-    greeting = f"Hey {user_name}, what's up?" if relationship != "self" else "Hey, what do you need?"
+    # Natural greeting via voice brain
+    greeting = voice_brain.get_greeting(session)
     await agent.say(greeting, allow_interruptions=True)
+
+    # Register interrupt handler: when user starts speaking, interrupt AI
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(track: rtc.Track, *args):
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            voice_brain.interrupt_current_response(session.session_id)
+
+    # Silence detection loop
+    async def silence_monitor():
+        while session.session_id in voice_brain._sessions:
+            await asyncio.sleep(2.0)
+            action = await voice_brain.check_silence(session.session_id)
+            if action == "prompt":
+                try:
+                    await agent.say(
+                        voice_brain.SILENCE_PROMPT,
+                        allow_interruptions=True,
+                    )
+                except Exception:
+                    pass
+            elif action == "hangup":
+                try:
+                    await agent.say(
+                        voice_brain.GOODBYE_MSG,
+                        allow_interruptions=False,
+                    )
+                except Exception:
+                    pass
+                logger.info(f"Silence hangup: {session.session_id}")
+                break
+
+    silence_task = asyncio.create_task(silence_monitor())
+
+    # Wait for the room to close (call ends)
+    try:
+        await ctx.room.disconnected()
+    finally:
+        silence_task.cancel()
+        voice_brain.end_session(session.session_id)
+        logger.info(f"Voice call ended: {session.session_id}")
 
 
 if __name__ == "__main__":

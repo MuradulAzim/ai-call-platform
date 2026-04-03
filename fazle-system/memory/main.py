@@ -12,11 +12,14 @@ import httpx
 import logging
 import uuid
 import hashlib
-from typing import Optional
+from typing import Optional, List
 import os
 from datetime import datetime
 from minio import Minio
 from urllib.parse import urlparse
+import psycopg2
+import psycopg2.pool
+import json as json_mod
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-memory")
@@ -42,6 +45,14 @@ class Settings(BaseSettings):
     minio_secure: bool = False
     minio_presign_expiry: int = 3600  # 1 hour
 
+    # Ollama embedding fallback (when OpenAI is unavailable)
+    ollama_url: str = "http://ollama:11434"
+    ollama_embedding_model: str = "nomic-embed-text"
+    ollama_embedding_dim: int = 768
+
+    # PostgreSQL for structured knowledge
+    database_url: str = ""
+
     class Config:
         env_prefix = ""
 
@@ -52,7 +63,28 @@ app = FastAPI(title="Fazle Memory — Vector Memory System", version="1.0.0")
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+# ── PostgreSQL connection pool ──────────────────────────────
+_db_pool: psycopg2.pool.SimpleConnectionPool | None = None
+
+
+def _get_db_pool() -> psycopg2.pool.SimpleConnectionPool | None:
+    global _db_pool
+    if _db_pool is not None:
+        return _db_pool
+    if not settings.database_url:
+        logger.warning("DATABASE_URL not set — knowledge table endpoints disabled")
+        return None
+    try:
+        _db_pool = psycopg2.pool.SimpleConnectionPool(1, 5, settings.database_url)
+        logger.info("PostgreSQL connection pool created")
+        return _db_pool
+    except Exception as e:
+        logger.error(f"Failed to create PostgreSQL pool: {e}")
+        return None
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,19 +154,43 @@ async def ensure_collection():
 
 
 async def get_embedding(text: str) -> list[float]:
-    """Get embedding vector from OpenAI (text-embedding-3-small, 1536-dim)."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"model": settings.embedding_model, "input": text},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["data"][0]["embedding"]
+    """Get embedding vector. Tries OpenAI first, falls back to Ollama nomic-embed-text."""
+    # Try OpenAI first
+    if settings.openai_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/embeddings",
+                    headers={
+                        "Authorization": f"Bearer {settings.openai_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": settings.embedding_model, "input": text},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data["data"][0]["embedding"]
+        except Exception as e:
+            logger.warning(f"OpenAI embedding failed, falling back to Ollama: {e}")
+
+    # Fallback to Ollama
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{settings.ollama_url}/api/embeddings",
+                json={"model": settings.ollama_embedding_model, "prompt": text},
+            )
+            resp.raise_for_status()
+            embedding = resp.json()["embedding"]
+            # Pad or truncate to match expected dimension for Qdrant collection
+            if len(embedding) < settings.embedding_dim:
+                embedding += [0.0] * (settings.embedding_dim - len(embedding))
+            elif len(embedding) > settings.embedding_dim:
+                embedding = embedding[:settings.embedding_dim]
+            return embedding
+    except Exception as e:
+        logger.error(f"Ollama embedding also failed: {e}")
+        raise HTTPException(status_code=502, detail="All embedding services unavailable")
 
 
 async def get_multimodal_embedding(text: str) -> list[float]:
@@ -792,3 +848,173 @@ async def collection_metrics():
             except Exception:
                 metrics[coll] = {"error": "unavailable"}
     return metrics
+
+
+# ── Owner Knowledge — Structured PostgreSQL storage ─────────
+
+KNOWLEDGE_CATEGORIES = {
+    "personal", "business", "political", "family", "daily",
+    "social", "religious", "financial", "health", "tech",
+    "preference", "education", "ideology",
+}
+
+
+class KnowledgeStoreRequest(BaseModel):
+    category: str = Field(..., description="Knowledge category")
+    subcategory: str = ""
+    key: str = Field(..., description="Knowledge key (e.g., 'full_name')")
+    value: str = Field(..., description="Knowledge value")
+    language: str = "en"
+    confidence: float = 1.0
+    source: str = "owner_chat"
+    metadata: dict = Field(default_factory=dict)
+
+
+@app.post("/knowledge/store")
+async def store_knowledge(request: KnowledgeStoreRequest):
+    """Store structured owner knowledge in PostgreSQL."""
+    pool = _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    if request.category not in KNOWLEDGE_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category. Must be one of: {KNOWLEDGE_CATEGORIES}",
+        )
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT upsert_owner_knowledge(%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    request.category,
+                    request.subcategory,
+                    request.key,
+                    request.value,
+                    request.language,
+                    request.confidence,
+                    request.source,
+                    json_mod.dumps(request.metadata),
+                ),
+            )
+            result_id = cur.fetchone()[0]
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Knowledge store failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to store knowledge")
+    finally:
+        pool.putconn(conn)
+
+    # Also store in Qdrant for vector search
+    text_to_embed = f"Azim's {request.category} — {request.key}: {request.value}"
+    try:
+        embedding = await get_embedding(text_to_embed)
+        content_hash = hashlib.sha256(
+            f"knowledge:{request.category}:{request.key}".encode()
+        ).hexdigest()[:16]
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, content_hash))
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.put(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points",
+                json={
+                    "points": [{
+                        "id": point_id,
+                        "vector": embedding,
+                        "payload": {
+                            "type": "knowledge",
+                            "user": "owner",
+                            "category": request.category,
+                            "key": request.key,
+                            "text": text_to_embed,
+                            "content": {"category": request.category, "key": request.key, "value": request.value},
+                            "created_at": datetime.utcnow().isoformat(),
+                        },
+                    }],
+                },
+            )
+    except Exception as e:
+        logger.warning(f"Qdrant mirror for knowledge failed (non-fatal): {e}")
+
+    return {"status": "stored", "id": str(result_id), "category": request.category, "key": request.key}
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = ""
+    category: Optional[str] = None
+    limit: int = 20
+
+
+@app.post("/knowledge/search")
+async def search_knowledge(request: KnowledgeSearchRequest):
+    """Search owner knowledge from PostgreSQL by category or text match."""
+    pool = _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            conditions = []
+            params: list = []
+            if request.category:
+                conditions.append("category = %s")
+                params.append(request.category)
+            if request.query:
+                conditions.append("(key ILIKE %s OR value ILIKE %s)")
+                like = f"%{request.query}%"
+                params.extend([like, like])
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            cur.execute(
+                f"SELECT id, category, subcategory, key, value, language, confidence, source, metadata, created_at "
+                f"FROM fazle_owner_knowledge {where} ORDER BY updated_at DESC LIMIT %s",
+                params + [request.limit],
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.error(f"Knowledge search failed: {e}")
+        raise HTTPException(status_code=500, detail="Knowledge search failed")
+    finally:
+        pool.putconn(conn)
+
+    results = []
+    for row in rows:
+        results.append({
+            "id": str(row[0]),
+            "category": row[1],
+            "subcategory": row[2],
+            "key": row[3],
+            "value": row[4],
+            "language": row[5],
+            "confidence": row[6],
+            "source": row[7],
+            "metadata": row[8] if isinstance(row[8], dict) else {},
+            "created_at": row[9].isoformat() if row[9] else None,
+        })
+
+    return {"results": results, "count": len(results)}
+
+
+@app.get("/knowledge/categories")
+async def list_knowledge_categories():
+    """List knowledge categories with counts."""
+    pool = _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT category, COUNT(*) as count FROM fazle_owner_knowledge GROUP BY category ORDER BY count DESC"
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.error(f"Knowledge categories query failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list categories")
+    finally:
+        pool.putconn(conn)
+
+    return {"categories": [{"category": r[0], "count": r[1]} for r in rows]}

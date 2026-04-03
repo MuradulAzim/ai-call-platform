@@ -69,7 +69,7 @@ def redact_pii(text: str) -> str:
 
 app = FastAPI(title="Fazle Trainer — Learning & Preference Extraction", version="1.0.0")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
 
 app.add_middleware(
     CORSMiddleware,

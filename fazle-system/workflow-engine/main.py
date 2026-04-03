@@ -111,6 +111,13 @@ class WorkflowCreate(BaseModel):
     trigger_type: str = Field("manual", pattern=r"^(manual|schedule|event)$")
 
 
+class WorkflowTriggerRequest(BaseModel):
+    event: str = Field(..., min_length=1, max_length=200)
+    source: str = Field("external", max_length=100)
+    payload: dict = Field(default_factory=dict)
+    timestamp: Optional[str] = None
+
+
 # ── Workflow Execution ──────────────────────────────────────
 
 _running_workflows: dict[str, bool] = {}
@@ -276,6 +283,43 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "workflow-engine", "version": "1.0.0"}
+
+
+@app.post("/trigger")
+async def trigger_workflow_event(req: WorkflowTriggerRequest):
+    """Accept social or external events without 404ing the caller.
+
+    This endpoint currently acknowledges the event and reports which workflows
+    are configured for event-based triggering. Execution remains an explicit
+    action through the existing workflow routes.
+    """
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, name, status
+                   FROM fazle_ai_workflows
+                   WHERE trigger_type = 'event'
+                   ORDER BY created_at DESC""",
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+
+    logger.info(
+        "Received workflow trigger event '%s' from %s (matched_event_workflows=%s)",
+        req.event,
+        req.source,
+        len(rows),
+    )
+    return {
+        "status": "accepted",
+        "event": req.event,
+        "source": req.source,
+        "matched_workflows": [
+            {"id": str(r["id"]), "name": r["name"], "status": r["status"]}
+            for r in rows
+        ],
+        "matched_count": len(rows),
+        "timestamp": req.timestamp,
+    }
 
 
 @app.post("/workflows/create")

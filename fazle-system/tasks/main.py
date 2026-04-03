@@ -87,7 +87,7 @@ app = FastAPI(title="Fazle Task Engine — Scheduling & Automation", version="2.
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
 
 app.add_middleware(
     CORSMiddleware,

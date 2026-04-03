@@ -13,6 +13,8 @@ services:
     container_name: fazle-api
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -37,12 +39,16 @@ services:
       FAZLE_GUARDRAIL_URL: "http://fazle-guardrail-engine:9600"
       FAZLE_WORKFLOW_ENGINE_URL: "http://fazle-workflow-engine:9700"
       FAZLE_SOCIAL_ENGINE_URL: "http://fazle-social-engine:9800"
+      FAZLE_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/7"
+      FAZLE_RATE_LIMIT_RPM: "${FAZLE_RATE_LIMIT_RPM:-120}"
+      FAZLE_RATE_LIMIT_PER_IP_RPS: "${FAZLE_RATE_LIMIT_PER_IP_RPS:-10}"
       # Vision + MinIO
       FAZLE_OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       FAZLE_MINIO_ENDPOINT: "minio:9000"
       FAZLE_MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-}"
       FAZLE_MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-}"
       FAZLE_MINIO_BUCKET: "fazle-multimodal"
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"
     logging:
       driver: "json-file"
       options:
@@ -66,7 +72,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8100/health').read()\""]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 5
       start_period: 60s
     networks:
@@ -80,6 +86,8 @@ services:
     container_name: fazle-brain
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -104,7 +112,7 @@ services:
       # Voice fast mode & agent system
       VOICE_FAST_MODE: "${FAZLE_VOICE_FAST_MODE:-true}"
       VOICE_OLLAMA_MODEL: "${VOICE_OLLAMA_MODEL:-qwen2.5:3b}"
-      VOICE_FAST_MODEL: "${VOICE_FAST_MODEL:-qwen2.5:0.5b}"
+      VOICE_FAST_MODEL: "${VOICE_FAST_MODEL:-qwen2.5:3b}"
       PERSONA_CACHE_TTL: "${PERSONA_CACHE_TTL:-300}"
       MEMORY_TOP_K: "${MEMORY_TOP_K:-2}"
     logging:
@@ -122,7 +130,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8200/health').read()\""]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 5
       start_period: 60s
     networks:
@@ -136,6 +144,8 @@ services:
     container_name: fazle-memory
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -151,6 +161,12 @@ services:
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:-}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-}"
       MINIO_BUCKET: "fazle-multimodal"
+      # Ollama embedding fallback
+      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+      OLLAMA_EMBEDDING_DIM: "768"
+      # PostgreSQL for structured knowledge
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-postgres}"
     logging:
       driver: "json-file"
       options:
@@ -166,7 +182,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8300/health').read()\""]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 5
       start_period: 60s
     networks:
@@ -180,6 +196,8 @@ services:
     container_name: fazle-task-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -216,6 +234,8 @@ services:
     container_name: fazle-web-intelligence
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -251,6 +271,8 @@ services:
     container_name: fazle-trainer
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -292,6 +314,8 @@ services:
     container_name: fazle-voice
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     volumes:
@@ -306,6 +330,9 @@ services:
       FAZLE_VOICE_TTS_ENGINE: "${FAZLE_VOICE_TTS_ENGINE:-piper}"
       FAZLE_VOICE_VOICE_MODEL: "${FAZLE_VOICE_VOICE_MODEL:-en_US-lessac-medium}"
       FAZLE_VOICE_VOICE_MODEL_DIR: "/models"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/1"
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID:-}"
     logging:
       driver: "json-file"
       options:
@@ -330,6 +357,7 @@ services:
     networks:
       - app-network
       - ai-network
+      - db-network
 
   # ── Fazle UI — Next.js Control Dashboard ───────────────────
   fazle-ui:
@@ -374,6 +402,8 @@ services:
     container_name: fazle-llm-gateway
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -419,6 +449,8 @@ services:
     container_name: fazle-learning-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -462,6 +494,8 @@ services:
     container_name: fazle-queue
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -500,6 +534,8 @@ services:
     build: ../fazle-system/workers
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -548,8 +584,12 @@ services:
     container_name: fazle-autonomy-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
+    volumes:
+      - ../fazle-system:/source:rw
     environment:
       AUTONOMY_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
       AUTONOMY_BRAIN_URL: "http://fazle-brain:8200"
@@ -557,6 +597,11 @@ services:
       AUTONOMY_TOOLS_URL: "http://fazle-web-intelligence:8500"
       AUTONOMY_TOOL_ENGINE_URL: "http://fazle-tool-engine:9200"
       AUTONOMY_KNOWLEDGE_GRAPH_URL: "http://fazle-knowledge-graph:9300"
+      AUTONOMY_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/6"
+      AUTONOMY_BRAIN_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/1"
+      AUTONOMY_MONITOR_ENABLED: "true"
+      AUTONOMY_MONITOR_INTERVAL_SECONDS: "300"
+      AUTONOMY_AUTO_IMPROVE_ENABLED: "true"
     logging:
       driver: "json-file"
       options:
@@ -583,6 +628,7 @@ services:
     networks:
       - ai-network
       - app-network
+      - db-network
 
   # ── Phase-5: Tool Execution Engine — Secure Tool Orchestration ──
   fazle-tool-engine:
@@ -590,6 +636,8 @@ services:
     container_name: fazle-tool-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -626,6 +674,8 @@ services:
     container_name: fazle-knowledge-graph
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -662,6 +712,8 @@ services:
     container_name: fazle-autonomous-runner
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -702,6 +754,8 @@ services:
     container_name: fazle-self-learning
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -738,6 +792,8 @@ services:
     container_name: fazle-guardrail-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -770,6 +826,8 @@ services:
     container_name: fazle-workflow-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -808,6 +866,8 @@ services:
     container_name: fazle-social-engine
     restart: unless-stopped
     read_only: true
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
     environment:
@@ -823,6 +883,8 @@ services:
       SOCIAL_VERIFY_TOKEN: "${SOCIAL_VERIFY_TOKEN:-}"
       SOCIAL_META_APP_SECRET: "${SOCIAL_META_APP_SECRET:-}"
       SOCIAL_WORKFLOW_ENGINE_URL: "http://fazle-workflow-engine:9700"
+      SOCIAL_OWNER_PHONE: "${SOCIAL_OWNER_PHONE:-}"
+      SOCIAL_LEARNING_ENGINE_URL: "http://fazle-learning-engine:8900"
     logging:
       driver: "json-file"
       options:
@@ -841,7 +903,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9800/health').read()\""]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 5
       start_period: 60s
     networks:

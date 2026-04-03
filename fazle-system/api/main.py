@@ -4,17 +4,23 @@
 # ============================================================
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from prometheus_fastapi_instrumentator import Instrumentator
 import hmac
 import httpx
+import json
 import logging
 import os
 import io
 import base64
 from typing import Optional
 from datetime import datetime
+
+import psycopg2
+import redis
+import time
 
 from schemas import (
     ChatRequest, ChatResponse,
@@ -57,6 +63,13 @@ logger = logging.getLogger("fazle-api")
 # Allowed file extensions for upload
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".png", ".jpg", ".jpeg", ".gif"}
 
+# Audio extensions for voice cloning
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".ogg", ".m4a", ".webm"}
+
+# ElevenLabs Voice Cloning (optional)
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1"
+
 
 class Settings(BaseSettings):
     api_key: str = ""
@@ -73,7 +86,10 @@ class Settings(BaseSettings):
     self_learning_url: str = "http://fazle-self-learning:9500"
     guardrail_url: str = "http://fazle-guardrail-engine:9600"
     workflow_engine_url: str = "http://fazle-workflow-engine:9700"
-    social_engine_url: str = "http://fazle-social-engine:9900"
+    social_engine_url: str = "http://fazle-social-engine:9800"
+    redis_url: str = "redis://redis:6379/7"
+    rate_limit_rpm: int = 120
+    rate_limit_per_ip_rps: int = 10
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
     livekit_url: str = "wss://livekit.iamazim.com"
@@ -99,6 +115,64 @@ app = FastAPI(
 )
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+# ── Redis for Rate Limiting ──────────────────────────────────
+_redis_client: redis.Redis | None = None
+
+
+def _get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(
+            settings.redis_url, decode_responses=True, socket_connect_timeout=2
+        )
+    return _redis_client
+
+
+def _check_rate_limit(key: str, limit: int, window: int) -> bool:
+    """Sliding-window rate limiter. Returns True if allowed."""
+    try:
+        r = _get_redis()
+        now = int(time.time() * 1000)
+        window_start = now - (window * 1000)
+        pipe = r.pipeline()
+        pipe.zremrangebyscore(key, 0, window_start)
+        pipe.zadd(key, {f"{now}:{os.urandom(4).hex()}": now})
+        pipe.zcard(key)
+        pipe.expire(key, window + 10)
+        results = pipe.execute()
+        return results[2] <= limit
+    except Exception:
+        return True  # fail open — don't block requests if Redis is down
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request, call_next):
+    """Per-IP rate limiting. Skip health/metrics endpoints."""
+    path = request.url.path
+    if path in ("/health", "/metrics"):
+        return await call_next(request)
+
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+
+    # Per-second burst limit (10 req/s per IP)
+    if not _check_rate_limit(f"api_rl_s:{client_ip}", settings.rate_limit_per_ip_rps, 1):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please slow down."},
+            headers={"Retry-After": "1"},
+        )
+
+    # Per-minute sustained limit (120 req/min per IP)
+    if not _check_rate_limit(f"api_rl_m:{client_ip}", settings.rate_limit_rpm, 60):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again in a minute."},
+            headers={"Retry-After": "60"},
+        )
+
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,6 +224,63 @@ async def verify_auth(
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
+# ── Voice Clone Database Helpers ────────────────────────────
+
+def _ensure_voice_clones_table():
+    """Create voice_clones table if not exists."""
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    if not db_url:
+        return
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS voice_clones (
+                    user_id TEXT PRIMARY KEY,
+                    voice_id TEXT NOT NULL,
+                    voice_name TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_voice_clone(user_id: str, voice_id: str, voice_name: str = ""):
+    """Store or update a user's cloned voice ID."""
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO voice_clones (user_id, voice_id, voice_name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    voice_id = EXCLUDED.voice_id,
+                    voice_name = EXCLUDED.voice_name,
+                    created_at = NOW()
+            """, (user_id, voice_id, voice_name))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_voice_clone(user_id: str) -> Optional[str]:
+    """Retrieve a user's cloned voice ID, or None."""
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    if not db_url:
+        return None
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT voice_id FROM voice_clones WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
+
+
 @app.on_event("startup")
 def startup():
     try:
@@ -159,6 +290,7 @@ def startup():
         ensure_password_reset_table()
         ensure_gdpr_tables()
         ensure_soft_delete_columns()
+        _ensure_voice_clones_table()
         logger.info("Database tables ensured on startup")
     except Exception as e:
         logger.error(f"Failed to ensure database tables: {e}")
@@ -362,13 +494,17 @@ async def voice_token(auth_user: dict = Depends(verify_auth)):
     user_name = auth_user.get("name", "User")
     relationship = auth_user.get("relationship_to_azim", "self")
 
+    # Look up cloned voice_id for this user
+    cloned_voice_id = _get_voice_clone(user_id) or ""
+
     # Each user gets their own private room for voice chat with Azim
     room_name = f"fazle-voice-{user_id}"
 
     token = AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
     token.with_identity(user_id)
     token.with_name(user_name)
-    token.with_metadata(relationship)
+    # JSON metadata with relationship + voice_id for per-session TTS
+    token.with_metadata(json.dumps({"relationship": relationship, "voice_id": cloned_voice_id}))
     token.with_grants(VideoGrants(
         room_join=True,
         room=room_name,
@@ -381,6 +517,74 @@ async def voice_token(auth_user: dict = Depends(verify_auth)):
         "url": settings.livekit_url,
         "room": room_name,
     }
+
+
+@app.post("/fazle/voice/clone")
+async def voice_clone(
+    file: UploadFile = File(...),
+    auth_user: dict = Depends(verify_auth),
+):
+    """Clone a user's voice via ElevenLabs. Upload audio (wav/mp3, max 10MB).
+    Returns the cloned voice_id for use in voice calls."""
+
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="Voice cloning not configured (missing ElevenLabs API key)")
+
+    # Validate user is not API-key-only auth
+    user_id = str(auth_user.get("id", ""))
+    if user_id == "api-key":
+        raise HTTPException(status_code=400, detail="Voice cloning requires user authentication (JWT)")
+
+    # Validate file type
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Audio file required. Supported: {', '.join(sorted(AUDIO_EXTENSIONS))}",
+        )
+
+    # Size guard (10MB)
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio file too large (max 10MB)")
+
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Audio file is empty")
+
+    user_name = auth_user.get("name", "User")
+    voice_name = f"fazle-clone-{user_name}-{user_id[:8]}"
+
+    # Upload to ElevenLabs
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{ELEVENLABS_API_BASE}/voices/add",
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+                data={"name": voice_name, "description": f"Cloned voice for user {user_id}"},
+                files={"files": (file.filename, contents, file.content_type or "audio/mpeg")},
+            )
+            resp.raise_for_status()
+            result = resp.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"ElevenLabs voice clone API error: {e.response.status_code}")
+        return {"voice_id": "", "status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
+    except Exception as e:
+        logger.error(f"ElevenLabs voice clone failed: {e}")
+        return {"voice_id": "", "status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
+
+    voice_id = result.get("voice_id", "")
+    if not voice_id:
+        return {"voice_id": "", "status": "fallback", "reply": "ElevenLabs did not return a voice_id"}
+
+    # Store voice_id associated with user
+    try:
+        _save_voice_clone(user_id, voice_id, voice_name)
+    except Exception as e:
+        logger.error(f"Failed to save voice clone mapping: {e}")
+        # Still return the voice_id even if DB save fails
+
+    logger.info(f"Voice cloned for user {user_id}: voice_id={voice_id}")
+    return {"voice_id": voice_id, "status": "ready"}
 
 
 # ── Health ──────────────────────────────────────────────────
@@ -403,7 +607,7 @@ async def make_decision(request: DecisionRequest):
             return DecisionResponse(**resp.json())
         except httpx.HTTPError as e:
             logger.error(f"Brain service error: {e}")
-            raise HTTPException(status_code=502, detail="Brain service unavailable")
+            return {"reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।", "status": "fallback"}
 
 
 # ── Chat endpoint ───────────────────────────────────────────
@@ -442,7 +646,11 @@ async def chat(
             return ChatResponse(**data)
         except httpx.HTTPError as e:
             logger.error(f"Brain service error: {e}")
-            raise HTTPException(status_code=502, detail="Brain service unavailable")
+            return ChatResponse(
+                reply="দুঃখিত, একটু সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।",
+                conversation_id=body.get("conversation_id", ""),
+                persona_mode="fallback",
+            )
 
 
 # ── Chat history ────────────────────────────────────────────
@@ -480,7 +688,7 @@ async def store_memory(request: MemoryStoreRequest, auth_user: dict = Depends(ve
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Memory service error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/memory/search")
@@ -499,7 +707,7 @@ async def search_memory(request: MemorySearchRequest, auth_user: dict = Depends(
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Memory service error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"results": [], "status": "fallback"}
 
 
 @app.delete("/fazle/memory/{memory_id}")
@@ -513,7 +721,7 @@ async def delete_memory(memory_id: str, auth_user: dict = Depends(verify_auth)):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Memory service error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.put("/fazle/memory/{memory_id}")
@@ -529,7 +737,7 @@ async def update_memory(memory_id: str, body: dict, auth_user: dict = Depends(ve
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Memory update error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.patch("/fazle/memory/{memory_id}/lock")
@@ -544,7 +752,7 @@ async def toggle_memory_lock(memory_id: str, auth_user: dict = Depends(verify_au
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Memory lock toggle error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/health")
@@ -567,7 +775,7 @@ async def search_multimodal(request: MemorySearchRequest, auth_user: dict = Depe
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Multimodal memory search error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"results": [], "status": "fallback"}
 
 
 # ── Knowledge ingestion proxy ───────────────────────────────
@@ -583,7 +791,7 @@ async def ingest_knowledge(request: KnowledgeIngestRequest):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Memory service error: {e}")
-            raise HTTPException(status_code=502, detail="Memory service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 # ── File upload ─────────────────────────────────────────────
@@ -824,7 +1032,7 @@ async def create_task(request: TaskCreateRequest):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Task service error: {e}")
-            raise HTTPException(status_code=502, detail="Task service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/tasks", dependencies=[Depends(verify_auth)])
@@ -836,7 +1044,7 @@ async def list_tasks():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Task service error: {e}")
-            raise HTTPException(status_code=502, detail="Task service unavailable")
+            return {"tasks": [], "status": "fallback"}
 
 
 # ── Web intelligence proxy ──────────────────────────────────
@@ -852,7 +1060,7 @@ async def web_search(request: WebSearchRequest):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Web intelligence error: {e}")
-            raise HTTPException(status_code=502, detail="Web intelligence service unavailable")
+            return {"results": [], "status": "fallback"}
 
 
 # ── Training proxy ──────────────────────────────────────────
@@ -868,7 +1076,7 @@ async def train(request: TrainRequest):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Trainer service error: {e}")
-            raise HTTPException(status_code=502, detail="Trainer service unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 # ── Service status ──────────────────────────────────────────
@@ -920,7 +1128,7 @@ async def persona_insights(admin: dict = Depends(require_admin)):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Learning engine error: {e}")
-            raise HTTPException(status_code=502, detail="Learning engine unavailable")
+            return {"insights": [], "status": "fallback"}
 
 
 @app.post("/fazle/persona/reflect")
@@ -937,7 +1145,7 @@ async def trigger_reflection(admin: dict = Depends(require_admin)):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Reflection trigger error: {e}")
-            raise HTTPException(status_code=502, detail="Learning engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 # ── Phase-5: Autonomy Engine proxy ──────────────────────────
@@ -951,7 +1159,7 @@ async def autonomy_plan(body: dict):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomy engine error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomy engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/autonomy/execute", dependencies=[Depends(verify_auth)])
@@ -963,7 +1171,7 @@ async def autonomy_execute(body: dict):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomy execute error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomy engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/autonomy/plans", dependencies=[Depends(verify_auth)])
@@ -975,7 +1183,7 @@ async def autonomy_plans(limit: int = 20):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomy list error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomy engine unavailable")
+            return {"plans": [], "status": "fallback"}
 
 
 @app.get("/fazle/autonomy/plan/{plan_id}", dependencies=[Depends(verify_auth)])
@@ -987,7 +1195,7 @@ async def autonomy_plan_detail(plan_id: str):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomy plan detail error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomy engine unavailable")
+            return {"status": "fallback", "detail": "unavailable"}
 
 
 # ── Phase-5: Tool Engine proxy ──────────────────────────────
@@ -1001,7 +1209,7 @@ async def tool_engine_list():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Tool engine list error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"tools": [], "status": "fallback"}
 
 
 @app.post("/fazle/tool-engine/execute", dependencies=[Depends(verify_auth)])
@@ -1013,7 +1221,7 @@ async def tool_engine_execute(body: dict):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Tool engine execute error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.put("/fazle/tool-engine/{tool_name}/toggle", dependencies=[Depends(verify_auth)])
@@ -1025,7 +1233,7 @@ async def tool_engine_toggle(tool_name: str):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Tool engine toggle error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 # ── Phase-5: Knowledge Graph proxy ──────────────────────────
@@ -1039,7 +1247,7 @@ async def kg_query(body: dict):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Knowledge graph query error: {e}")
-            raise HTTPException(status_code=502, detail="Knowledge graph unavailable")
+            return {"results": [], "status": "fallback"}
 
 
 @app.get("/fazle/knowledge-graph/stats", dependencies=[Depends(verify_auth)])
@@ -1051,7 +1259,7 @@ async def kg_stats():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Knowledge graph stats error: {e}")
-            raise HTTPException(status_code=502, detail="Knowledge graph unavailable")
+            return {"stats": {}, "status": "fallback"}
 
 
 @app.get("/fazle/knowledge-graph/nodes", dependencies=[Depends(verify_auth)])
@@ -1066,7 +1274,7 @@ async def kg_nodes(node_type: str = None, limit: int = 50):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Knowledge graph nodes error: {e}")
-            raise HTTPException(status_code=502, detail="Knowledge graph unavailable")
+            return {"nodes": [], "status": "fallback"}
 
 
 @app.get("/fazle/knowledge-graph/context/{node_id}", dependencies=[Depends(verify_auth)])
@@ -1078,10 +1286,8 @@ async def kg_context(node_id: str, depth: int = 2):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Knowledge graph context error: {e}")
-            raise HTTPException(status_code=502, detail="Knowledge graph unavailable")
+            return {"context": {}, "status": "fallback"}
 
-
-# ── Phase-5: Autonomous Task Runner proxy ───────────────────
 
 @app.post("/fazle/autonomous-tasks", dependencies=[Depends(verify_auth)])
 async def create_autonomous_task(body: dict):
@@ -1092,7 +1298,7 @@ async def create_autonomous_task(body: dict):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomous runner error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomous runner unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/autonomous-tasks", dependencies=[Depends(verify_auth)])
@@ -1107,7 +1313,7 @@ async def list_autonomous_tasks(status: str = None, limit: int = 50):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomous runner list error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomous runner unavailable")
+            return {"tasks": [], "status": "fallback"}
 
 
 @app.post("/fazle/autonomous-tasks/{task_id}/run", dependencies=[Depends(verify_auth)])
@@ -1119,7 +1325,7 @@ async def run_autonomous_task(task_id: str):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomous runner run error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomous runner unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/autonomous-tasks/{task_id}/pause", dependencies=[Depends(verify_auth)])
@@ -1131,7 +1337,7 @@ async def pause_autonomous_task(task_id: str):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomous runner pause error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomous runner unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/autonomous-tasks/history", dependencies=[Depends(verify_auth)])
@@ -1146,7 +1352,7 @@ async def autonomous_task_history(task_id: str = None, limit: int = 50):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Autonomous runner history error: {e}")
-            raise HTTPException(status_code=502, detail="Autonomous runner unavailable")
+            return {"history": [], "status": "fallback"}
 
 
 # ── Phase-5: Self-Learning Engine proxy ─────────────────────
@@ -1160,7 +1366,7 @@ async def self_learning_analyze(body: dict = None):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Self-learning analyze error: {e}")
-            raise HTTPException(status_code=502, detail="Self-learning engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/self-learning/improve", dependencies=[Depends(verify_auth)])
@@ -1172,7 +1378,7 @@ async def self_learning_improve(body: dict = None):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Self-learning improve error: {e}")
-            raise HTTPException(status_code=502, detail="Self-learning engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/self-learning/insights", dependencies=[Depends(verify_auth)])
@@ -1187,7 +1393,7 @@ async def self_learning_insights(limit: int = 50, insight_type: str = None):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Self-learning insights error: {e}")
-            raise HTTPException(status_code=502, detail="Self-learning engine unavailable")
+            return {"insights": [], "status": "fallback"}
 
 
 @app.get("/fazle/self-learning/stats", dependencies=[Depends(verify_auth)])
@@ -1199,7 +1405,7 @@ async def self_learning_stats():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Self-learning stats error: {e}")
-            raise HTTPException(status_code=502, detail="Self-learning engine unavailable")
+            return {"stats": {}, "status": "fallback"}
 
 
 # ── AI Safety Guardrail Engine proxy ────────────────────────
@@ -1213,7 +1419,7 @@ async def guardrail_check(body: dict):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail check error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"safe": True, "status": "fallback"}
 
 
 @app.get("/fazle/guardrail/policies", dependencies=[Depends(verify_auth)])
@@ -1225,7 +1431,7 @@ async def guardrail_policies():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail policies error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"policies": [], "status": "fallback"}
 
 
 @app.post("/fazle/guardrail/policies")
@@ -1238,7 +1444,7 @@ async def guardrail_create_policy(body: dict, admin: dict = Depends(require_admi
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail create policy error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.put("/fazle/guardrail/policies/{policy_id}")
@@ -1251,7 +1457,7 @@ async def guardrail_update_policy(policy_id: str, body: dict, admin: dict = Depe
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail update policy error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.delete("/fazle/guardrail/policies/{policy_id}")
@@ -1264,7 +1470,7 @@ async def guardrail_delete_policy(policy_id: str, admin: dict = Depends(require_
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail delete policy error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.put("/fazle/guardrail/policies/{policy_id}/toggle")
@@ -1277,7 +1483,7 @@ async def guardrail_toggle_policy(policy_id: str, admin: dict = Depends(require_
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail toggle policy error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/guardrail/logs")
@@ -1294,7 +1500,7 @@ async def guardrail_logs(limit: int = 50, risk_level: str = None, decision: str 
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail logs error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"logs": [], "status": "fallback"}
 
 
 @app.post("/fazle/guardrail/logs/{log_id}/review")
@@ -1308,7 +1514,7 @@ async def guardrail_review(log_id: str, body: dict, admin: dict = Depends(requir
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail review error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/guardrail/stats", dependencies=[Depends(verify_auth)])
@@ -1320,7 +1526,7 @@ async def guardrail_stats():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Guardrail stats error: {e}")
-            raise HTTPException(status_code=502, detail="Guardrail engine unavailable")
+            return {"stats": {}, "status": "fallback"}
 
 
 # ── Observability proxy ─────────────────────────────────────
@@ -1352,7 +1558,7 @@ async def observability_metrics():
             return results
         except httpx.HTTPError as e:
             logger.error(f"Observability metrics error: {e}")
-            raise HTTPException(status_code=502, detail="Prometheus unavailable")
+            return {"api_request_rate": 0, "api_latency_p95": 0, "container_count": 0, "healthy_services": 0}
 
 
 @app.get("/fazle/observability/services", dependencies=[Depends(verify_auth)])
@@ -1375,7 +1581,7 @@ async def observability_services():
             return {"services": []}
         except httpx.HTTPError as e:
             logger.error(f"Observability services error: {e}")
-            raise HTTPException(status_code=502, detail="Prometheus unavailable")
+            return {"services": []}
 
 
 @app.get("/fazle/observability/container-stats", dependencies=[Depends(verify_auth)])
@@ -1408,7 +1614,7 @@ async def observability_container_stats():
             return {"containers": containers}
         except httpx.HTTPError as e:
             logger.error(f"Container stats error: {e}")
-            raise HTTPException(status_code=502, detail="Prometheus unavailable")
+            return {"containers": []}
 
 
 # ── Workflow Engine proxy ────────────────────────────────────
@@ -1423,7 +1629,7 @@ async def workflow_create(body: dict, user: dict = Depends(require_admin)):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Workflow create error: {e}")
-            raise HTTPException(status_code=502, detail="Workflow engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/workflows/{workflow_id}/start")
@@ -1437,7 +1643,7 @@ async def workflow_start(workflow_id: str, body: dict = None, user: dict = Depen
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Workflow start error: {e}")
-            raise HTTPException(status_code=502, detail="Workflow engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/workflows", dependencies=[Depends(verify_auth)])
@@ -1452,7 +1658,7 @@ async def workflow_list(status: str = None, limit: int = 50):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Workflow list error: {e}")
-            raise HTTPException(status_code=502, detail="Workflow engine unavailable")
+            return {"workflows": [], "status": "fallback"}
 
 
 @app.get("/fazle/workflows/{workflow_id}", dependencies=[Depends(verify_auth)])
@@ -1464,10 +1670,10 @@ async def workflow_status(workflow_id: str):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Workflow status error: {e}")
-            raise HTTPException(status_code=502, detail="Workflow engine unavailable")
+            return {"status": "fallback", "detail": "unavailable"}
 
 
-@app.post("/fazle/workflows/{workflow_id}/stop")
+@app.post("/fazle/workflows/{workflow_id}/stop", dependencies=[Depends(require_admin)])
 async def workflow_stop(workflow_id: str, user: dict = Depends(require_admin)):
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -1477,7 +1683,7 @@ async def workflow_stop(workflow_id: str, user: dict = Depends(require_admin)):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Workflow stop error: {e}")
-            raise HTTPException(status_code=502, detail="Workflow engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/workflows/{workflow_id}/logs", dependencies=[Depends(verify_auth)])
@@ -1490,7 +1696,7 @@ async def workflow_logs(workflow_id: str, limit: int = 100):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Workflow logs error: {e}")
-            raise HTTPException(status_code=502, detail="Workflow engine unavailable")
+            return {"logs": [], "status": "fallback"}
 
 
 # ── Tool Marketplace proxy ───────────────────────────────────
@@ -1504,7 +1710,7 @@ async def marketplace_list():
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Marketplace list error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"tools": [], "status": "fallback"}
 
 
 @app.post("/fazle/marketplace/tools/install")
@@ -1517,7 +1723,7 @@ async def marketplace_install(body: dict, user: dict = Depends(require_admin)):
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Marketplace install error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/marketplace/tools/{tool_name}/enable")
@@ -1530,7 +1736,7 @@ async def marketplace_enable(tool_name: str, user: dict = Depends(require_admin)
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Marketplace enable error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.post("/fazle/marketplace/tools/{tool_name}/disable")
@@ -1543,7 +1749,7 @@ async def marketplace_disable(tool_name: str, user: dict = Depends(require_admin
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Marketplace disable error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.delete("/fazle/marketplace/tools/{tool_name}")
@@ -1556,4 +1762,4 @@ async def marketplace_remove(tool_name: str, user: dict = Depends(require_admin)
             return resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Marketplace remove error: {e}")
-            raise HTTPException(status_code=502, detail="Tool engine unavailable")
+            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}

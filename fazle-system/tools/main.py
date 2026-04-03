@@ -37,7 +37,7 @@ app = FastAPI(title="Fazle Web Intelligence — Search & Extraction", version="1
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
 
 app.add_middleware(
     CORSMiddleware,

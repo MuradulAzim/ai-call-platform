@@ -21,7 +21,8 @@ async def create_post(
         return {"posted": False, "error": "Facebook credentials not configured"}
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             payload = {"message": message, "access_token": page_access_token}
             if image_url:
                 payload["url"] = image_url
@@ -48,7 +49,8 @@ async def reply_to_comment(
         return {"sent": False, "error": "Facebook token not configured"}
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             resp = await client.post(
                 f"{GRAPH_API_BASE}/{target_id}/comments",
                 data={"message": message, "access_token": page_access_token},
@@ -75,7 +77,8 @@ async def react_to_post(
         return {"sent": False, "error": "Facebook token not configured"}
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
             resp = await client.post(
                 f"{GRAPH_API_BASE}/{target_id}/reactions",
                 data={"type": reaction_type.upper(), "access_token": page_access_token},
@@ -95,7 +98,8 @@ async def get_page_posts(
     if not page_id or not page_access_token:
         return []
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             resp = await client.get(
                 f"{GRAPH_API_BASE}/{page_id}/feed",
                 params={"access_token": page_access_token, "limit": limit,
@@ -117,7 +121,8 @@ async def get_post_comments(
     if not page_access_token:
         return []
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+        async with httpx.AsyncClient(transport=transport, timeout=15.0) as client:
             resp = await client.get(
                 f"{GRAPH_API_BASE}/{post_id}/comments",
                 params={"access_token": page_access_token, "limit": limit,

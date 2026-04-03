@@ -9,3 +9,4 @@ sentence-transformers==3.3.1
 numpy==2.2.1
 prometheus-fastapi-instrumentator==7.0.2
 minio==7.2.12
+psycopg2-binary==2.9.9

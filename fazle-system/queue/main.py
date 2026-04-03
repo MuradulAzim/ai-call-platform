@@ -50,7 +50,7 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020",
+    "https://fazle.iamazim.com,https://iamazim.com",
 ).split(",")
 
 app.add_middleware(

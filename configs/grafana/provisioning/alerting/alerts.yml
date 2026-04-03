@@ -1,0 +1,222 @@
+# ============================================================
+# Grafana Alert Rules — Provisioned Alerting
+# Auto-configures critical infrastructure alerts on startup
+# ============================================================
+
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: Infrastructure Alerts
+    folder: Fazle AI
+    interval: 1m
+    rules:
+      # ── API High Error Rate ────────────────────────────────
+      - uid: api-high-error-rate
+        title: API High Error Rate
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(http_requests_total{status=~"5.."}[5m])
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(http_requests_total[5m])
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: math
+              expression: $A / $B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.05]
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API error rate exceeds 5%"
+          description: "More than 5% of API requests are returning 5xx errors for the last 5 minutes."
+
+      # ── Service Down ───────────────────────────────────────
+      - uid: service-down
+        title: Service Down
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 120
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: up{job=~"dograh-api|fazle-.*"} == 0
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "The service {{ $labels.job }} has been unreachable for more than 2 minutes."
+
+      # ── High Memory Usage ──────────────────────────────────
+      - uid: high-memory-usage
+        title: High Memory Usage
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) > 0.85
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} memory usage above 85%"
+          description: "Container {{ $labels.name }} is using more than 85% of its memory limit for 10+ minutes."
+
+      # ── Disk Space Low ─────────────────────────────────────
+      - uid: disk-space-low
+        title: Disk Space Low
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.15
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk space below 15%"
+          description: "Root filesystem has less than 15% free space remaining."
+
+      # ── PostgreSQL High Connections ────────────────────────
+      - uid: postgres-high-connections
+        title: PostgreSQL High Connections
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: pg_stat_activity_count > (pg_settings_max_connections * 0.8)
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connections above 80% of max"
+          description: "Database connection count is approaching the maximum limit."
+
+      # ── Redis Memory High ──────────────────────────────────
+      - uid: redis-memory-high
+        title: Redis Memory High
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (redis_memory_used_bytes / redis_memory_max_bytes) > 0.9
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory usage above 90%"
+          description: "Redis is using more than 90% of its configured max memory."
+
+      # ── LiveKit Room Stuck ─────────────────────────────────
+      - uid: livekit-room-stuck
+        title: LiveKit Room Stuck
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: livekit_room_duration_seconds > 7200
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LiveKit room active for over 2 hours"
+          description: "A LiveKit room has been active for more than 2 hours, which may indicate a stuck session."
+
+      # ── Certificate Expiry ─────────────────────────────────
+      - uid: cert-expiry-soon
+        title: Certificate Expiry Soon
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (probe_ssl_earliest_cert_expiry - time()) < (7 * 24 * 3600)
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "TLS certificate expires in less than 7 days"
+          description: "A TLS certificate will expire within 7 days. Renew immediately."
+
+      # ── Container Restart Loop ─────────────────────────────
+      - uid: container-restart-loop
+        title: Container Restart Loop
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(container_restart_count[1h]) > 3
+              intervalMs: 1000
+              maxDataPoints: 43200
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Container {{ $labels.name }} restarting frequently"
+          description: "Container {{ $labels.name }} has restarted more than 3 times in the last hour."

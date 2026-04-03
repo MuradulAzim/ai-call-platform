@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/1"
     # Owner critical action password (VPS login password)
     owner_action_password: str = ""
+    # Social engine URL for contact lookup
+    social_engine_url: str = "http://fazle-social-engine:9800"
 
     class Config:
         env_prefix = ""
@@ -127,7 +129,54 @@ async def init_agents():
         "4 domain agents (social, voice, system, learning) + 5 utility agents"
     )
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com,http://localhost:3020").split(",")
+    # ── Seed default owner profile if empty (Step 1) ──
+    try:
+        profile = azim_profile_all()
+        if not profile:
+            default_profile = {
+                "full_name": "Azim",
+                "role": "Business Owner & Tech Entrepreneur",
+                "personality": "Direct, confident, casual, witty",
+                "communication_style": "Desi-British mix, uses 'bro', 'bruh', 'wallah', bilingual Bangla-English",
+                "language": "Bangla, English, Banglish",
+                "location": "Bangladesh",
+                "greeting_style": "Casual desi-british: 'yo', 'hey bro', 'assalamu alaikum'",
+                "humor_level": "7",
+                "strictness": "5",
+                "tone_variation": "Direct and casual with friends, professional with clients, warm with family",
+            }
+            azim_profile_update(default_profile)
+            logger.info("Seeded default owner profile (Step 1)")
+    except Exception as e:
+        logger.warning(f"Profile seeding failed: {e}")
+    # Start Ollama pre-warm background task
+    asyncio.create_task(_ollama_prewarm_loop())
+
+
+async def _ollama_prewarm_loop():
+    """Ping Ollama every 2 minutes with a tiny prompt to keep the model loaded in RAM.
+    Prevents cold-start delays on the memory-constrained VPS."""
+    await asyncio.sleep(5)  # let startup finish
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{settings.ollama_url}/api/chat",
+                    json={
+                        "model": settings.voice_fast_model,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": False,
+                    },
+                )
+                if resp.status_code == 200:
+                    logger.debug("Ollama pre-warm: model kept hot")
+                else:
+                    logger.warning(f"Ollama pre-warm: status {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Ollama pre-warm failed: {e}")
+        await asyncio.sleep(120)  # every 2 minutes
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,11 +213,11 @@ Respond in JSON with these fields:
 
 
 # ── LLM Failover Constants ────────────────────────────────────
-_LLM_TIMEOUT_GATEWAY = 4.0    # Gateway: 4s per-provider cap
+_LLM_TIMEOUT_GATEWAY = 20.0    # Gateway: 20s (OpenAI 429 + Ollama cold start needs ~10s)
 _LLM_TIMEOUT_OPENAI = 5.0     # Direct OpenAI: 5s per-provider cap
-_LLM_TIMEOUT_OLLAMA = 5.0     # Local Ollama: 5s per-provider cap
-_LLM_TIMEOUT_FAST = 4.0       # Fast model fallback: 4s cap
-_LLM_PARALLEL_GLOBAL = 6.0    # Global parallel timeout: 6s max total
+_LLM_TIMEOUT_OLLAMA = 15.0    # Local Ollama: 15s per-provider cap (cold start can take 5-8s)
+_LLM_TIMEOUT_FAST = 10.0      # Fast model fallback: 10s cap
+_LLM_PARALLEL_GLOBAL = 15.0   # Global parallel timeout: 15s max total
 
 _FALLBACK_REPLY_BN = "দুঃখিত, একটু সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।"
 _FALLBACK_REPLY_EN = "Sorry, having a small issue. Please try again shortly."
@@ -1128,6 +1177,7 @@ async def chat(request: ChatRequest):
 
     # Build social context with intent classification for social interactions
     social_context = None
+    contact_data = None
     if relationship == "social":
         from persona_engine import classify_social_intent
         intent = classify_social_intent(request.message)
@@ -1136,6 +1186,23 @@ async def chat(request: ChatRequest):
             context_parts.append(request.context)
         social_context = "\n".join(context_parts)
 
+        # Fetch contact data from social engine for personalized responses
+        if conversation_id and conversation_id.startswith("social-"):
+            _parts = conversation_id.split("-", 2)
+            if len(_parts) >= 3:
+                _platform = _parts[1]
+                _phone = _parts[2]
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as _client:
+                        _resp = await _client.get(
+                            f"{settings.social_engine_url}/contacts/lookup",
+                            params={"phone": _phone, "platform": _platform},
+                        )
+                        if _resp.status_code == 200:
+                            contact_data = _resp.json().get("contact")
+                except Exception as _e:
+                    logger.debug(f"Contact lookup failed: {_e}")
+
     # Run persona build + memory searches in parallel (hybrid: general + knowledge + personal)
     system_prompt_task = build_system_prompt_async(
         user_name=user_name,
@@ -1143,6 +1210,7 @@ async def chat(request: ChatRequest):
         user_id=user_id,
         learning_engine_url=settings.learning_engine_url,
         social_context=social_context,
+        contact_data=contact_data,
     )
     mem_task = retrieve_memories(request.message, user_id=user_id, limit=3)
     mm_task = retrieve_multimodal_memories(request.message, user_id=user_id, limit=2)
@@ -1274,6 +1342,15 @@ async def chat(request: ChatRequest):
     user_history_append(platform, user_identifier, "user", request.message)
     user_history_append(platform, user_identifier, "assistant", reply)
     user_replies_track(platform, user_identifier, reply)
+
+    # Track contact interactions for memory enrichment (social messages only)
+    if relationship == "social" and platform in ("whatsapp", "facebook"):
+        try:
+            from memory_manager import contact_interaction_track
+            contact_interaction_track(platform, user_identifier, request.message, "incoming")
+            contact_interaction_track(platform, user_identifier, reply, "outgoing")
+        except Exception:
+            pass
 
     # Process side effects
     if memory_updates:
@@ -1702,6 +1779,23 @@ async def _execute_owner_action(action_data: dict, platform: str) -> bool:
                                 "text": f"Azim's {field}: {value}",
                             },
                         )
+                    # Store in PostgreSQL knowledge table
+                    for field, value in profile_fields.items():
+                        category = _field_to_category(field)
+                        try:
+                            await client.post(
+                                f"{settings.memory_url}/knowledge/store",
+                                json={
+                                    "category": category,
+                                    "subcategory": field,
+                                    "key": field,
+                                    "value": str(value),
+                                    "language": "auto",
+                                    "source": "owner_chat",
+                                },
+                            )
+                        except Exception as e:
+                            logger.warning(f"Knowledge table store failed for {field}: {e}")
                 logger.info(f"Owner profile updated: {list(profile_fields.keys())}")
                 return True
 
@@ -2178,6 +2272,169 @@ async def chat_agent(request: AgentChatRequest):
         await execute_actions(actions)
 
 
+# ── Summary Engine (Step 16) ────────────────────────────────
+
+class SummarizeRequest(BaseModel):
+    conversation_id: str
+    user_phone: str = ""
+    user_name: str = ""
+    platform: str = "whatsapp"
+
+
+@app.post("/chat/summarize")
+async def summarize_conversation(request: SummarizeRequest):
+    """Generate a summary of a conversation and store it.
+    Called by social engine after N messages or end of conversation."""
+    history = conversation_get(request.conversation_id)
+    if not history or len(history) < 4:
+        return {"summary": "", "status": "too_short"}
+
+    # Build conversation text
+    conv_text = "\n".join(
+        f"{'User' if m.get('role') == 'user' else 'Azim'}: {m.get('content', '')[:200]}"
+        for m in history[-20:]
+    )
+
+    summary_prompt = (
+        f"Summarize this conversation in 2-3 sentences in Bangla.\n"
+        f"Include: main topic, user intent, outcome, any commitments made.\n\n"
+        f"{conv_text}"
+    )
+
+    messages = [
+        {"role": "system", "content": "You are a conversation summarizer. Return ONLY the summary in Bangla. No JSON."},
+        {"role": "user", "content": summary_prompt},
+    ]
+
+    try:
+        result = await query_llm(messages)
+        summary = result.get("reply", "")
+        if not summary:
+            return {"summary": "", "status": "generation_failed"}
+    except Exception as e:
+        logger.warning(f"Summary generation failed: {e}")
+        return {"summary": "", "status": "error"}
+
+    # Extract key topics
+    key_topics = []
+    topic_words = ["কাজ", "বেতন", "salary", "apply", "location", "complaint", "info"]
+    for tw in topic_words:
+        if tw in conv_text.lower():
+            key_topics.append(tw)
+
+    # Store summary via social engine
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{settings.social_engine_url}/internal/save-summary",
+                json={
+                    "conversation_id": request.conversation_id,
+                    "summary": summary,
+                    "user_phone": request.user_phone,
+                    "user_name": request.user_name,
+                    "message_count": len(history),
+                    "key_topics": key_topics,
+                    "platform": request.platform,
+                },
+            )
+    except Exception as e:
+        logger.debug(f"Summary storage via social engine failed: {e}")
+
+    return {"summary": summary, "message_count": len(history), "key_topics": key_topics, "status": "ok"}
+
+
+# ── Explanation Engine (Step 17) ─────────────────────────────
+
+class ExplainRequest(BaseModel):
+    topic: str
+    depth: str = "simple"  # simple, medium, detailed
+    language: str = "bn"  # bn = Bangla, en = English
+
+
+@app.post("/chat/explain")
+async def explain_topic(request: ExplainRequest):
+    """Generate an explanation of a topic at the requested depth.
+    Used by owner or social engine to get structured explanations."""
+    depth_instructions = {
+        "simple": "Explain in 1-2 simple sentences. Use everyday language.",
+        "medium": "Explain in a clear paragraph with examples.",
+        "detailed": "Give a thorough explanation with examples, context, and implications.",
+    }
+    lang_instruction = "Respond in Bangla (বাংলা)." if request.language == "bn" else "Respond in English."
+
+    explain_prompt = (
+        f"{depth_instructions.get(request.depth, depth_instructions['simple'])}\n"
+        f"{lang_instruction}\n\n"
+        f"Topic: {request.topic}"
+    )
+
+    messages = [
+        {"role": "system", "content": "You are a knowledgeable explainer. Give clear, accurate explanations."},
+        {"role": "user", "content": explain_prompt},
+    ]
+
+    try:
+        result = await query_llm(messages)
+        explanation = result.get("reply", "")
+    except Exception as e:
+        logger.warning(f"Explanation generation failed: {e}")
+        explanation = "ব্যাখ্যা তৈরি করতে সমস্যা হয়েছে।"
+
+    return {"explanation": explanation, "topic": request.topic, "depth": request.depth}
+
+
+# ── Identity Confidence Score (Step 20) ─────────────────────
+
+@app.get("/azim/identity-confidence")
+async def identity_confidence():
+    """Calculate identity confidence score based on profile completeness."""
+    profile = azim_profile_all()
+    if not profile:
+        return {"confidence": 0.0, "missing_fields": ["all"], "level": "empty"}
+
+    # Core fields that define identity
+    core_fields = [
+        "full_name", "role", "personality", "communication_style",
+        "language", "location", "greeting_style", "humor_level",
+        "strictness", "tone_variation",
+    ]
+    # Extended fields for deeper identity
+    extended_fields = [
+        "business_info", "family", "preferences", "ideology",
+        "occupation", "hobbies", "education", "goals",
+        "dislikes", "food", "music", "tech_stack", "religion",
+    ]
+
+    filled_core = sum(1 for f in core_fields if profile.get(f))
+    filled_extended = sum(1 for f in extended_fields if profile.get(f))
+    missing = [f for f in core_fields + extended_fields if not profile.get(f)]
+
+    # Core fields worth 70%, extended worth 30%
+    core_score = (filled_core / len(core_fields)) * 0.7 if core_fields else 0
+    extended_score = (filled_extended / len(extended_fields)) * 0.3 if extended_fields else 0
+    confidence = round(core_score + extended_score, 2)
+
+    level = "empty"
+    if confidence >= 0.8:
+        level = "strong"
+    elif confidence >= 0.5:
+        level = "moderate"
+    elif confidence >= 0.2:
+        level = "weak"
+    else:
+        level = "minimal"
+
+    return {
+        "confidence": confidence,
+        "level": level,
+        "filled_core": filled_core,
+        "total_core": len(core_fields),
+        "filled_extended": filled_extended,
+        "total_extended": len(extended_fields),
+        "missing_fields": missing[:10],
+    }
+
+
 # ── Azim Identity Profile endpoints ─────────────────────────
 
 @app.get("/azim/profile")
@@ -2256,6 +2513,8 @@ async def answer_interview(data: dict):
 async def chat_multimodal(request: dict):
     """Process image or audio content from WhatsApp.
     Accepts: media_type (image/audio), media_url or base64, sender context.
+    If local_extracted_text is provided (from social-engine OCR/Whisper),
+    skip expensive OpenAI vision/whisper calls and use local text directly.
     Returns: extracted text/transcript + AI reply."""
     media_type = request.get("media_type", "")
     media_b64 = request.get("media_base64", "")
@@ -2266,10 +2525,55 @@ async def chat_multimodal(request: dict):
     is_owner = request.get("is_owner", False)
     conversation_id = request.get("conversation_id", f"social-{platform}-{sender_id}")
     relationship = "self" if is_owner else "social"
+    local_extracted_text = request.get("local_extracted_text", "")
 
     extracted_text = ""
 
-    if media_type == "image" and media_b64:
+    # ── Fast path: if social-engine already extracted text locally, skip OpenAI ──
+    if local_extracted_text:
+        extracted_text = local_extracted_text
+        description = ""
+        doc_type = ""
+
+        if media_type == "image":
+            description = "[Locally extracted via OCR]"
+            user_msg = f"[User sent an image]\nExtracted text (OCR): {extracted_text[:1000]}"
+            if caption:
+                user_msg += f"\nCaption: {caption}"
+        elif media_type == "audio":
+            user_msg = f"[User sent a voice message]\nTranscript: {extracted_text}"
+            if is_owner:
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        await client.post(
+                            f"{settings.memory_url}/store",
+                            json={
+                                "type": "knowledge",
+                                "user": "owner",
+                                "content": {
+                                    "kind": "owner_voice_training",
+                                    "transcript": extracted_text,
+                                    "platform": platform,
+                                },
+                                "text": f"Owner voice message (training): {extracted_text}",
+                            },
+                        )
+                        await client.post(
+                            f"{settings.learning_engine_url}/learn",
+                            json={
+                                "transcript": f"Owner (voice): {extracted_text}",
+                                "user": "owner",
+                                "conversation_id": conversation_id,
+                            },
+                        )
+                except Exception:
+                    pass
+        else:
+            return {"reply": "Unsupported media type", "extracted_text": "", "conversation_id": conversation_id}
+
+        logger.info(f"Multimodal fast-path: using local extracted text ({len(extracted_text)} chars)")
+
+    elif media_type == "image" and media_b64:
         # OCR + image understanding via GPT-4o vision
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -2442,7 +2746,8 @@ async def chat_multimodal(request: dict):
     ]
 
     try:
-        result = await query_llm(messages)
+        complexity = _classify_query_complexity(user_msg)
+        result = await query_llm_smart(messages, complexity)
     except Exception as e:
         logger.error(f"Multimodal chat LLM error: {e}")
         return {"reply": "দুঃখিত, একটু সমস্যা হচ্ছে।", "extracted_text": extracted_text, "conversation_id": conversation_id}
@@ -2456,6 +2761,23 @@ async def chat_multimodal(request: dict):
 
 
 # ── Owner profile auto-extraction from chat ─────────────────
+
+_FIELD_CATEGORY_MAP = {
+    "full_name": "personal", "personality": "personal", "communication_style": "personal",
+    "location": "personal", "occupation": "personal", "education": "education",
+    "language": "personal", "religion": "religious",
+    "business_info": "business", "tech_stack": "tech",
+    "family": "family", "preferences": "preference", "ideology": "ideology",
+    "hobbies": "social", "daily_routine": "daily", "goals": "personal",
+    "dislikes": "preference", "food": "preference", "music": "preference",
+    "health": "health", "financial": "financial",
+}
+
+
+def _field_to_category(field: str) -> str:
+    """Map a profile field name to a knowledge category."""
+    return _FIELD_CATEGORY_MAP.get(field, "personal")
+
 
 async def _extract_owner_profile_from_message(message: str, reply: str) -> None:
     """Analyze owner messages for identity information and auto-store in profile.

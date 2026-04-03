@@ -27,11 +27,11 @@
 ### Security Hardening (Complete)
 - [x] SSRF protection enhanced: `getaddrinfo()` resolves both IPv4 and IPv6
 - [x] PII redaction (`redact_pii()`) added to trainer pipeline before memory storage
-- [ ] Add rate limiting to Fazle API endpoints (currently no rate limiting on internal services)
-- [ ] Review CORS `allow_origins` on all Fazle services — tighten to exact domains only
+- [x] Add rate limiting to Fazle API endpoints (Redis sliding-window: 120 req/min, 10 req/s per IP)
+- [x] Review CORS `allow_origins` on all Fazle services — tightened to exact domains only
 
-### Grafana Alert Rules
-Add these alerting rules in Grafana (or via provisioned alert config):
+### Grafana Alert Rules (Complete)
+Provisioned 9 alert rules via `configs/grafana/provisioning/alerting/alerts.yml`:
 
 | Alert | PromQL / Condition | Threshold |
 |-------|-------------------|-----------|
@@ -63,9 +63,9 @@ Add these alerting rules in Grafana (or via provisioned alert config):
 - [ ] Store secrets in a vault (HashiCorp Vault, Doppler, or GitHub Actions secrets) instead of `.env` files
 
 ### Container Hardening
-- [ ] Add `read_only: true` to all remaining containers (postgres, redis, minio, livekit, coturn)
+- [x] Add `read_only: true` to all remaining containers (redis added; postgres/minio/livekit/coturn need writable volumes)
 - [ ] Drop all capabilities and add only required ones (`cap_drop: [ALL]`, `cap_add: [...]`)
-- [ ] Set `no-new-privileges: true` on all containers (already on cadvisor)
+- [x] Set `no-new-privileges: true` on all containers (all fazle-ai services + ai-infra services)
 - [ ] Use non-root users where possible (Coturn currently requires root for TLS certs)
 - [ ] Scan container images for vulnerabilities: `trivy image <image>` in CI
 

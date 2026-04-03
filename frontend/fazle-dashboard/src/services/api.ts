@@ -13,6 +13,12 @@ function getAuthHeaders(): HeadersInit {
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
+    if (res.status === 401 && typeof window !== 'undefined') {
+      localStorage.removeItem('fazle_token');
+      localStorage.removeItem('fazle_role');
+      window.location.href = '/login';
+      throw new Error('Session expired');
+    }
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     const error: ApiError = { detail: body.detail || res.statusText, status: res.status };
     throw error;
