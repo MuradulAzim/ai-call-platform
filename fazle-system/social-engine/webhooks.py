@@ -6,6 +6,7 @@
 import logging
 import random
 import re
+import time
 import uuid
 import io
 import tempfile
@@ -19,6 +20,48 @@ from facebook import parse_webhook_entry
 import base64
 
 logger = logging.getLogger("fazle-social-engine")
+
+# ── Dedup & rate-limit state ────────────────────────────────
+_SEEN_MSG_IDS: dict[str, float] = {}      # message_id -> timestamp
+_SENDER_LOCKS: dict[str, float] = {}      # sender_id -> lock_until timestamp
+_DEDUP_TTL = 300       # ignore duplicate message_ids within 5 min
+_SENDER_COOLDOWN = 10  # seconds between replies to same sender
+
+
+def _purge_expired():
+    """Remove expired entries from dedup and rate-limit dicts."""
+    now = time.monotonic()
+    for d, ttl in [(_SEEN_MSG_IDS, _DEDUP_TTL), (_SENDER_LOCKS, _SENDER_COOLDOWN + 5)]:
+        expired = [k for k, v in d.items() if now - v > ttl]
+        for k in expired:
+            del d[k]
+
+
+def _is_duplicate_message(message_id: str) -> bool:
+    """Return True if this message_id was already processed."""
+    if not message_id:
+        return False
+    _purge_expired()
+    if message_id in _SEEN_MSG_IDS:
+        return True
+    _SEEN_MSG_IDS[message_id] = time.monotonic()
+    return False
+
+
+def _is_sender_locked(sender_id: str) -> bool:
+    """Return True if sender is still in cooldown."""
+    lock_until = _SENDER_LOCKS.get(sender_id, 0)
+    return time.monotonic() < lock_until
+
+
+def _lock_sender(sender_id: str):
+    """Lock sender for SENDER_COOLDOWN seconds."""
+    _SENDER_LOCKS[sender_id] = time.monotonic() + _SENDER_COOLDOWN
+
+
+def _unlock_sender(sender_id: str):
+    """Remove sender lock."""
+    _SENDER_LOCKS.pop(sender_id, None)
 
 
 # ── OCR: extract text from image using Tesseract ───────────
@@ -422,6 +465,12 @@ async def handle_whatsapp_webhook(
         if not has_text and not has_media:
             continue
 
+        # ── Dedup: skip if we already processed this message_id ──
+        msg_id = msg.get("message_id", "")
+        if _is_duplicate_message(msg_id):
+            logger.info(f"Dedup: skipping duplicate message {msg_id} from {msg.get('sender_id', '?')}")
+            continue
+
         is_owner_msg = _is_owner(msg["sender_id"], owner_phone)
 
         # Determine content for DB storage
@@ -537,37 +586,6 @@ async def handle_whatsapp_webhook(
                         processed += 1
                         continue
 
-            # If we got text locally from image/audio, try keyword match first
-            if local_text:
-                try:
-                    from main import match_keyword_response
-                    kw_reply = match_keyword_response(db_conn_fn, local_text, "whatsapp")
-                except Exception:
-                    kw_reply = None
-                if kw_reply:
-                    logger.info(f"Keyword match on OCR/audio text for {msg['sender_id']}")
-                    from whatsapp import send_message
-                    result = await send_message(
-                        creds.get("whatsapp_api_url", ""),
-                        creds.get("access_token", ""),
-                        creds.get("phone_number_id", ""),
-                        msg["sender_id"],
-                        kw_reply,
-                    )
-                    with db_conn_fn() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """INSERT INTO fazle_social_messages
-                                   (platform, direction, contact_identifier, content, metadata, status)
-                                   VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s)""",
-                                (msg["sender_id"], kw_reply,
-                                 psycopg2.extras.Json({"source": "keyword_auto_reply", "media_type": msg_type}),
-                                 "sent" if result.get("sent") else "failed"),
-                            )
-                        conn.commit()
-                    processed += 1
-                    continue
-
             media_b64 = base64.b64encode(media_bytes).decode("utf-8")
 
             # Route to brain /chat/multimodal (with local_text hint to reduce token usage)
@@ -669,7 +687,7 @@ async def handle_whatsapp_webhook(
             processed += 1
             continue
 
-        # ── INSTANT ACK + KEYWORD CHECK + DELAYED FINAL RESPONSE ──
+        # ── INSTANT ACK + DELAYED FINAL RESPONSE ──
         # Step 0: Upsert contact in contact book + fetch contact data
         contact_data = None
         try:
@@ -686,68 +704,10 @@ async def handle_whatsapp_webhook(
             contact_relation = (contact_data.get("relation") or "unknown").lower()
             is_priority = contact_relation in ("vip", "client")
 
-        # Step 0.5: Check keyword auto-reply — SMART MODE
-        # Instead of static keyword reply, pass keyword intent as context to brain
-        keyword_intent = None
-        try:
-            from main import match_keyword_response
-            keyword_reply = match_keyword_response(db_conn_fn, msg["text"], "whatsapp")
-            if keyword_reply:
-                # For priority contacts, route through brain with intent context
-                # For others, use keyword reply directly (saves LLM tokens)
-                if is_priority:
-                    keyword_intent = keyword_reply  # Pass as context hint
-                    keyword_reply = None  # Don't send static reply
-                    logger.info(f"Priority contact {msg['sender_id']}: routing keyword through brain")
-        except Exception as e:
-            logger.warning(f"Keyword match failed: {e}")
-            keyword_reply = None
-
-        if keyword_reply:
-            # Standard contact: Keyword matched — send directly, skip LLM entirely
-            logger.info(f"Keyword match for {msg['sender_id']}: skipping LLM")
-            creds = get_creds_fn("whatsapp")
-            if creds:
-                from whatsapp import send_message
-                result = await send_message(
-                    creds.get("whatsapp_api_url", ""),
-                    creds.get("access_token", ""),
-                    creds.get("phone_number_id", ""),
-                    msg["sender_id"],
-                    keyword_reply,
-                )
-                with db_conn_fn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """INSERT INTO fazle_social_messages
-                               (platform, direction, contact_identifier, content, metadata, status)
-                               VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s)""",
-                            (msg["sender_id"], keyword_reply,
-                             psycopg2.extras.Json({"source": "keyword_auto_reply"}),
-                             "sent" if result.get("sent") else "failed"),
-                        )
-                    conn.commit()
-
-            # Track contact interest level based on message content
-            try:
-                from main import update_contact_interest
-                _auto_update_interest(db_conn_fn, msg["sender_id"], "whatsapp", msg["text"])
-            except Exception:
-                pass
-
-            processed += 1
-            continue
-
-        # Step 1: Send instant acknowledgement (<1s perceived response)
-        # Priority contacts skip ACK delay — they get responses faster
-        ack_text = _pick_ack_message(msg["text"])
-        ack_sent = await _send_whatsapp_ack(get_creds_fn, msg["sender_id"], ack_text)
-        if ack_sent:
-            logger.info(f"Instant ACK sent to {msg['sender_id']}: {ack_text}")
-
-        # Step 1.5: Check reply reuse cache BEFORE calling LLM (Step 18, 19 — Cost Optimization)
+        # ── FIX 1+10: NO ACK before brain — get AI reply FIRST, send ONCE ──
+        # Step 1: Check reply reuse cache BEFORE calling LLM
         cached_reply = None
-        if not is_priority:  # Priority contacts always get fresh LLM replies
+        if not is_priority:
             try:
                 from main import find_cached_reply
                 cached_reply = find_cached_reply(db_conn_fn, msg["text"], "whatsapp")
@@ -757,7 +717,7 @@ async def handle_whatsapp_webhook(
                 logger.debug(f"Reply cache check failed: {e}")
 
         if cached_reply:
-            # Send cached reply — no LLM cost!
+            # Send cached reply directly — no ACK, no LLM
             creds = get_creds_fn("whatsapp")
             if creds:
                 from whatsapp import send_message
@@ -786,12 +746,15 @@ async def handle_whatsapp_webhook(
             processed += 1
             continue
 
-        # Step 2: Process brain response (runs after ACK is already delivered)
-        # Build enhanced context with contact data + keyword intent
+        # Step 2: Call brain for AI response — NO ACK sent yet
+        # Rate-limit: skip if we're already processing a reply for this sender
+        if _is_sender_locked(msg["sender_id"]):
+            logger.info(f"Rate-limit: sender {msg['sender_id']} still in cooldown — skipping")
+            processed += 1
+            continue
+        _lock_sender(msg["sender_id"])
+
         brain_context = ""
-        if keyword_intent:
-            brain_context += f"Keyword intent detected. Standard info: {keyword_intent[:300]}\n"
-            brain_context += "Personalize this response for the contact. Don't just copy the standard reply.\n"
         if contact_data:
             brain_context += f"Contact: {contact_data.get('name', '')} ({contact_relation})"
             if contact_data.get("company"):
@@ -802,44 +765,46 @@ async def handle_whatsapp_webhook(
 
         ai_reply = await _call_brain(
             brain_url, msg["text"], "whatsapp", msg["sender_name"],
-            sender_id=msg["sender_id"], ack_sent=ack_sent,
+            sender_id=msg["sender_id"], ack_sent=False,
             context=brain_context if brain_context else "",
         )
-        # Fallback: if brain returns empty, send a safe Bangla fallback
-        if not ai_reply:
-            ai_reply = "\u09a6\u09c1\u0983\u0996\u09bf\u09a4, \u098f\u0995\u099f\u09c1 \u09b8\u09ae\u09b8\u09cd\u09af\u09be \u09b9\u099a\u09cd\u099b\u09c7\u0964 \u098f\u0995\u099f\u09c1 \u09aa\u09b0\u09c7 \u0986\u09ac\u09be\u09b0 \u099a\u09c7\u09b7\u09cd\u099f\u09be \u0995\u09b0\u09c1\u09a8\u0964"
-        if ai_reply:
-            # Step 2.5: Save reply for future reuse (Step 12, 18)
-            try:
-                from main import save_chat_reply
-                save_chat_reply(db_conn_fn, msg["text"], ai_reply,
-                                category=contact_relation or "unknown",
-                                platform="whatsapp", source="llm")
-            except Exception as e:
-                logger.debug(f"Reply cache save failed: {e}")
+        _unlock_sender(msg["sender_id"])
 
-            # Step 3: Send final AI reply
-            creds = get_creds_fn("whatsapp")
-            if creds:
-                from whatsapp import send_message
-                result = await send_message(
-                    creds.get("whatsapp_api_url", ""),
-                    creds.get("access_token", ""),
-                    creds.get("phone_number_id", ""),
-                    msg["sender_id"],
-                    ai_reply,
-                )
-                # Store outgoing reply (only the final reply, not the ACK)
-                with db_conn_fn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """INSERT INTO fazle_social_messages
-                               (platform, direction, contact_identifier, content, status)
-                               VALUES ('whatsapp', 'outgoing', %s, %s, %s)""",
-                            (msg["sender_id"], ai_reply, "sent" if result.get("sent") else "failed"),
-                        )
-                    conn.commit()
-        # Track contact interest level based on message content
+        # FIX 1: Fallback ONLY if brain returned nothing
+        if not ai_reply or not ai_reply.strip():
+            ai_reply = "দুঃখিত, একটু সমস্যা হয়েছে। আবার বলবেন?"
+            logger.warning(f"Brain returned empty for {msg['sender_id']} — using fallback")
+
+        # Step 3: Send the SINGLE AI reply (no ACK before it)
+        # Save reply for future reuse
+        try:
+            from main import save_chat_reply
+            save_chat_reply(db_conn_fn, msg["text"], ai_reply,
+                            category=contact_relation or "unknown",
+                            platform="whatsapp", source="llm")
+        except Exception as e:
+            logger.debug(f"Reply cache save failed: {e}")
+
+        creds = get_creds_fn("whatsapp")
+        if creds:
+            from whatsapp import send_message
+            result = await send_message(
+                creds.get("whatsapp_api_url", ""),
+                creds.get("access_token", ""),
+                creds.get("phone_number_id", ""),
+                msg["sender_id"],
+                ai_reply,
+            )
+            with db_conn_fn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO fazle_social_messages
+                           (platform, direction, contact_identifier, content, status)
+                           VALUES ('whatsapp', 'outgoing', %s, %s, %s)""",
+                        (msg["sender_id"], ai_reply, "sent" if result.get("sent") else "failed"),
+                    )
+                conn.commit()
+
         try:
             _auto_update_interest(db_conn_fn, msg["sender_id"], "whatsapp", msg["text"])
         except Exception:
@@ -950,7 +915,7 @@ async def _call_brain(brain_url: str, message: str, platform: str,
             payload["context"] = context
         else:
             payload["context"] = f"Platform: {platform}. Reply naturally."
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=55.0) as client:
             resp = await client.post(
                 f"{brain_url}/chat",
                 json=payload,
@@ -969,7 +934,7 @@ async def _call_brain_multimodal(
 ) -> str:
     """Call Brain /chat/multimodal endpoint for image/audio processing."""
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=55.0) as client:
             resp = await client.post(
                 f"{brain_url}/chat/multimodal",
                 json={

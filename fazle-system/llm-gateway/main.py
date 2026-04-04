@@ -29,13 +29,13 @@ logger = logging.getLogger("fazle-llm-gateway")
 class Settings(BaseSettings):
     openai_api_key: str = ""
     ollama_url: str = "http://ollama:11434"
-    llm_provider: str = "openai"
+    llm_provider: str = "ollama"           # FIX 5: Ollama-first
     llm_model: str = "gpt-4o"
-    ollama_model: str = "llama3.1"
+    ollama_model: str = "qwen2.5:3b"       # FIX 5: Bangla-capable model
     redis_url: str = "redis://redis:6379/3"
     # Fallback model when primary fails
-    fallback_provider: str = "ollama"
-    fallback_model: str = "llama3.1"
+    fallback_provider: str = "openai"      # FIX 5: OpenAI as fallback only
+    fallback_model: str = "gpt-4o"
     # Cache TTL in seconds (0 = disabled)
     cache_ttl: int = 300
     # Rate limit: max requests per minute per caller
@@ -216,10 +216,9 @@ async def _call_ollama(
         "stream": False,
         "options": {"temperature": temperature},
     }
-    if response_format == "json":
-        body["format"] = "json"
+    # NEVER force JSON format on Ollama — causes 500 when model can't produce valid JSON
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:  # FIX 6: tighter timeout
         resp = await client.post(
             f"{settings.ollama_url}/api/chat",
             json=body,

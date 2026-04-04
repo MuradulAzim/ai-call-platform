@@ -67,10 +67,10 @@ def _user_replies_key(platform: str, user_id: str) -> str:
 
 def user_history_append(
     platform: str, user_id: str, role: str, content: str,
-    max_messages: int = 20, ttl: int = 3600,
+    max_messages: int = 20, ttl: int = 86400,
 ) -> None:
     """Append a message to user-scoped conversation history.
-    Keeps last *max_messages* entries. TTL 1 hour default."""
+    Keeps last *max_messages* entries. TTL 24 hours (FIX 11)."""
     r = _get_redis()
     key = _user_conv_key(platform, user_id)
     entry = json.dumps({"role": role, "content": content, "ts": datetime.utcnow().isoformat()})
@@ -97,9 +97,9 @@ def user_history_get(platform: str, user_id: str, limit: int = 10) -> list[dict]
 
 def user_replies_track(
     platform: str, user_id: str, reply: str,
-    max_replies: int = 5, ttl: int = 3600,
+    max_replies: int = 5, ttl: int = 86400,
 ) -> None:
-    """Track recent AI replies for anti-repetition."""
+    """Track recent AI replies for anti-repetition. TTL 24 hours (FIX 11)."""
     r = _get_redis()
     key = _user_replies_key(platform, user_id)
     r.rpush(key, reply)

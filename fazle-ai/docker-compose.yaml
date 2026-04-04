@@ -1,5 +1,5 @@
-# ============================================================
-# Fazle Personal AI System — All Fazle Services
+﻿# ============================================================
+# Fazle Personal AI System â€” All Fazle Services
 # Intelligence layer integrated with Dograh voice platform
 # ============================================================
 # DEPLOY ORDER: 3 (start AFTER ai-infra)
@@ -7,7 +7,7 @@
 # ============================================================
 
 services:
-  # ── Fazle API Gateway ──────────────────────────────────────
+  # â”€â”€ Fazle API Gateway â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-api:
     build: ../fazle-system/api
     container_name: fazle-api
@@ -80,7 +80,7 @@ services:
       - ai-network
       - db-network
 
-  # ── Fazle Brain — Core Reasoning Engine ────────────────────
+  # â”€â”€ Fazle Brain â€” Core Reasoning Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-brain:
     build: ../fazle-system/brain
     container_name: fazle-brain
@@ -95,14 +95,14 @@ services:
       OLLAMA_URL: "http://ollama:11434"
       LLM_PROVIDER: "${FAZLE_LLM_PROVIDER:-openai}"
       LLM_MODEL: "${FAZLE_LLM_MODEL:-gpt-4o}"
-      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:3b}"
+      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
       MEMORY_URL: "http://fazle-memory:8300"
       TOOLS_URL: "http://fazle-web-intelligence:8500"
       TASK_URL: "http://fazle-task-engine:8400"
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/1"
       LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
       LEARNING_ENGINE_URL: "http://fazle-learning-engine:8900"
-      USE_LLM_GATEWAY: "true"
+      USE_LLM_GATEWAY: "false"
       # Phase-5 Autonomous AI services
       AUTONOMY_ENGINE_URL: "http://fazle-autonomy-engine:9100"
       TOOL_ENGINE_URL: "http://fazle-tool-engine:9200"
@@ -111,8 +111,8 @@ services:
       SELF_LEARNING_URL: "http://fazle-self-learning:9500"
       # Voice fast mode & agent system
       VOICE_FAST_MODE: "${FAZLE_VOICE_FAST_MODE:-true}"
-      VOICE_OLLAMA_MODEL: "${VOICE_OLLAMA_MODEL:-qwen2.5:3b}"
-      VOICE_FAST_MODEL: "${VOICE_FAST_MODEL:-qwen2.5:3b}"
+      VOICE_OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
+      VOICE_FAST_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
       PERSONA_CACHE_TTL: "${PERSONA_CACHE_TTL:-300}"
       MEMORY_TOP_K: "${MEMORY_TOP_K:-2}"
     logging:
@@ -138,7 +138,7 @@ services:
       - db-network
       - app-network
 
-  # ── Fazle Memory — Vector Memory System ────────────────────
+  # â”€â”€ Fazle Memory â€” Vector Memory System â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-memory:
     build: ../fazle-system/memory
     container_name: fazle-memory
@@ -190,7 +190,7 @@ services:
       - db-network
       - app-network
 
-  # ── Fazle Task Engine — Scheduling & Automation ────────────
+  # â”€â”€ Fazle Task Engine â€” Scheduling & Automation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-task-engine:
     build: ../fazle-system/tasks
     container_name: fazle-task-engine
@@ -228,7 +228,7 @@ services:
       - app-network
       - db-network
 
-  # ── Fazle Web Intelligence — Search & Extraction ──────────
+  # â”€â”€ Fazle Web Intelligence â€” Search & Extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-web-intelligence:
     build: ../fazle-system/tools
     container_name: fazle-web-intelligence
@@ -265,7 +265,7 @@ services:
       - ai-network
       - app-network
 
-  # ── Fazle Trainer — Learning & Preference Extraction ──────
+  # â”€â”€ Fazle Trainer â€” Learning & Preference Extraction â”€â”€â”€â”€â”€â”€
   fazle-trainer:
     build: ../fazle-system/trainer
     container_name: fazle-trainer
@@ -280,11 +280,11 @@ services:
       OLLAMA_URL: "http://ollama:11434"
       LLM_PROVIDER: "${FAZLE_LLM_PROVIDER:-openai}"
       LLM_MODEL: "${FAZLE_LLM_MODEL:-gpt-4o}"
-      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:3b}"
+      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
       MEMORY_URL: "http://fazle-memory:8300"
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/2"
       LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
-      USE_LLM_GATEWAY: "true"
+      USE_LLM_GATEWAY: "false"
     logging:
       driver: "json-file"
       options:
@@ -308,7 +308,7 @@ services:
       - app-network
       - db-network
 
-  # ── Fazle Voice Agent — LiveKit-based STT/TTS ─────────────
+  # â”€â”€ Fazle Voice Agent â€” LiveKit-based STT/TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-voice:
     build: ../fazle-system/voice
     container_name: fazle-voice
@@ -359,7 +359,7 @@ services:
       - ai-network
       - db-network
 
-  # ── Fazle UI — Next.js Control Dashboard ───────────────────
+  # â”€â”€ Fazle UI â€” Next.js Control Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-ui:
     build: ../frontend/fazle-dashboard
     container_name: fazle-ui
@@ -396,7 +396,7 @@ services:
     networks:
       - app-network
 
-  # ── Fazle LLM Gateway — Centralized LLM Routing ───────────
+  # â”€â”€ Fazle LLM Gateway â€” Centralized LLM Routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-llm-gateway:
     build: ../fazle-system/llm-gateway
     container_name: fazle-llm-gateway
@@ -411,10 +411,10 @@ services:
       OLLAMA_URL: "http://ollama:11434"
       LLM_PROVIDER: "${FAZLE_LLM_PROVIDER:-openai}"
       LLM_MODEL: "${FAZLE_LLM_MODEL:-gpt-4o}"
-      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:3b}"
+      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/3"
       FALLBACK_PROVIDER: "${FAZLE_FALLBACK_PROVIDER:-ollama}"
-      FALLBACK_MODEL: "${FAZLE_FALLBACK_MODEL:-qwen2.5:3b}"
+      FALLBACK_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
       CACHE_TTL: "${FAZLE_CACHE_TTL:-300}"
       RATE_LIMIT_RPM: "${FAZLE_RATE_LIMIT_RPM:-60}"
       RATE_LIMIT_PER_USER_RPS: "${FAZLE_RATE_LIMIT_PER_USER_RPS:-10}"
@@ -443,7 +443,7 @@ services:
       - app-network
       - db-network
 
-  # ── Fazle Learning Engine — Self-Improvement System ───────
+  # â”€â”€ Fazle Learning Engine â€” Self-Improvement System â”€â”€â”€â”€â”€â”€â”€
   fazle-learning-engine:
     build: ../fazle-system/learning-engine
     container_name: fazle-learning-engine
@@ -488,7 +488,7 @@ services:
       - app-network
       - db-network
 
-  # ── Fazle Queue — Async Request Queue ─────────────────────
+  # â”€â”€ Fazle Queue â€” Async Request Queue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-queue:
     build: ../fazle-system/queue
     container_name: fazle-queue
@@ -529,7 +529,7 @@ services:
       - app-network
       - db-network
 
-  # ── Fazle Workers — LLM Request Worker Pool ───────────────
+  # â”€â”€ Fazle Workers â€” LLM Request Worker Pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-workers:
     build: ../fazle-system/workers
     restart: unless-stopped
@@ -578,7 +578,7 @@ services:
       - app-network
       - db-network
 
-  # ── Phase-5: Autonomy Engine — Goal Decomposition & Planning ──
+  # â”€â”€ Phase-5: Autonomy Engine â€” Goal Decomposition & Planning â”€â”€
   fazle-autonomy-engine:
     build: ../fazle-system/autonomy-engine
     container_name: fazle-autonomy-engine
@@ -630,7 +630,7 @@ services:
       - app-network
       - db-network
 
-  # ── Phase-5: Tool Execution Engine — Secure Tool Orchestration ──
+  # â”€â”€ Phase-5: Tool Execution Engine â€” Secure Tool Orchestration â”€â”€
   fazle-tool-engine:
     build: ../fazle-system/tool-engine
     container_name: fazle-tool-engine
@@ -668,7 +668,7 @@ services:
       - ai-network
       - app-network
 
-  # ── Phase-5: Knowledge Graph — Entity & Relationship Store ──
+  # â”€â”€ Phase-5: Knowledge Graph â€” Entity & Relationship Store â”€â”€
   fazle-knowledge-graph:
     build: ../fazle-system/knowledge-graph
     container_name: fazle-knowledge-graph
@@ -706,7 +706,7 @@ services:
       - ai-network
       - app-network
 
-  # ── Phase-5: Autonomous Task Runner — Background Task Loops ──
+  # â”€â”€ Phase-5: Autonomous Task Runner â€” Background Task Loops â”€â”€
   fazle-autonomous-runner:
     build: ../fazle-system/autonomous-runner
     container_name: fazle-autonomous-runner
@@ -748,7 +748,7 @@ services:
       - ai-network
       - app-network
 
-  # ── Phase-5: Self-Learning Engine — Pattern & Insight Extraction ──
+  # â”€â”€ Phase-5: Self-Learning Engine â€” Pattern & Insight Extraction â”€â”€
   fazle-self-learning:
     build: ../fazle-system/self-learning
     container_name: fazle-self-learning
@@ -786,7 +786,7 @@ services:
       - ai-network
       - app-network
 
-  # ── Fazle Guardrail Engine — AI Safety ─────────────────────
+  # â”€â”€ Fazle Guardrail Engine â€” AI Safety â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-guardrail-engine:
     build: ../fazle-system/guardrail-engine
     container_name: fazle-guardrail-engine
@@ -820,7 +820,7 @@ services:
       - ai-network
       - db-network
 
-  # ── Fazle Workflow Engine — Multi-step AI Workflows ────────
+  # â”€â”€ Fazle Workflow Engine â€” Multi-step AI Workflows â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-workflow-engine:
     build: ../fazle-system/workflow-engine
     container_name: fazle-workflow-engine
@@ -860,7 +860,7 @@ services:
       - ai-network
       - db-network
 
-  # ── Fazle Social Engine — WhatsApp + Facebook Automation ──
+  # â”€â”€ Fazle Social Engine â€” WhatsApp + Facebook Automation â”€â”€
   fazle-social-engine:
     build: ../fazle-system/social-engine
     container_name: fazle-social-engine
@@ -911,7 +911,7 @@ services:
       - app-network
       - db-network
 
-  # ── OpenTelemetry Collector — Distributed Tracing ──────────
+  # â”€â”€ OpenTelemetry Collector â€” Distributed Tracing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-otel-collector:
     image: otel/opentelemetry-collector-contrib:0.96.0
     container_name: fazle-otel-collector

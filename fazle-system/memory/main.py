@@ -152,6 +152,16 @@ async def ensure_collection():
             except Exception:
                 pass  # Index may already exist
 
+        # Create payload indexes for tree memory on main collection
+        for field_name, field_type in [("tree_path", "keyword"), ("tree_ancestors", "keyword")]:
+            try:
+                await client.put(
+                    f"{settings.vector_db_url}/collections/{settings.collection_name}/index",
+                    json={"field_name": field_name, "field_schema": field_type},
+                )
+            except Exception:
+                pass  # Index may already exist
+
 
 async def get_embedding(text: str) -> list[float]:
     """Get embedding vector. Tries OpenAI first, falls back to Ollama nomic-embed-text."""
@@ -1018,3 +1028,290 @@ async def list_knowledge_categories():
         pool.putconn(conn)
 
     return {"categories": [{"category": r[0], "count": r[1]} for r in rows]}
+
+
+# ══════════════════════════════════════════════════════════════
+# Tree Memory System — Hierarchical knowledge with tree paths
+# Stores memories tagged with tree paths like:
+#   azim/business/al-aqsa/services
+#   azim/family/wife/preferences
+# Enables browsing & searching within branches of the tree.
+# ══════════════════════════════════════════════════════════════
+
+def _tree_ancestors(tree_path: str) -> list[str]:
+    """Build ancestor list for a tree path.
+    'azim/business/al-aqsa' → ['azim', 'azim/business', 'azim/business/al-aqsa']
+    """
+    parts = [p.strip() for p in tree_path.strip("/").split("/") if p.strip()]
+    ancestors = []
+    for i in range(1, len(parts) + 1):
+        ancestors.append("/".join(parts[:i]))
+    return ancestors
+
+
+class TreeStoreRequest(BaseModel):
+    tree_path: str = Field(..., description="Tree path e.g. 'business/al-aqsa/services'")
+    text: str = Field(..., description="Memory content text")
+    content: dict = Field(default_factory=dict, description="Optional structured content")
+    user: str = "Azim"
+    source: str = "manual"
+    language: str = "en"
+
+
+class TreeSearchRequest(BaseModel):
+    query: str = Field(..., description="Semantic search query")
+    tree_path: Optional[str] = Field(None, description="Filter to this branch (prefix match)")
+    limit: int = 10
+
+
+class TreeBulkStoreRequest(BaseModel):
+    items: List[TreeStoreRequest]
+
+
+@app.post("/tree/store")
+async def tree_store(request: TreeStoreRequest):
+    """Store a memory tagged with a tree path."""
+    path = request.tree_path.strip("/").lower()
+    if not path:
+        raise HTTPException(status_code=400, detail="tree_path is required")
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    try:
+        embedding = await get_embedding(request.text)
+    except Exception as e:
+        logger.error(f"Tree store embedding failed: {e}")
+        raise HTTPException(status_code=502, detail="Embedding service unavailable")
+
+    content_hash = hashlib.sha256(f"tree:{path}:{request.text[:200]}".encode()).hexdigest()[:16]
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, content_hash))
+
+    ancestors = _tree_ancestors(path)
+
+    payload = {
+        "type": "tree_memory",
+        "tree_path": path,
+        "tree_ancestors": ancestors,
+        "tree_depth": len(ancestors),
+        "user": request.user,
+        "text": request.text,
+        "content": request.content,
+        "source": request.source,
+        "language": request.language,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.put(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points",
+                json={"points": [{"id": point_id, "vector": embedding, "payload": payload}]},
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Tree store Qdrant failed: {e}")
+            raise HTTPException(status_code=502, detail="Vector database unavailable")
+
+    logger.info(f"Tree memory stored: {path} — {request.text[:60]}")
+    return {"status": "stored", "id": point_id, "tree_path": path, "depth": len(ancestors)}
+
+
+@app.post("/tree/store-bulk")
+async def tree_store_bulk(request: TreeBulkStoreRequest):
+    """Store multiple tree memories at once."""
+    results = []
+    for item in request.items:
+        try:
+            r = await tree_store(item)
+            results.append({"tree_path": item.tree_path, "status": "stored", "id": r.get("id")})
+        except Exception as e:
+            results.append({"tree_path": item.tree_path, "status": "error", "error": str(e)})
+    return {"stored": sum(1 for r in results if r["status"] == "stored"), "total": len(results), "results": results}
+
+
+@app.post("/tree/search")
+async def tree_search(request: TreeSearchRequest):
+    """Semantic search within tree memories, optionally filtered to a branch."""
+    try:
+        embedding = await get_embedding(request.query)
+    except Exception as e:
+        logger.error(f"Tree search embedding failed: {e}")
+        raise HTTPException(status_code=502, detail="Embedding service unavailable")
+
+    filter_conditions = [{"key": "type", "match": {"value": "tree_memory"}}]
+    if request.tree_path:
+        branch = request.tree_path.strip("/").lower()
+        filter_conditions.append({"key": "tree_ancestors", "match": {"value": branch}})
+
+    search_body = {
+        "vector": embedding,
+        "limit": request.limit,
+        "with_payload": True,
+        "filter": {"must": filter_conditions},
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points/search",
+                json=search_body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Tree search Qdrant failed: {e}")
+            raise HTTPException(status_code=502, detail="Vector database unavailable")
+
+    results = []
+    for hit in data.get("result", []):
+        p = hit.get("payload", {})
+        results.append({
+            "id": hit.get("id"),
+            "score": hit.get("score", 0),
+            "tree_path": p.get("tree_path", ""),
+            "text": p.get("text", ""),
+            "content": p.get("content", {}),
+            "source": p.get("source", ""),
+            "language": p.get("language", ""),
+            "created_at": p.get("created_at"),
+        })
+
+    return {"results": results, "count": len(results), "branch": request.tree_path}
+
+
+@app.get("/tree/browse")
+async def tree_browse(limit: int = 500):
+    """List all unique tree paths (branches) stored in memory."""
+    scroll_body = {
+        "limit": limit,
+        "with_payload": True,
+        "filter": {"must": [{"key": "type", "match": {"value": "tree_memory"}}]},
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points/scroll",
+                json=scroll_body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Tree browse Qdrant failed: {e}")
+            raise HTTPException(status_code=502, detail="Vector database unavailable")
+
+    # Collect unique paths and build tree structure
+    path_counts: dict[str, int] = {}
+    for point in data.get("result", {}).get("points", []):
+        p = point.get("payload", {})
+        tp = p.get("tree_path", "")
+        if tp:
+            path_counts[tp] = path_counts.get(tp, 0) + 1
+
+    # Build nested tree from paths
+    tree: dict = {}
+    for path in sorted(path_counts.keys()):
+        parts = path.split("/")
+        node = tree
+        for part in parts:
+            if part not in node:
+                node[part] = {}
+            node = node[part]
+
+    return {
+        "paths": [{"path": p, "count": c} for p, c in sorted(path_counts.items())],
+        "total_paths": len(path_counts),
+        "total_memories": sum(path_counts.values()),
+        "tree": tree,
+    }
+
+
+@app.get("/tree/branch")
+async def tree_branch(path: str, limit: int = 50, offset: int = 0):
+    """Get all memories under a specific tree path (branch)."""
+    branch = path.strip("/").lower()
+    if not branch:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    scroll_body = {
+        "limit": limit,
+        "offset": offset,
+        "with_payload": True,
+        "filter": {
+            "must": [
+                {"key": "type", "match": {"value": "tree_memory"}},
+                {"key": "tree_ancestors", "match": {"value": branch}},
+            ]
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points/scroll",
+                json=scroll_body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Tree branch Qdrant failed: {e}")
+            raise HTTPException(status_code=502, detail="Vector database unavailable")
+
+    memories = []
+    for point in data.get("result", {}).get("points", []):
+        p = point.get("payload", {})
+        memories.append({
+            "id": point.get("id"),
+            "tree_path": p.get("tree_path", ""),
+            "text": p.get("text", ""),
+            "content": p.get("content", {}),
+            "source": p.get("source", ""),
+            "language": p.get("language", ""),
+            "created_at": p.get("created_at"),
+        })
+
+    return {"branch": branch, "memories": memories, "count": len(memories)}
+
+
+@app.delete("/tree/memory/{memory_id}")
+async def tree_delete_memory(memory_id: str):
+    """Delete a specific tree memory by ID."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points/delete",
+                json={"points": [memory_id]},
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Tree delete Qdrant failed: {e}")
+            raise HTTPException(status_code=502, detail="Vector database unavailable")
+    return {"status": "deleted", "id": memory_id}
+
+
+@app.delete("/tree/branch-delete")
+async def tree_delete_branch(path: str):
+    """Delete all memories under a tree path (branch)."""
+    branch = path.strip("/").lower()
+    if not branch:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.vector_db_url}/collections/{settings.collection_name}/points/delete",
+                json={
+                    "filter": {
+                        "must": [
+                            {"key": "type", "match": {"value": "tree_memory"}},
+                            {"key": "tree_ancestors", "match": {"value": branch}},
+                        ]
+                    }
+                },
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Tree branch delete Qdrant failed: {e}")
+            raise HTTPException(status_code=502, detail="Vector database unavailable")
+
+    return {"status": "deleted", "branch": branch}

@@ -56,8 +56,9 @@ class SocialAgent(BaseAgent):
                 social_context=social_context,
             )
 
-            # Inject identity core into prompt
-            full_prompt = f"{identity_prompt}\n\n{system_prompt}"
+            # Skip identity_prompt prepend — BASE_IDENTITY in persona_engine covers it.
+            # Saves ~460 chars (~150 tokens, ~6s on CPU).
+            full_prompt = system_prompt
 
             # Enrich context
             ctx.metadata["social_intent"] = intent

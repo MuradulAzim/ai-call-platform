@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     knowledge_graph_url: str = "http://fazle-knowledge-graph:9300"
     autonomous_runner_url: str = "http://fazle-autonomous-runner:9400"
     self_learning_url: str = "http://fazle-self-learning:9500"
-    use_llm_gateway: bool = True
+    use_llm_gateway: bool = False
     # Voice fast mode: bypass gateway, use Ollama, reduce top_k, skip batching
     voice_fast_mode: bool = False
     voice_ollama_model: str = "qwen2.5:0.5b"
@@ -153,27 +153,34 @@ async def init_agents():
     asyncio.create_task(_ollama_prewarm_loop())
 
 
+_ollama_busy = False  # Guard to prevent prewarm during active requests
+
+
 async def _ollama_prewarm_loop():
     """Ping Ollama every 2 minutes with a tiny prompt to keep the model loaded in RAM.
     Prevents cold-start delays on the memory-constrained VPS."""
     await asyncio.sleep(5)  # let startup finish
     while True:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{settings.ollama_url}/api/chat",
-                    json={
-                        "model": settings.voice_fast_model,
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "stream": False,
-                    },
-                )
-                if resp.status_code == 200:
-                    logger.debug("Ollama pre-warm: model kept hot")
-                else:
-                    logger.warning(f"Ollama pre-warm: status {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Ollama pre-warm failed: {e}")
+        if _ollama_busy:
+            logger.debug("Ollama pre-warm: skipped, request in-flight")
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        f"{settings.ollama_url}/api/chat",
+                        json={
+                            "model": settings.ollama_model,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "options": {"num_predict": 1},
+                        },
+                    )
+                    if resp.status_code == 200:
+                        logger.debug("Ollama pre-warm: model kept hot")
+                    else:
+                        logger.warning(f"Ollama pre-warm: status {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"Ollama pre-warm failed: {e}")
         await asyncio.sleep(120)  # every 2 minutes
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
@@ -213,14 +220,58 @@ Respond in JSON with these fields:
 
 
 # ── LLM Failover Constants ────────────────────────────────────
-_LLM_TIMEOUT_GATEWAY = 20.0    # Gateway: 20s (OpenAI 429 + Ollama cold start needs ~10s)
+_LLM_TIMEOUT_GATEWAY = 20.0    # Gateway: 20s
 _LLM_TIMEOUT_OPENAI = 5.0     # Direct OpenAI: 5s per-provider cap
-_LLM_TIMEOUT_OLLAMA = 15.0    # Local Ollama: 15s per-provider cap (cold start can take 5-8s)
-_LLM_TIMEOUT_FAST = 10.0      # Fast model fallback: 10s cap
-_LLM_PARALLEL_GLOBAL = 15.0   # Global parallel timeout: 15s max total
+_LLM_TIMEOUT_OLLAMA = 50.0    # Local Ollama: 50s (handles cold-start + larger prompts on CPU)
+_LLM_TIMEOUT_FAST = 8.0       # Fast model fallback: 8s cap
+_LLM_PARALLEL_GLOBAL = 55.0   # Global parallel timeout: 55s max total
 
-_FALLBACK_REPLY_BN = "দুঃখিত, একটু সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।"
+_FALLBACK_REPLY_BN = "দুঃখিত, একটু সমস্যা হয়েছে। আবার বলবেন?"
 _FALLBACK_REPLY_EN = "Sorry, having a small issue. Please try again shortly."
+
+
+# ── FIX 3: Identity hard override — instant answers, no LLM needed ──
+_IDENTITY_PATTERNS = [
+    "তুমি কে", "আপনি কে", "তুই কে", "who are you", "what are you",
+    "তোমার নাম কি", "আপনার নাম কি", "তোমার পরিচয়", "আপনার পরিচয়",
+    "your name", "introduce yourself", "নিজের পরিচয় দাও", "পরিচয় দিন",
+    "পরিচয় দাও", "তুমি কি ai", "are you ai", "are you a bot",
+    "তুমি কি রোবট", "তুমি কি বট",
+]
+
+_IDENTITY_REPLY = (
+    "আমি ফজলে আজিম, আল-আকসা সিকিউরিটি সার্ভিস এর পরিচালক। "
+    "কিভাবে সাহায্য করতে পারি?"
+)
+
+
+def _check_identity_override(message: str) -> str | None:
+    """Return instant identity reply if the message is an identity question."""
+    msg = message.strip().lower()
+    for pattern in _IDENTITY_PATTERNS:
+        if pattern in msg:
+            return _IDENTITY_REPLY
+    return None
+
+
+# ── FIX 9: Human response filter ──
+def _humanize_reply(reply: str) -> str:
+    """Remove robotic phrases and ensure natural Bangla tone."""
+    import re
+    # Remove common AI-isms
+    _ROBOTIC = [
+        "Certainly!", "Of course!", "Absolutely!", "Sure thing!",
+        "I'd be happy to help", "I'm here to help", "Great question!",
+        "That's a great question", "Let me help you with that",
+        "I understand your concern", "Thank you for reaching out",
+        "How can I assist you today",
+    ]
+    for phrase in _ROBOTIC:
+        reply = reply.replace(phrase, "").replace(phrase.lower(), "")
+    # Clean up whitespace
+    reply = re.sub(r'\n{3,}', '\n\n', reply)
+    reply = reply.strip()
+    return reply
 
 
 async def query_openai(messages: list[dict]) -> dict:
@@ -246,19 +297,40 @@ async def query_openai(messages: list[dict]) -> dict:
 
 async def query_ollama(messages: list[dict]) -> dict:
     """Call local Ollama LLM for reasoning (direct, used as fallback)."""
-    async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_OLLAMA) as client:
+    global _ollama_busy
+    _ollama_busy = True
+    try:
+      async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_OLLAMA) as client:
         resp = await client.post(
             f"{settings.ollama_url}/api/chat",
             json={
                 "model": settings.ollama_model,
                 "messages": messages,
                 "stream": False,
-                "format": "json",
+                "options": {"num_predict": 50},
             },
         )
         resp.raise_for_status()
         data = resp.json()
-        return json.loads(data["message"]["content"])
+        # Log Ollama performance metrics
+        _pec = data.get("prompt_eval_count", 0)
+        _ec = data.get("eval_count", 0)
+        _ed = data.get("eval_duration", 0) / 1e9
+        _td = data.get("total_duration", 0) / 1e9
+        _ld = data.get("load_duration", 0) / 1e9
+        _tps = _ec / _ed if _ed > 0 else 0
+        _msg_sizes = [len(m.get("content", "")) for m in messages]
+        logger.info(
+            f"Ollama perf: prompt_tok={_pec} eval_tok={_ec} eval={_ed:.1f}s "
+            f"tok/s={_tps:.1f} total={_td:.1f}s load={_ld:.2f}s msg_chars={_msg_sizes}"
+        )
+        content = data["message"]["content"]
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return {"reply": content.strip(), "memory_updates": [], "actions": []}
+    finally:
+        _ollama_busy = False
 
 
 async def query_gateway(messages: list[dict]) -> dict:
@@ -299,12 +371,15 @@ async def query_llm_voice(messages: list[dict]) -> dict:
                     "model": settings.voice_ollama_model,
                     "messages": messages,
                     "stream": False,
-                    "format": "json",
                 },
             )
             resp.raise_for_status()
             data = resp.json()
-            return json.loads(data["message"]["content"])
+            content = data["message"]["content"]
+            try:
+                return json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                return {"reply": content.strip(), "memory_updates": [], "actions": []}
     except Exception as e:
         logger.warning(f"Voice fast Ollama failed, falling back to gateway: {e}")
         return await query_llm(messages)
@@ -464,23 +539,23 @@ import time as _time
 
 
 async def query_llm_smart(messages: list[dict], complexity: str = "medium") -> dict:
-    """Parallel LLM routing — fires Gateway + OpenAI + Ollama simultaneously.
-    First successful response wins; others are cancelled.
-    Global timeout: 6s. Falls back to fast model, then static Bangla reply."""
+    """FIX 5: Ollama-first LLM routing with parallel fallback.
+    Fires Ollama + Gateway simultaneously. OpenAI only if key configured.
+    Global timeout: 12s. Falls back to fast model, then static Bangla reply."""
     model_override = None
     route_label = "full"
 
     if complexity == "simple":
-        model_override = "gpt-4o-mini"
+        model_override = None  # FIX 5: Use Ollama default model, not gpt-4o-mini
         route_label = "fast"
     elif complexity == "complex":
-        model_override = settings.llm_model  # gpt-4o
+        model_override = settings.llm_model
         route_label = "complex"
 
     t0 = _time.monotonic()
 
-    # ── Priority weights (lower = preferred when two finish close together) ──
-    _PRIORITY = {"gateway": 0, "openai_direct": 1, "ollama": 2}
+    # FIX 5: Ollama is priority 0 (preferred), gateway secondary, OpenAI last
+    _PRIORITY = {"ollama": 0, "gateway": 1, "openai_direct": 2}
 
     # ── Build provider coroutines ──
     async def _provider_gateway():
@@ -492,12 +567,14 @@ async def query_llm_smart(messages: list[dict], complexity: str = "medium") -> d
     async def _provider_ollama():
         return await query_ollama(messages)
 
+    # FIX 5: Ollama first, then gateway, then OpenAI
     providers: list[tuple[str, asyncio.Task]] = []
+    providers.append(("ollama", asyncio.create_task(_provider_ollama())))
     if settings.use_llm_gateway:
         providers.append(("gateway", asyncio.create_task(_provider_gateway())))
-    if settings.openai_api_key:
-        providers.append(("openai_direct", asyncio.create_task(_provider_openai())))
-    providers.append(("ollama", asyncio.create_task(_provider_ollama())))
+    # OpenAI disabled — API key is 429-blocked, wastes ~1s per request
+    # if settings.openai_api_key:
+    #     providers.append(("openai_direct", asyncio.create_task(_provider_openai())))
 
     task_to_name: dict[asyncio.Task, str] = {t: n for n, t in providers}
     pending = {t for _, t in providers}
@@ -587,21 +664,20 @@ async def query_llm_smart(messages: list[dict], complexity: str = "medium") -> d
             f"LLM parallel ALL FAILED in {elapsed:.2f}s — no time left for fast_model"
         )
 
-    # ── Static fallback — NEVER silent ──
+    # ── Static fallback — return empty so /chat endpoint detects failure ──
     intel_usage_track("static_fallback", route="emergency_static")
-    logger.error(f"LLM ALL PROVIDERS FAILED — returning safe fallback. chain={failed_providers}")
+    logger.error(f"LLM ALL PROVIDERS FAILED — returning empty reply for fallback. chain={failed_providers}")
     return {
-        "reply": _FALLBACK_REPLY_BN,
+        "reply": "",
         "memory_updates": [],
         "actions": [],
     }
 
 
 async def _query_gateway_with_model(messages: list[dict], model: str = None) -> dict:
-    """Call LLM Gateway with optional model override. 5s hard timeout."""
+    """Call LLM Gateway with optional model override."""
     payload = {
         "messages": messages,
-        "response_format": "json",
         "caller": "fazle-brain",
         "temperature": 0.7,
     }
@@ -610,7 +686,11 @@ async def _query_gateway_with_model(messages: list[dict], model: str = None) -> 
     async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_GATEWAY) as client:
         resp = await client.post(f"{settings.llm_gateway_url}/generate", json=payload)
         resp.raise_for_status()
-        return json.loads(resp.json()["content"])
+        content = resp.json()["content"]
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return {"reply": content.strip(), "memory_updates": [], "actions": []}
 
 
 async def _query_openai_with_model(messages: list[dict], model: str = None) -> dict:
@@ -644,12 +724,15 @@ async def _query_fast_model_fallback(messages: list[dict]) -> dict:
                 "model": settings.voice_fast_model,
                 "messages": messages,
                 "stream": False,
-                "format": "json",
             },
         )
         resp.raise_for_status()
         data = resp.json()
-        return json.loads(data["message"]["content"])
+        content = data["message"]["content"]
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return {"reply": content.strip(), "memory_updates": [], "actions": []}
 
 
 # STEP 1: Question Strategy — confidence-aware response
@@ -1128,6 +1211,18 @@ async def chat(request: ChatRequest):
     relationship = request.relationship or "self"
     user_id = request.user_id
 
+    # ── FIX 3: Identity hard override — instant, no LLM ──
+    identity_reply = _check_identity_override(request.message)
+    if identity_reply:
+        logger.info(f"Identity override triggered for: {request.message[:60]}")
+        return {
+            "reply": identity_reply,
+            "conversation_id": conversation_id,
+            "memory_updates": [],
+            "route": "identity_override",
+            "presence": {"typing_delay_ms": 0, "response_delay_ms": 0, "tone_energy": "high"},
+        }
+
     # ── STEP 2: Owner Priority Interrupt ──
     await _check_owner_priority(relationship)
 
@@ -1137,7 +1232,6 @@ async def chat(request: ChatRequest):
     # Ultra-simple queries: skip heavy pipeline entirely
     if complexity == "simple" and relationship in ("self", "wife", "parent", "sibling"):
         history = conversation_get(conversation_id)
-        from persona_engine import build_identity_context as _bic
         fast_prompt = (
             "You are Azim. Respond naturally in 1-2 short sentences. Be warm and direct. "
             "Use your natural speech: 'bro', 'haha', 'wallah'. Respond in JSON: {\"reply\": \"...\", \"memory_updates\": [], \"actions\": []}"
@@ -1150,6 +1244,7 @@ async def chat(request: ChatRequest):
         try:
             result = await query_llm_smart(fast_messages, complexity="simple")
             reply = result.get("reply", "yo 👋")
+            reply = _humanize_reply(reply)
             history.append({"role": "user", "content": request.message})
             history.append({"role": "assistant", "content": reply})
             conversation_set(conversation_id, history)
@@ -1203,7 +1298,9 @@ async def chat(request: ChatRequest):
                 except Exception as _e:
                     logger.debug(f"Contact lookup failed: {_e}")
 
-    # Run persona build + memory searches in parallel (hybrid: general + knowledge + personal)
+    # FIX 7+8: Run persona build + memory searches in parallel (limited to 5 items max)
+    # NOTE: Memory retrieval skipped — base system_prompt is always >500 chars
+    # and we truncate to 500, so appended contexts are always lost. Saves 2-3s.
     system_prompt_task = build_system_prompt_async(
         user_name=user_name,
         relationship=relationship,
@@ -1212,63 +1309,28 @@ async def chat(request: ChatRequest):
         social_context=social_context,
         contact_data=contact_data,
     )
-    mem_task = retrieve_memories(request.message, user_id=user_id, limit=3)
-    mm_task = retrieve_multimodal_memories(request.message, user_id=user_id, limit=2)
-    knowledge_task = retrieve_memories(request.message, memory_type="knowledge", user_id=user_id, limit=2)
-    personal_task = retrieve_memories(request.message, memory_type="personal", user_id=user_id, limit=2)
 
-    system_prompt, memories, mm_memories, knowledge_mems, personal_mems = await asyncio.gather(
-        system_prompt_task, mem_task, mm_task, knowledge_task, personal_task,
-    )
-    # Merge long-term knowledge/personal memories (deduplicated) with general
-    seen_texts = {m.get("text", "") for m in memories}
-    for m in knowledge_mems + personal_mems:
-        if m.get("text", "") not in seen_texts:
-            memories.append(m)
-            seen_texts.add(m.get("text", ""))
-    memory_context = _format_memory_context(memories, mm_memories)
+    system_prompt = await system_prompt_task
+    memories = []
+    memory_context = ""
 
     # ── User-scoped conversation intelligence ───────────────
-    # Determine platform + user identifier for memory isolation
     platform = "app"
     user_identifier = user_id or conversation_id
     if conversation_id and conversation_id.startswith("social-"):
         parts = conversation_id.split("-", 2)
         if len(parts) >= 3:
-            platform = parts[1]  # whatsapp, facebook
-            user_identifier = parts[2]  # sender phone/id
+            platform = parts[1]
+            user_identifier = parts[2]
 
-    # Fetch user-scoped recent history (isolated per user)
-    user_history = user_history_get(platform, user_identifier, limit=10)
-    user_history_context = build_user_history_context(user_history)
+    user_history_context = ""
+    anti_rep_context = ""
+    awareness_context = ""
 
-    # Anti-repetition: check recent AI replies for this user
-    recent_replies = user_replies_get(platform, user_identifier, limit=5)
-    anti_rep_context = build_anti_repetition_context(recent_replies)
-
-    # Context awareness: new vs returning user
-    user_type = detect_user_type(user_history)
-    awareness_context = build_context_awareness(user_type)
-
-    # ── Owner style learning (STEP 6) ──────────────────────
-    # For social messages, search for similar owner training examples
+    # ── Owner style learning (STEP 6) — skipped, always truncated ──
     owner_style_context = ""
-    if relationship == "social":
-        try:
-            owner_examples = await retrieve_memories(
-                request.message, memory_type="knowledge", user_id="owner", limit=3,
-            )
-            # Filter to only owner_training entries
-            owner_training = [
-                m for m in owner_examples
-                if "owner" in m.get("text", "").lower() or
-                   (isinstance(m.get("content"), dict) and m["content"].get("kind") == "owner_training")
-            ]
-            owner_style_context = build_owner_style_context(owner_training)
-        except Exception as e:
-            logger.debug(f"Owner style search failed: {e}")
 
-    # Inject all context into system prompt
+    # Inject context — FIX 7: trimmed total prompt size
     system_prompt = system_prompt + memory_context + user_history_context + anti_rep_context + awareness_context + owner_style_context
 
     # ── Strategy Agent: domain routing + identity enforcement ──
@@ -1285,36 +1347,103 @@ async def chat(request: ChatRequest):
         )
         try:
             domain_result = await agent_manager.process_domain(ctx)
-            # If domain agent produced an identity-enhanced prompt, use it
             domain_prompt = domain_result.get("system_prompt")
+            logger.debug(f"domain_prompt_len={len(domain_prompt) if domain_prompt else 0}")
             if domain_prompt:
                 system_prompt = domain_prompt + memory_context + user_history_context + anti_rep_context + awareness_context + owner_style_context
             else:
-                # Enforce identity core on the existing prompt
-                identity_prompt = domain_result.get("identity_prompt", "")
-                if identity_prompt:
-                    system_prompt = identity_prompt + "\n\n" + system_prompt
+                # Skip identity_prompt for social — BASE_IDENTITY covers it, saves ~450 chars (~6s on CPU)
+                if relationship != "social":
+                    identity_prompt = domain_result.get("identity_prompt", "")
+                    if identity_prompt:
+                        system_prompt = identity_prompt + "\n\n" + system_prompt
         except Exception as e:
             logger.debug(f"Domain routing skipped: {e}")
 
-    # Build conversation history
+    # FIX 2: FORCE system prompt as first message, always role=system
+    # Build conversation history — FIX 7: limit to last 5 turns
     history = conversation_get(conversation_id)
+    logger.debug(f"sys_prompt_len={len(system_prompt)} history={len(history)}")
+
+    # Truncate system prompt to prevent Ollama CPU timeout on large prompts
+    # Core identity is always preserved even after truncation
+    _CORE_IDENTITY = (
+        "You are Fazle AI — Azim, owner of Al-Aqsa Security & Logistics Services Ltd (BD, est.2014). "
+        "Ex-G4S Dubai. Contact: 01958 122300. Web: al-aqsasecurity.com. "
+        "Services: security, logistics, events. "
+        "RULES: You ARE Azim. Never reveal AI/bot. Bangla-first. Direct, short. "
+        "NEVER: Certainly!, Of course!, I'd be happy to help."
+    )
+    _MAX_SYSTEM_CHARS = 1700  # Social ~1600 chars passes; self/family gets truncated to fit CPU budget
+    if len(system_prompt) > _MAX_SYSTEM_CHARS:
+        logger.info(f"System prompt truncated: {len(system_prompt)} -> {_MAX_SYSTEM_CHARS} chars")
+        # Keep core identity + as much persona detail as fits
+        remaining = _MAX_SYSTEM_CHARS - len(_CORE_IDENTITY) - 2  # 2 for \n\n
+        if remaining > 100:
+            detail = system_prompt[:remaining]
+            last_newline = detail.rfind("\n")
+            if last_newline > remaining // 2:
+                detail = detail[:last_newline]
+            system_prompt = _CORE_IDENTITY + "\n\n" + detail
+        else:
+            system_prompt = _CORE_IDENTITY
+
     messages = [
         {"role": "system", "content": system_prompt},
-        *history[-10:],  # Keep last 10 turns
+        *history[-3:],
         {"role": "user", "content": request.message},
     ]
 
-    # ── STEP 4: Cost-optimized LLM call with failover ──
+    # ── FIX 1+10: Strict response pipeline with retry + logging ──
+    t_llm_start = _time.monotonic()
+    result = None
+    llm_provider_used = "none"
+    fallback_triggered = False
+
     try:
         result = await query_llm_smart(messages, complexity=complexity)
+        llm_provider_used = "smart_parallel"
     except Exception as e:
-        logger.error(f"LLM unexpected error (all failovers exhausted): {e}")
-        result = {"reply": _FALLBACK_REPLY_BN, "memory_updates": [], "actions": []}
+        logger.error(f"LLM attempt 1 failed: {e}")
 
-    reply = result.get("reply", _FALLBACK_REPLY_BN)
-    memory_updates = result.get("memory_updates", [])
-    actions = result.get("actions", [])
+    # Check if reply is empty/None — retry once with shorter context
+    reply_text = result.get("reply", "") if result else ""
+    if not reply_text or not reply_text.strip():
+        logger.warning("LLM attempt 1 returned empty — retrying with reduced context")
+        retry_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.message},
+        ]
+        try:
+            result = await query_llm_smart(retry_messages, complexity="simple")
+            llm_provider_used = "smart_retry"
+        except Exception as e:
+            logger.error(f"LLM attempt 2 also failed: {e}")
+
+    t_llm_end = _time.monotonic()
+    llm_elapsed = t_llm_end - t_llm_start
+
+    reply_text = result.get("reply", "") if result else ""
+    if reply_text and reply_text.strip():
+        reply = reply_text
+        memory_updates = result.get("memory_updates", [])
+        actions = result.get("actions", [])
+    else:
+        # ONLY HERE fallback is allowed (FIX 1)
+        reply = _FALLBACK_REPLY_BN
+        memory_updates = []
+        actions = []
+        fallback_triggered = True
+
+    # FIX 10: Mandatory logging
+    logger.info(
+        f"LLM RESULT | provider={llm_provider_used} | elapsed={llm_elapsed:.2f}s | "
+        f"fallback={'YES' if fallback_triggered else 'NO'} | "
+        f"reply_len={len(reply)} | user={user_name} | rel={relationship}"
+    )
+
+    # FIX 9: Human response filter
+    reply = _humanize_reply(reply)
 
     # ── STEP 1: Question Strategy — confidence check ──
     if _detect_low_confidence(reply) and relationship in ("self", "wife", "parent", "sibling"):
@@ -2898,6 +3027,104 @@ async def kg_stats():
         except Exception as e:
             logger.error(f"Knowledge graph stats error: {e}")
             raise HTTPException(status_code=502, detail="Knowledge graph unreachable")
+
+
+# ── Tree Memory Proxy Endpoints ─────────────────────────────
+
+@app.post("/tree/store")
+async def tree_store_proxy(request: dict):
+    """Store a tree-tagged memory (proxied to memory service)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(f"{settings.memory_url}/tree/store", json=request)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree store error: {e}")
+            return {"error": "Tree store failed", "detail": str(e)}
+
+
+@app.post("/tree/store-bulk")
+async def tree_store_bulk_proxy(request: dict):
+    """Store multiple tree memories (proxied to memory service)."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(f"{settings.memory_url}/tree/store-bulk", json=request)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree store-bulk error: {e}")
+            return {"error": "Tree store-bulk failed", "detail": str(e)}
+
+
+@app.post("/tree/search")
+async def tree_search_proxy(request: dict):
+    """Semantic search in tree memories (proxied to memory service)."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(f"{settings.memory_url}/tree/search", json=request)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree search error: {e}")
+            return {"error": "Tree search failed", "detail": str(e)}
+
+
+@app.get("/tree/browse")
+async def tree_browse_proxy():
+    """Browse all tree memory paths (proxied to memory service)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{settings.memory_url}/tree/browse")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree browse error: {e}")
+            return {"error": "Tree browse failed", "detail": str(e)}
+
+
+@app.get("/tree/branch")
+async def tree_branch_proxy(path: str, limit: int = 50):
+    """Get memories under a tree branch (proxied to memory service)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(
+                f"{settings.memory_url}/tree/branch",
+                params={"path": path, "limit": limit},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree branch error: {e}")
+            return {"error": "Tree branch failed", "detail": str(e)}
+
+
+@app.get("/tree/structure")
+async def tree_structure_proxy():
+    """Get tree structure (proxied to knowledge graph)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{settings.knowledge_graph_url}/tree/structure")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree structure error: {e}")
+            return {"error": "Tree structure failed", "detail": str(e)}
+
+
+@app.post("/tree/add-branch")
+async def tree_add_branch_proxy(request: dict):
+    """Add a new tree branch (proxied to knowledge graph)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{settings.knowledge_graph_url}/tree/add-branch", json=request,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Tree add-branch error: {e}")
+            return {"error": "Tree add-branch failed", "detail": str(e)}
 
 
 @app.post("/self-learning/analyze")

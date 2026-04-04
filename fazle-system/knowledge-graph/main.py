@@ -428,3 +428,195 @@ async def list_nodes(
         nodes = [n for n in nodes if n.node_type == node_type]
     nodes.sort(key=lambda n: n.mention_count, reverse=True)
     return {"nodes": nodes[offset:offset + limit], "total": len(nodes)}
+
+
+# ══════════════════════════════════════════════════════════════
+# Tree Memory Structure — Hierarchical branch management
+# The knowledge graph maintains the TREE STRUCTURE (branches),
+# while actual memories/facts are stored in Qdrant via memory service.
+# ══════════════════════════════════════════════════════════════
+
+# Default tree structure — branches auto-created on startup
+_DEFAULT_TREE: dict[str, dict] = {
+    "azim": {
+        "family": {
+            "wife": {},
+            "children": {"son": {}, "daughter": {}},
+            "parents": {},
+            "siblings": {},
+        },
+        "business": {
+            "al-aqsa-security": {
+                "services": {},
+                "pricing": {},
+                "employees": {},
+                "clients": {},
+                "operations": {},
+            },
+            "logistics": {},
+        },
+        "social": {
+            "friends": {},
+            "contacts": {},
+            "networks": {},
+        },
+        "hobbies": {},
+        "ideology": {},
+        "dreams": {},
+        "knowledge": {
+            "technical": {},
+            "general": {},
+            "religious": {},
+        },
+        "daily": {
+            "schedule": {},
+            "habits": {},
+            "health": {},
+        },
+    },
+}
+
+# In-memory tree structure (mutable, can grow)
+_tree_structure: dict = {}
+
+
+def _flatten_tree(tree: dict, prefix: str = "") -> list[str]:
+    """Flatten nested dict into list of paths."""
+    paths = []
+    for key, subtree in tree.items():
+        path = f"{prefix}/{key}" if prefix else key
+        paths.append(path)
+        if subtree:
+            paths.extend(_flatten_tree(subtree, path))
+    return paths
+
+
+def _add_branch_to_tree(tree: dict, path: str) -> bool:
+    """Add a branch path to the tree structure. Returns True if new."""
+    parts = [p.strip() for p in path.strip("/").split("/") if p.strip()]
+    node = tree
+    added = False
+    for part in parts:
+        if part not in node:
+            node[part] = {}
+            added = True
+        node = node[part]
+    return added
+
+
+def _get_subtree(tree: dict, path: str) -> dict | None:
+    """Get the subtree at a given path."""
+    parts = [p.strip() for p in path.strip("/").split("/") if p.strip()]
+    node = tree
+    for part in parts:
+        if part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _init_tree():
+    """Initialize tree structure from defaults."""
+    global _tree_structure
+    _tree_structure = _DEFAULT_TREE.copy()
+    import copy
+    _tree_structure = copy.deepcopy(_DEFAULT_TREE)
+    logger.info(f"Tree initialized with {len(_flatten_tree(_tree_structure))} branches")
+
+
+@app.on_event("startup")
+async def startup_tree():
+    _init_tree()
+
+
+@app.get("/tree/structure")
+async def get_tree_structure():
+    """Get the full tree structure."""
+    paths = _flatten_tree(_tree_structure)
+    return {
+        "tree": _tree_structure,
+        "paths": paths,
+        "total_branches": len(paths),
+    }
+
+
+@app.get("/tree/branch")
+async def get_tree_branch(path: str):
+    """Get sub-branches under a specific path."""
+    path = path.strip("/").lower()
+    subtree = _get_subtree(_tree_structure, path)
+    if subtree is None:
+        raise HTTPException(status_code=404, detail=f"Branch '{path}' not found")
+
+    sub_paths = _flatten_tree(subtree, path)
+    return {
+        "branch": path,
+        "subtree": subtree,
+        "sub_branches": sub_paths,
+        "children": list(subtree.keys()),
+    }
+
+
+class AddBranchRequest(BaseModel):
+    path: str = Field(..., description="New branch path e.g. 'azim/hobbies/fishing'")
+    description: str = ""
+
+
+@app.post("/tree/add-branch")
+async def add_tree_branch(req: AddBranchRequest):
+    """Add a new branch to the tree. Auto-creates intermediate branches."""
+    path = req.path.strip("/").lower()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    added = _add_branch_to_tree(_tree_structure, path)
+    all_paths = _flatten_tree(_tree_structure)
+
+    # Also add as a graph node for relationship tracking
+    parts = path.split("/")
+    leaf_name = parts[-1]
+    node = add_node(
+        f"tree:{path}",
+        NodeType.concept,
+        {"tree_path": path, "description": req.description, "is_tree_branch": True},
+    )
+
+    # Link to parent if exists
+    if len(parts) > 1:
+        parent_path = "/".join(parts[:-1])
+        parent_key = f"tree:{parent_path}".lower().strip()
+        if parent_key in _name_index:
+            parent_id = _name_index[parent_key]
+            add_relationship(node.id, parent_id, RelationshipType.belongs_to)
+
+    return {
+        "status": "added" if added else "exists",
+        "path": path,
+        "total_branches": len(all_paths),
+        "node_id": node.id,
+    }
+
+
+@app.delete("/tree/remove-branch")
+async def remove_tree_branch(path: str):
+    """Remove a leaf branch from the tree (only if it has no children)."""
+    path = path.strip("/").lower()
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    # Navigate to parent
+    node = _tree_structure
+    for part in parts[:-1]:
+        if part not in node:
+            raise HTTPException(status_code=404, detail=f"Branch '{path}' not found")
+        node = node[part]
+
+    leaf = parts[-1]
+    if leaf not in node:
+        raise HTTPException(status_code=404, detail=f"Branch '{path}' not found")
+    if node[leaf]:
+        raise HTTPException(status_code=409, detail="Cannot remove branch with children. Remove children first.")
+
+    del node[leaf]
+    return {"status": "removed", "path": path}

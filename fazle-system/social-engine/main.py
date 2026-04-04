@@ -5,6 +5,7 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+import asyncio
 import hashlib
 import hmac
 import httpx
@@ -171,21 +172,6 @@ def ensure_tables():
                 CREATE INDEX IF NOT EXISTS idx_social_posts_platform
                     ON fazle_social_posts (platform, created_at DESC);
 
-                -- Keyword auto-reply system (no LLM usage)
-                CREATE TABLE IF NOT EXISTS fazle_keyword_responses (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    keywords TEXT[] NOT NULL,
-                    response TEXT NOT NULL,
-                    category VARCHAR(100) DEFAULT '',
-                    language VARCHAR(10) DEFAULT 'bn',
-                    priority INT DEFAULT 50,
-                    platform VARCHAR(20) DEFAULT 'all',
-                    enabled BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_keyword_responses_enabled
-                    ON fazle_keyword_responses (enabled, priority DESC);
-
                 -- Contact book system
                 CREATE TABLE IF NOT EXISTS fazle_contacts (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -295,231 +281,6 @@ def ensure_tables():
             """)
         conn.commit()
     logger.info("Social engine tables ensured")
-
-
-# ── Keyword auto-reply seeding ─────────────────────────────
-_KEYWORD_SEED = [
-    {
-        "keywords": ["hi", "hello", "assalamu", "assalamualaikum", "আসসালামু আলাইকুম", "salam", "slm"],
-        "response": (
-            "ধন্যবাদ আমাদের সাথে যোগাযোগ করার জন্য 🙏\n\n"
-            "👉 Survey Scout পদে নিয়োগ চলছে\n\n"
-            "📌 কাজ: জাহাজে মালামাল তদারকি\n"
-            "🕐 ডিউটি: ৬–৮ ঘণ্টা\n"
-            "💰 বেতন: ১০,০০০ – ১৮,০০০ টাকা\n\n"
-            "📄 আবেদন করতে পাঠান:\n"
-            "নাম | বয়স | শিক্ষাগত যোগ্যতা | ঠিকানা\n\n"
-            "⚠️ Limited Vacancy"
-        ),
-        "category": "greeting",
-        "priority": 90,
-    },
-    {
-        "keywords": ["kaj", "কাজ", "ki kaj", "কি কাজ", "kaj ki", "কাজ কি", "details", "বিস্তারিত",
-                      "info", "তথ্য", "duty", "ডিউটি", "কয় ঘন্টা", "koto ghonta", "ki korte hobe",
-                      "কি করতে হবে", "description", "কাজের বিস্তারিত", "duty time"],
-        "response": (
-            "📌 কাজের বিস্তারিত:\n\n"
-            "✔ জাহাজে মালামাল তদারকি\n"
-            "✔ লোড–আনলোড হিসাব রাখা\n"
-            "✔ চুরি/নষ্ট হওয়া প্রতিরোধ\n\n"
-            "🕐 ডিউটি: ৬–৮ ঘণ্টা\n\n"
-            "✔ সহজ কাজ, ট্রেনিং দেয়া হবে\n\n"
-            "📲 আবেদন করতে পাঠান:\nনাম | বয়স | শিক্ষাগত যোগ্যতা | ঠিকানা"
-        ),
-        "category": "details",
-        "priority": 80,
-    },
-    {
-        "keywords": ["salary", "beton", "বেতন", "taka", "টাকা", "income", "ইনকাম",
-                      "koto taka", "কত টাকা", "koto beton", "কত বেতন", "payment",
-                      "পেমেন্ট", "masik beton", "মাসিক বেতন"],
-        "response": (
-            "💰 বেতন কাঠামো:\n\n"
-            "🔹 ট্রেনিং (৪৫ দিন): ১০–১৫ হাজার\n"
-            "🔹 পরে: ১২–১৮ হাজার\n\n"
-            "✔ কাজের দক্ষতার উপর বেতন বাড়ে"
-        ),
-        "category": "salary",
-        "priority": 80,
-    },
-    {
-        "keywords": ["location", "লোকেশন", "address", "ঠিকানা", "koi", "কোথায়", "kothay",
-                      "office koi", "অফিস কোথায়", "map", "ম্যাপ", "location den",
-                      "লোকেশন দেন", "kothay aste hobe", "কোথায় আসতে হবে"],
-        "response": (
-            "📍 অফিস:\n\n"
-            "আল-আকসা সিকিউরিটি সার্ভিস\n"
-            "ভিক্টোরিয়া গেইট, একে খান মোড়, পাহাড়তলী, চট্টগ্রাম\n\n"
-            "🕘 সময়: ৯টা – ৫টা\n\n"
-            "✔ আসার আগে মেসেজ দিন"
-        ),
-        "category": "location",
-        "priority": 80,
-    },
-    {
-        "keywords": ["interested", "আগ্রহী", "ami interested", "আমি আগ্রহী", "chai", "চাই",
-                      "korte chai", "করতে চাই", "apply", "আবেদন", "join", "জয়েন",
-                      "join korte chai", "জয়েন করতে চাই", "ami parbo", "আমি পারবো",
-                      "kaj korte chai"],
-        "response": (
-            "ধন্যবাদ 🙏\n\n"
-            "📄 আবেদন করতে পাঠান:\n"
-            "1. নাম\n"
-            "2. বয়স\n"
-            "3. শিক্ষাগত যোগ্যতা\n"
-            "4. বর্তমান ঠিকানা\n\n"
-            "✔ দ্রুত যোগাযোগ করা হবে"
-        ),
-        "category": "apply",
-        "priority": 85,
-    },
-    {
-        "keywords": ["ki lagbe", "কি লাগবে", "lagbe", "লাগবে", "requirement", "রিকোয়ারমেন্ট",
-                      "documents", "ডকুমেন্ট", "ki ki lagbe", "কি কি লাগবে", "ki dorkar",
-                      "কি দরকার", "paper lagbe", "কাগজ লাগবে", "certificate"],
-        "response": (
-            "📌 প্রয়োজন:\n\n"
-            "✔ ১ কপি ছবি\n"
-            "✔ NID / জন্ম নিবন্ধন\n"
-            "✔ ন্যূনতম অষ্টম শ্রেণি\n\n"
-            "✔ অভিজ্ঞতা লাগবে না (ট্রেনিং দেয়া হবে)"
-        ),
-        "category": "requirements",
-        "priority": 75,
-    },
-    {
-        "keywords": ["taka lage", "টাকা লাগে", "fee", "ফি", "charge", "চার্জ", "registration fee",
-                      "scam", "স্ক্যাম", "fake", "ফেক", "batpar", "বাটপার", "fraud", "ধোকা",
-                      "dhoka", "প্রতারণা"],
-        "response": (
-            "✔ অনলাইনে কোন টাকা নেওয়া হয় না\n\n"
-            "👉 অফিসে এসে যাচাই করে তারপর সিদ্ধান্ত নিন\n\n"
-            "✔ স্বচ্ছ প্রসেস\n"
-            "✔ সরাসরি জয়েন\n\n"
-            "📍 আগে এসে যাচাই করুন"
-        ),
-        "category": "fees_scam",
-        "priority": 85,
-    },
-    {
-        "keywords": ["call", "কল", "phone", "ফোন", "call den", "কল দেন", "phone den",
-                      "ফোন দেন", "knock den", "নক দেন", "contact", "যোগাযোগ",
-                      "amar number", "আমার নাম্বার", "call koren"],
-        "response": (
-            "📲 শুধুমাত্র WhatsApp মেসেজ\n\n"
-            "❌ কল করা হয় না\n\n"
-            "👉 আপনার তথ্য পাঠান, আমরা রিপ্লাই দিব"
-        ),
-        "category": "call_request",
-        "priority": 70,
-    },
-    {
-        "keywords": ["vacancy", "ভ্যাকান্সি", "seat", "সিট", "ase", "আছে", "ase naki",
-                      "আছে নাকি", "available", "এভেইলেবল", "lok lagbe", "লোক লাগবে",
-                      "chance ase", "চান্স আছে"],
-        "response": (
-            "⚠️ Limited Vacancy\n\n"
-            "✔ এখনো লোক নেয়া হচ্ছে\n"
-            "✔ আগে এলে আগে সুযোগ\n\n"
-            "👉 দ্রুত আবেদন করুন বা অফিসে আসুন"
-        ),
-        "category": "vacancy",
-        "priority": 75,
-    },
-    {
-        "keywords": ["parbo", "পারবো", "ami parbo", "আমি পারবো", "education", "এডুকেশন",
-                      "pora lekha", "পড়ালেখা", "ssc nai", "এসএসসি নাই", "madrasa", "মাদ্রাসা",
-                      "kom pora", "কম পড়া", "experience nai"],
-        "response": (
-            "✔ হ্যাঁ, সমস্যা নেই 👍\n\n"
-            "📌 ন্যূনতম অষ্টম শ্রেণি হলেই চলবে\n"
-            "✔ অভিজ্ঞতা লাগবে না\n"
-            "✔ সম্পূর্ণ কাজ শিখানো হবে\n\n"
-            "👉 আগ্রহী হলে আপনার তথ্য পাঠান"
-        ),
-        "category": "education",
-        "priority": 75,
-    },
-    {
-        "keywords": ["inbox", "ইনবক্স", "inbox koren", "ইনবক্স করেন", "dm", "msg", "message",
-                      "pm", "private", "personal", "inbox den", "ইনবক্স দেন"],
-        "response": (
-            "📲 দয়া করে সরাসরি WhatsApp-এ মেসেজ করুন:\n\n"
-            "01958 122300\n"
-            "01958 122322\n\n"
-            "✔ Only Message (No Call)"
-        ),
-        "category": "inbox",
-        "priority": 70,
-    },
-    {
-        "keywords": ["salary dey na", "বেতন দেয় না", "taka mare", "টাকা মারে", "police",
-                      "পুলিশ", "case", "মামলা", "প্রতারক", "dhokabaj", "ধোকাবাজ"],
-        "response": (
-            "আপনার মতামতের জন্য ধন্যবাদ\n\n"
-            "✔ আমরা সবাইকে সরাসরি অফিসে এসে যাচাই করার অনুরোধ করি\n\n"
-            "📍 যাচাই করে সিদ্ধান্ত নিন"
-        ),
-        "category": "negative",
-        "priority": 60,
-    },
-    {
-        "keywords": ["keno", "eto lok", "hiring", "sara bochor", "সারা বছর",
-                      "vacancy shesh hoy na", "always recruitment"],
-        "response": (
-            "✔ কাজটি জাহাজ ভিত্তিক, তাই নিয়মিত লোক প্রয়োজন হয়\n\n"
-            "✔ অনেকেই অন্য কাজে চলে যায় / শিফট পরিবর্তন হয়\n\n"
-            "👉 তাই সারা বছর নিয়োগ চলতে পারে\n\n"
-            "✔ আগ্রহী হলে দ্রুত আবেদন করুন"
-        ),
-        "category": "suspicion",
-        "priority": 65,
-    },
-]
-
-
-def _seed_keyword_responses():
-    """Seed keyword_responses table if empty."""
-    with _get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM fazle_keyword_responses")
-            count = cur.fetchone()[0]
-            if count > 0:
-                logger.info(f"Keyword responses already seeded ({count} rows)")
-                return
-            for entry in _KEYWORD_SEED:
-                cur.execute(
-                    """INSERT INTO fazle_keyword_responses (keywords, response, category, language, priority)
-                       VALUES (%s, %s, %s, %s, %s)""",
-                    (entry["keywords"], entry["response"], entry["category"], "bn", entry["priority"]),
-                )
-        conn.commit()
-    logger.info(f"Seeded {len(_KEYWORD_SEED)} keyword responses")
-
-
-def match_keyword_response(db_conn_fn, message: str, platform: str = "all") -> str | None:
-    """Check if message matches any keyword rule. Returns response text or None."""
-    msg_lower = message.strip().lower()
-    if len(msg_lower) < 2:
-        return None
-    best_response = None
-    best_priority = -1
-    with db_conn_fn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """SELECT keywords, response, priority FROM fazle_keyword_responses
-                   WHERE enabled = TRUE AND (platform = %s OR platform = 'all')
-                   ORDER BY priority DESC""",
-                (platform,),
-            )
-            for row in cur.fetchall():
-                for kw in row["keywords"]:
-                    if kw.lower() in msg_lower and row["priority"] > best_priority:
-                        best_response = row["response"]
-                        best_priority = row["priority"]
-                        break
-    return best_response
 
 
 def upsert_contact(db_conn_fn, phone: str, name: str = "", platform: str = "whatsapp",
@@ -832,7 +593,6 @@ def get_reply_stats(db_conn_fn) -> dict:
 def startup():
     try:
         ensure_tables()
-        _seed_keyword_responses()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
 
@@ -1112,12 +872,19 @@ async def whatsapp_webhook_receive(request: Request):
         logger.warning("WhatsApp webhook: invalid or missing HMAC signature")
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
     payload = json.loads(raw_body)
-    result = await handle_whatsapp_webhook(
-        payload, _get_conn, settings.brain_url, _get_integration_creds,
-        owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
-    )
-    # Trigger workflow automation
-    await trigger_workflow(settings.workflow_engine_url, "whatsapp.message.received", result)
+
+    # Process in background — return 200 instantly so Meta doesn't retry
+    async def _process_wa():
+        try:
+            result = await handle_whatsapp_webhook(
+                payload, _get_conn, settings.brain_url, _get_integration_creds,
+                owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
+            )
+            await trigger_workflow(settings.workflow_engine_url, "whatsapp.message.received", result)
+        except Exception as exc:
+            logger.error(f"Background WhatsApp processing error: {exc}")
+
+    asyncio.create_task(_process_wa())
     return {"status": "ok"}
 
 
@@ -1150,11 +917,18 @@ async def facebook_webhook_receive(request: Request):
         logger.warning("Facebook webhook: invalid or missing HMAC signature")
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
     payload = json.loads(raw_body)
-    result = await handle_facebook_webhook(
-        payload, _get_conn, settings.brain_url, _get_integration_creds,
-        owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
-    )
-    await trigger_workflow(settings.workflow_engine_url, "facebook.comment.received", result)
+
+    async def _process_fb():
+        try:
+            result = await handle_facebook_webhook(
+                payload, _get_conn, settings.brain_url, _get_integration_creds,
+                owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
+            )
+            await trigger_workflow(settings.workflow_engine_url, "facebook.comment.received", result)
+        except Exception as exc:
+            logger.error(f"Background Facebook processing error: {exc}")
+
+    asyncio.create_task(_process_fb())
     return {"status": "ok"}
 
 
