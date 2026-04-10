@@ -18,8 +18,10 @@ import time
 import asyncio
 import os
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
+import psycopg2
+import psycopg2.extras
 import redis
 
 logging.basicConfig(level=logging.INFO)
@@ -29,13 +31,16 @@ logger = logging.getLogger("fazle-llm-gateway")
 class Settings(BaseSettings):
     openai_api_key: str = ""
     ollama_url: str = "http://ollama:11434"
-    llm_provider: str = "ollama"           # FIX 5: Ollama-first
-    llm_model: str = "gpt-4o"
-    ollama_model: str = "qwen2.5:3b"       # FIX 5: Bangla-capable model
+    llm_provider: str = "ollama"           # Ollama-first
+    llm_model: str = "qwen2.5:1.5b"
+    ollama_model: str = "qwen2.5:1.5b"
     redis_url: str = "redis://redis:6379/3"
-    # Fallback model when primary fails
-    fallback_provider: str = "openai"      # FIX 5: OpenAI as fallback only
+    database_url: str = ""                 # PostgreSQL for conversation logging
+    # Fallback model when primary fails or times out
+    fallback_provider: str = "openai"
     fallback_model: str = "gpt-4o"
+    # Ollama timeout in seconds — if exceeded, fallback to OpenAI
+    ollama_timeout: int = 10
     # Cache TTL in seconds (0 = disabled)
     cache_ttl: int = 300
     # Rate limit: max requests per minute per caller
@@ -62,6 +67,76 @@ def _get_redis() -> redis.Redis:
     if _redis is None:
         _redis = redis.Redis.from_url(settings.redis_url, decode_responses=True)
     return _redis
+
+
+# ── PostgreSQL Conversation Logging ─────────────────────────
+
+_DB_INIT_DONE = False
+
+
+def _get_db_conn():
+    """Get a PostgreSQL connection for logging. Returns None if no DB configured."""
+    if not settings.database_url:
+        return None
+    return psycopg2.connect(settings.database_url)
+
+
+def _ensure_log_table():
+    """Create llm_conversation_log table if it doesn't exist."""
+    global _DB_INIT_DONE
+    if _DB_INIT_DONE or not settings.database_url:
+        return
+    try:
+        conn = _get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS llm_conversation_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    caller VARCHAR(100),
+                    user_id VARCHAR(200),
+                    provider VARCHAR(20) NOT NULL,
+                    model VARCHAR(100) NOT NULL,
+                    messages JSONB NOT NULL,
+                    reply TEXT NOT NULL,
+                    usage_data JSONB,
+                    latency_ms REAL,
+                    is_fallback BOOLEAN DEFAULT FALSE,
+                    trainable BOOLEAN DEFAULT FALSE
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_log_ts ON llm_conversation_log(ts);
+                CREATE INDEX IF NOT EXISTS idx_llm_log_trainable ON llm_conversation_log(trainable) WHERE trainable = TRUE;
+            """)
+        conn.commit()
+        conn.close()
+        _DB_INIT_DONE = True
+        logger.info("llm_conversation_log table ready")
+    except Exception as e:
+        logger.warning(f"Could not init DB log table: {e}")
+
+
+def _log_to_db(caller: str, user_id: str, provider: str, model: str,
+               messages: list[dict], reply: str, usage: dict,
+               latency_ms: float, is_fallback: bool):
+    """Persist every LLM exchange to PostgreSQL (fire-and-forget)."""
+    if not settings.database_url:
+        return
+    try:
+        conn = _get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO llm_conversation_log
+                   (caller, user_id, provider, model, messages, reply, usage_data, latency_ms, is_fallback, trainable)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (caller, user_id, provider, model,
+                 json.dumps(messages), reply,
+                 json.dumps(usage), latency_ms,
+                 is_fallback, is_fallback and provider == "openai"),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"DB log write error: {e}")
 
 
 app = FastAPI(title="Fazle LLM Gateway", version="2.0.0")
@@ -218,7 +293,7 @@ async def _call_ollama(
     }
     # NEVER force JSON format on Ollama — causes 500 when model can't produce valid JSON
 
-    async with httpx.AsyncClient(timeout=15.0) as client:  # FIX 6: tighter timeout
+    async with httpx.AsyncClient(timeout=float(settings.ollama_timeout)) as client:
         resp = await client.post(
             f"{settings.ollama_url}/api/chat",
             json=body,
@@ -518,16 +593,19 @@ async def generate(request: GenerateRequest):
     # Primary call (via batcher for coalescing)
     start = time.monotonic()
     result = None
+    is_fallback = False
     try:
         entry = _BatchEntry(provider, model, messages, request.temperature, request.response_format)
         result = await _batcher.submit(entry)
         llm_request_latency_hist.labels(provider=provider).observe(time.monotonic() - start)
         llm_requests_total.labels(provider=provider, status="success").inc()
     except Exception as primary_err:
-        llm_request_latency_hist.labels(provider=provider).observe(time.monotonic() - start)
+        primary_elapsed = time.monotonic() - start
+        llm_request_latency_hist.labels(provider=provider).observe(primary_elapsed)
         llm_requests_total.labels(provider=provider, status="failed").inc()
-        logger.warning(f"Primary LLM failed ({provider}/{model}): {primary_err}")
-        # Fallback
+        is_timeout = isinstance(primary_err, (httpx.ReadTimeout, httpx.ConnectTimeout, asyncio.TimeoutError))
+        logger.warning(f"Primary LLM failed ({provider}/{model}): {'TIMEOUT' if is_timeout else primary_err}")
+        # Fallback to OpenAI
         fb_provider = settings.fallback_provider
         fb_model = settings.fallback_model
         if fb_provider != provider or fb_model != model:
@@ -535,6 +613,7 @@ async def generate(request: GenerateRequest):
                 logger.info(f"Falling back to {fb_provider}/{fb_model}")
                 fb_start = time.monotonic()
                 result = await _call_provider(fb_provider, fb_model, messages, request.temperature, request.response_format)
+                is_fallback = True
                 llm_request_latency_hist.labels(provider=fb_provider).observe(time.monotonic() - fb_start)
                 llm_requests_total.labels(provider=fb_provider, status="success").inc()
             except Exception as fb_err:
@@ -565,7 +644,7 @@ async def generate(request: GenerateRequest):
     # Usage tracking
     try:
         r = _get_redis()
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         usage_key = f"llm_usage:{today}:{request.caller}"
         pipe = r.pipeline()
         pipe.hincrby(usage_key, "requests", 1)
@@ -575,6 +654,19 @@ async def generate(request: GenerateRequest):
         pipe.execute()
     except Exception:
         pass
+
+    # Persist every exchange to PostgreSQL (conversations for training)
+    _log_to_db(
+        caller=request.caller,
+        user_id=user_id,
+        provider=result["provider"],
+        model=result["model"],
+        messages=messages,
+        reply=result["content"],
+        usage=result["usage"],
+        latency_ms=round(latency_ms, 1),
+        is_fallback=is_fallback,
+    )
 
     return GenerateResponse(**response_data)
 
@@ -621,3 +713,40 @@ async def usage(days: int = 7):
                 "completion_tokens": int(data.get("completion_tokens", 0)),
             }
     return {"usage": stats}
+
+
+@app.get("/training-data")
+async def training_data(limit: int = 100, offset: int = 0):
+    """Export OpenAI fallback responses as training pairs for Ollama fine-tuning."""
+    if not settings.database_url:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    try:
+        conn = _get_db_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, ts, messages, reply, model, latency_ms
+                   FROM llm_conversation_log
+                   WHERE trainable = TRUE
+                   ORDER BY ts DESC LIMIT %s OFFSET %s""",
+                (limit, offset),
+            )
+            rows = cur.fetchall()
+        conn.close()
+        # Format as Ollama-compatible training pairs
+        pairs = []
+        for row in rows:
+            pairs.append({
+                "id": row["id"],
+                "ts": row["ts"].isoformat() if row["ts"] else None,
+                "messages": row["messages"],
+                "expected_reply": row["reply"],
+                "source_model": row["model"],
+            })
+        return {"count": len(pairs), "training_pairs": pairs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.on_event("startup")
+async def startup():
+    _ensure_log_table()
