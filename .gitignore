@@ -26,6 +26,9 @@ node_modules/
 .next/
 .turbo/
 dist/
+next-env.d.ts
+tsconfig.tsbuildinfo
+package-lock.json
 
 # Python
 __pycache__/
