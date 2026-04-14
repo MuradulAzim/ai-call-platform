@@ -316,6 +316,7 @@ services:
 
   # â”€â”€ Fazle Voice Agent â€” LiveKit-based STT/TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   fazle-voice:
+    profiles: ["voice"]
     build: ../fazle-system/voice
     container_name: fazle-voice
     restart: unless-stopped
