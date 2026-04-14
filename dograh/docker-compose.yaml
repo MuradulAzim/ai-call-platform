@@ -7,10 +7,15 @@
 # ============================================================
 # DO NOT MODIFY dograhai/dograh-api or dograhai/dograh-ui images
 # ============================================================
+# STATUS: DISABLED (Phase 8.1 — WhatsApp-first pivot)
+# Voice services moved to "voice" profile. To re-enable:
+#   docker compose --env-file ../.env --profile voice up -d
+# ============================================================
 
 services:
   # ── Dograh API — FastAPI Backend (DO NOT MODIFY) ───────────
   api:
+    profiles: ["voice"]
     image: ${REGISTRY:-dograhai}/dograh-api:${DOGRAH_API_VERSION:-1.0.0}
     container_name: dograh-api
     restart: unless-stopped
@@ -64,6 +69,7 @@ services:
 
   # ── Dograh UI — Next.js Dashboard (DO NOT MODIFY) ────────
   ui:
+    profiles: ["voice"]
     image: ${REGISTRY:-dograhai}/dograh-ui:${DOGRAH_UI_VERSION:-1.0.0}
     container_name: dograh-ui
     restart: unless-stopped

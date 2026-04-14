@@ -1,16 +1,17 @@
-# Dograh + Fazle AI — Autonomous Voice Agent Platform
+# Fazle AI — WhatsApp-First Business Platform
 
-> AI-powered voice agent platform with an autonomous intelligence layer. Handles real-time phone calls via Twilio SIP and LiveKit WebRTC, backed by a multi-agent AI brain that plans, reasons, learns, and self-improves across every interaction.
+> AI-powered business management platform focused on WhatsApp automation, recruitment, client handling, employee management, and role-based database operations. Built on a multi-agent AI brain that plans, reasons, learns, and self-improves.
 
 **Domain:** `iamazim.com` &nbsp;|&nbsp; **VPS:** Contabo (4 CPUs, 7.8 GB RAM, 73 GB disk, Ubuntu)  
-**Version:** Phase 8 — AI Voice Agent Integration &nbsp;|&nbsp; **Containers:** 40  
-**Last updated:** 2026-04-13
+**Version:** Phase 8.1 — WhatsApp-First Business Pivot &nbsp;|&nbsp; **Active Containers:** ~28 (voice stack disabled)  
+**Last updated:** 2026-04-14
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Disabled Services (Voice Stack)](#disabled-services-voice-stack)
 - [LLM Strategy](#llm-strategy)
 - [Architecture](#architecture)
 - [Services](#services)
@@ -45,15 +46,16 @@ The platform combines two systems:
 
 | System | Purpose |
 |--------|---------|
-| **Dograh** | Open-source voice AI SaaS — handles inbound/outbound phone calls with real-time STT/TTS, LiveKit WebRTC streaming, and Twilio SIP integration. |
-| **Fazle** | Custom autonomous AI layer — multi-agent reasoning, goal decomposition, tool execution, knowledge graph, semantic memory, self-learning, relationship-aware personality, and voice cloning. |
+| **Fazle** | Custom autonomous AI layer — multi-agent reasoning, WhatsApp/Facebook automation, recruitment AI, client handling, employee management, role-based database updates, knowledge graph, semantic memory, self-learning, and workflow automation. |
+| **Dograh** | _(DISABLED)_ Open-source voice AI SaaS — handles inbound/outbound phone calls with real-time STT/TTS, LiveKit WebRTC streaming, and Twilio SIP integration. Can be re-enabled via `--profile voice`. |
 
-Together they deliver an AI voice clone that answers phone calls, remembers conversations, autonomously plans and executes multi-step tasks, builds a knowledge graph from interactions, learns from its own behavior, and maintains relationship-specific behavior (family, friends, professional contacts) with content safety boundaries.
+Together they deliver an AI-powered business platform that manages WhatsApp conversations, automates recruitment and client handling, tracks employees and programs, updates databases via role-based WhatsApp commands, builds a knowledge graph from interactions, learns from its own behavior, and maintains relationship-specific behavior with content safety boundaries.
 
 **Key capabilities:**
+- **WhatsApp-first business automation** — recruitment, client handling, employee management via WhatsApp messages
+- **Role-based database updates** — user roles control what data can be modified via WhatsApp commands
 - **Ollama-first LLM** — all chat routed through local `qwen2.5:1.5b` with automatic OpenAI `gpt-4o` fallback (10 s timeout)
-- Real-time voice call handling (Twilio → LiveKit → STT → LLM → TTS)
-- Multi-agent brain with 9+ specialized agents (conversation, memory, research, task, tool, voice, social, system, learning)
+- Multi-agent brain with 9+ specialized agents (conversation, memory, research, task, tool, social, system, learning)
 - LLM gateway with caching (300 s TTL), rate limiting (60 RPM), request batching, PostgreSQL conversation logging, and trainable data export
 - Autonomous goal planning with self-reflection and retry logic
 - Tool execution engine with permission control and sandboxing
@@ -63,12 +65,69 @@ Together they deliver an AI voice clone that answers phone calls, remembers conv
 - Personality injection with relationship-aware context (family, social, professional)
 - Semantic memory search over all past conversations (Qdrant vectors)
 - Workflow engine for multi-step automation
-- Social engine with WhatsApp/Facebook intent detection
+- Social engine with WhatsApp/Facebook intent detection, contact intelligence
 - Guardrail engine for content safety enforcement
 - OpenTelemetry distributed tracing
 - Full observability: Prometheus + Grafana + Loki + Promtail + OTel
-- Zero-downtime blue/green deployments
 - Row-Level Security on all database tables
+
+---
+
+## Disabled Services (Voice Stack)
+
+As of Phase 8.1 (2026-04-14), the following voice/telephony services are **disabled** using Docker Compose profiles. They remain in the codebase and can be re-enabled at any time.
+
+### What's Disabled
+
+| Service | Stack | RAM Saved | How to Re-enable |
+|---------|-------|-----------|------------------|
+| **dograh-api** | dograh | ~512 MB | `--profile voice` |
+| **dograh-ui** | dograh | ~256 MB | `--profile voice` |
+| **livekit** | ai-infra | ~1 GB | `--profile voice` |
+| **coturn** | ai-infra | ~512 MB | `--profile voice` |
+| **cloudflared** | ai-infra | ~256 MB | `--profile voice` |
+| **telephony-webhook** | telephony-webhook | ~128 MB | `--profile voice` |
+| **ai-agent-service** | ai-agent-service | ~128 MB | `--profile voice` |
+| **fazle-voice** | fazle-ai | ~1 GB | `--profile voice` |
+
+**Total RAM freed:** ~3.8 GB — redirected to Ollama and active business services.
+
+**Ollama memory limit** reduced from 6 GB → 4 GB (sufficient without voice contention).
+
+### How to Re-enable Voice Services
+
+To bring back the full voice pipeline (Twilio → LiveKit → STT → Brain → TTS):
+
+```bash
+# 1. Start ai-infra with voice profile (LiveKit + Coturn)
+cd ai-infra && docker compose --env-file ../.env --profile voice up -d && cd ..
+
+# 2. Start Dograh voice platform
+cd dograh && docker compose --env-file ../.env --profile voice up -d && cd ..
+
+# 3. Start fazle-ai with voice profile (fazle-voice agent)
+cd fazle-ai && docker compose --env-file ../.env --profile voice up -d && cd ..
+
+# 4. Start telephony webhook
+cd telephony-webhook && docker compose --env-file ../.env --profile voice up -d && cd ..
+
+# 5. Start AI agent dispatch
+cd ai-agent-service && docker compose --env-file ../.env --profile voice up -d && cd ..
+```
+
+> **Note:** When re-enabling voice, also restore Ollama memory limit to 6 GB in `ai-infra/docker-compose.yaml` and set `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` as required vars in `fazle-ai/docker-compose.yaml`.
+
+### What's Kept (Active)
+
+| Category | Services |
+|----------|----------|
+| **Infrastructure** | PostgreSQL + pgvector, Redis, Qdrant, Ollama, MinIO |
+| **AI Core** | Brain (multi-agent), Memory, LLM Gateway, Queue + Workers |
+| **Business** | API Gateway, Social Engine (WhatsApp/Facebook), Task Engine, Web Intelligence, Trainer |
+| **Autonomous AI** | Autonomy Engine, Tool Engine, Knowledge Graph, Autonomous Runner, Self-Learning |
+| **Extended** | Guardrail Engine, Workflow Engine, Learning Engine |
+| **Frontend** | Fazle UI (Next.js dashboard) |
+| **Observability** | Prometheus, Grafana, Loki, Promtail, node-exporter, cAdvisor, OTel Collector |
 
 ---
 
@@ -199,7 +258,9 @@ All shared infrastructure. Must start first.
 | cadvisor | `gcr.io/cadvisor/cadvisor:latest` | 8080 | Container metrics |
 | cloudflared-tunnel | `cloudflare/cloudflared` | — | Cloudflare tunnel for edge routing |
 
-### Stack 2 — dograh (Voice Platform)
+### Stack 2 — dograh (Voice Platform) — DISABLED
+
+> **Status:** Disabled via `profiles: ["voice"]`. Re-enable with `docker compose --env-file ../.env --profile voice up -d`
 
 Pre-built Dograh containers for voice call handling.
 
@@ -221,7 +282,7 @@ All Fazle services — core intelligence, Phase-5 autonomous services, and suppo
 | fazle-task-engine | 8400 | Scheduler — reminders, recurring tasks (APScheduler) |
 | fazle-web-intelligence | 8500 | Web search & scraping (Serper API, BeautifulSoup) |
 | fazle-trainer | 8600 | ML training — preference extraction, fine-tuning |
-| fazle-voice | 8700 | Voice processing — LiveKit STT/TTS, accent modulation |
+| fazle-voice | 8700 | _(DISABLED)_ Voice processing — LiveKit STT/TTS, accent modulation |
 | fazle-ui | 3020 | Next.js dashboard — settings, conversations, Phase-5 management |
 | **LLM Infrastructure** | | |
 | fazle-llm-gateway | 8800 | Centralized LLM routing — Ollama→OpenAI fallback, caching, DB logging |
@@ -241,7 +302,9 @@ All Fazle services — core intelligence, Phase-5 autonomous services, and suppo
 | **Observability** | | |
 | fazle-otel-collector | 4317-4318 | OpenTelemetry collector — distributed tracing |
 
-### Stack 4 — telephony-webhook (Twilio Inbound)
+### Stack 4 — telephony-webhook (Twilio Inbound) — DISABLED
+
+> **Status:** Disabled via `profiles: ["voice"]`. Re-enable with `docker compose --env-file ../.env --profile voice up -d`
 
 Production-grade Node.js webhook handler that sits between Nginx and Dograh API for inbound Twilio calls. Solves Cloudflare/Nginx header stripping that breaks Twilio provider detection.
 
@@ -260,7 +323,9 @@ Production-grade Node.js webhook handler that sits between Nginx and Dograh API 
 - **Metrics endpoint** — `/metrics` with total, duplicate, failed, permanently_failed counters
 - **PostgreSQL event store** — `telephony_events` table with full call payload
 
-### Stack 5 — ai-agent-service (Voice Agent Dispatch)
+### Stack 5 — ai-agent-service (Voice Agent Dispatch) — DISABLED
+
+> **Status:** Disabled via `profiles: ["voice"]`. Re-enable with `docker compose --env-file ../.env --profile voice up -d`
 
 Lightweight Node.js service that bridges Twilio/SIP inbound calls with the fazle-voice AI agent via LiveKit. Receives LiveKit webhook events, detects SIP participants, stores call context in Redis, and dispatches fazle-voice to the call room.
 
@@ -894,39 +959,39 @@ bash scripts/health-check.sh
 
 ## Resource Limits
 
-| Service          | CPU  | Memory | Reserved |
-|------------------|------|--------|----------|
-| PostgreSQL       | 2    | 2 GB   | 512 MB   |
-| Redis            | 1    | 768 MB | 256 MB   |
-| MinIO            | 1    | 1 GB   | 256 MB   |
-| LiveKit          | 2    | 1 GB   | 256 MB   |
-| Coturn           | 1    | 512 MB | 128 MB   |
-| Ollama           | 4    | 6 GB   | 2 GB     |
-| Qdrant           | 1    | 1 GB   | 256 MB   |
-| Fazle Brain      | 2    | 1 GB   | 256 MB   |
-| Fazle API        | 1    | 512 MB | 128 MB   |
-| Fazle Memory     | 1    | 512 MB | 128 MB   |
-| Fazle Tasks      | 0.5  | 512 MB | 128 MB   |
-| Fazle Web Intel  | 0.5  | 512 MB | 128 MB   |
-| Fazle Trainer    | 1    | 512 MB | 128 MB   |
-| Fazle Voice      | 1    | 512 MB | 128 MB   |
-| Fazle UI         | 0.5  | 256 MB | 128 MB   |
-| LLM Gateway      | 1    | 1 GB   | 256 MB   |
-| Learning Engine  | 0.5  | 512 MB | 128 MB   |
-| Queue            | 0.5  | 512 MB | 128 MB   |
-| Workers ×2       | 1 ea | 1 GB ea| 256 MB ea|
-| Prometheus       | 0.5  | 512 MB | 256 MB   |
-| Grafana          | 0.5  | 256 MB | 128 MB   |
-| Loki             | 0.5  | 512 MB | 256 MB   |
+| Service          | CPU  | Memory | Reserved | Status |
+|------------------|------|--------|----------|--------|
+| PostgreSQL       | 2    | 2 GB   | 512 MB   | Active |
+| Redis            | 1    | 768 MB | 256 MB   | Active |
+| MinIO            | 1    | 1 GB   | 256 MB   | Active |
+| LiveKit          | 2    | 1 GB   | 256 MB   | **Disabled** |
+| Coturn           | 1    | 512 MB | 128 MB   | **Disabled** |
+| Ollama           | 4    | 4 GB   | 1 GB     | Active (reduced) |
+| Qdrant           | 1    | 1 GB   | 256 MB   | Active |
+| Fazle Brain      | 2    | 1 GB   | 256 MB   | Active |
+| Fazle API        | 1    | 512 MB | 128 MB   | Active |
+| Fazle Memory     | 1    | 512 MB | 128 MB   | Active |
+| Fazle Tasks      | 0.5  | 512 MB | 128 MB   | Active |
+| Fazle Web Intel  | 0.5  | 512 MB | 128 MB   | Active |
+| Fazle Trainer    | 1    | 512 MB | 128 MB   | Active |
+| Fazle Voice      | 1    | 512 MB | 128 MB   | **Disabled** |
+| Fazle UI         | 0.5  | 256 MB | 128 MB   | Active |
+| LLM Gateway      | 1    | 1 GB   | 256 MB   | Active |
+| Learning Engine  | 0.5  | 512 MB | 128 MB   | Active |
+| Queue            | 0.5  | 512 MB | 128 MB   | Active |
+| Workers ×2       | 1 ea | 1 GB ea| 256 MB ea| Active |
+| Prometheus       | 0.5  | 512 MB | 256 MB   | Active |
+| Grafana          | 0.5  | 256 MB | 128 MB   | Active |
+| Loki             | 0.5  | 512 MB | 256 MB   | Active |
 
 ### Ollama Resource Protection
 
 | Setting | Value | Rationale |
 |---------|-------|-----------|
 | NUM_PARALLEL | 1 | Prevent RAM exhaustion on 7.8 GB VPS |
-| MAX_LOADED_MODELS | 1 | Only load one model at a time |
-| MAX_QUEUE | 2 | Prevent request pile-up |
-| Memory limit | 6 GB | Hard ceiling |
+| MAX_LOADED_MODELS | 2 | Allow embedding + chat models simultaneously |
+| MAX_QUEUE | 4 | Higher throughput now that voice isn't competing |
+| Memory limit | 4 GB | Hard ceiling (reduced from 6 GB after voice stack disabled) |
 | Primary model | qwen2.5:1.5b (986 MB) | Fast inference, fits in RAM alongside all services |
 | Installed models | qwen2.5:1.5b, qwen2.5:0.5b, qwen2.5:3b, nomic-embed-text | 4 models, ~3.5 GB total disk |
 
@@ -1035,15 +1100,20 @@ docker exec ai-postgres psql -U postgres -d postgres \
 | Phase 5 | Autonomous AI — multi-agent brain, autonomy engine, tool engine, knowledge graph, runner, self-learning | Deployed (2026-03-19) |
 | Phase 6 | Ollama-first LLM gateway — caching, fallback, DB logging, training data export | Deployed (2026-04-10) |
 | Phase 7 | Telephony webhook hardening — Nginx-first routing, header re-injection proxy, idempotent event store, retry & dead-letter | Deployed (2026-04-13) |
+| Phase 8.1 | **WhatsApp-first business pivot** — Disabled voice stack (Dograh, LiveKit, Coturn, telephony-webhook, ai-agent-service, fazle-voice) via Docker profiles. Freed ~3.8 GB RAM. Focus on WhatsApp automation, recruitment, client/employee management, role-based DB updates | Deployed (2026-04-14) |
 
 ### Planned
 
+- **WhatsApp role-based commands** — User roles (admin, manager, employee) control which database operations are allowed via WhatsApp messages
+- **Recruitment AI pipeline** — Automated candidate screening, interview scheduling, and follow-up via WhatsApp
+- **Client management automation** — Automated client onboarding, payment tracking, and program enrollment via WhatsApp
+- **Employee management** — Shift scheduling, task assignment, and performance tracking via WhatsApp commands
 - **Single gateway architecture** — Remove brain's parallel fan-out, route ALL LLM calls through gateway only
 - **Embedding migration** — Switch memory service to Ollama `nomic-embed-text` primary, OpenAI fallback
 - **Ollama fine-tuning** — Train on collected OpenAI fallback responses from `llm_conversation_log`
-- **Voice AI Training** — Custom voice model training pipeline
 - **PII Redaction** — Strip personal data before storing extracted knowledge
 - **CI/CD Pipeline** — Automated testing and deployment
+- **Voice re-enablement** — Re-enable voice stack when VPS upgraded to 8+ vCPU / 16 GB RAM (use `--profile voice`)
 
 ---
 

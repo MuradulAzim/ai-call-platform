@@ -1,5 +1,10 @@
+# STATUS: DISABLED (Phase 8.1 — WhatsApp-first pivot)
+# Voice/telephony services moved to "voice" profile. To re-enable:
+#   docker compose --env-file ../.env --profile voice up -d
+
 services:
   telephony-webhook:
+    profiles: ["voice"]
     build: .
     container_name: telephony-webhook
     restart: unless-stopped

@@ -1,9 +1,12 @@
 ﻿# ============================================================
 # Fazle Personal AI System â€” All Fazle Services
-# Intelligence layer integrated with Dograh voice platform
+# WhatsApp-first business platform with AI intelligence layer
 # ============================================================
 # DEPLOY ORDER: 3 (start AFTER ai-infra)
 # Usage: docker compose --env-file ../.env up -d
+# ============================================================
+# Phase 8.1: Voice services (fazle-voice) moved to "voice" profile.
+# To re-enable voice: docker compose --env-file ../.env --profile voice up -d
 # ============================================================
 
 services:
@@ -26,9 +29,10 @@ services:
       FAZLE_TASK_URL: "http://fazle-task-engine:8400"
       FAZLE_TOOLS_URL: "http://fazle-web-intelligence:8500"
       FAZLE_TRAINER_URL: "http://fazle-trainer:8600"
-      FAZLE_LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:?LIVEKIT_API_KEY not set}"
-      FAZLE_LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET not set}"
-      FAZLE_LIVEKIT_URL: "${FAZLE_LIVEKIT_URL:-wss://livekit.iamazim.com}"
+      # LiveKit (disabled — voice profile only)
+      FAZLE_LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-}"
+      FAZLE_LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-}"
+      FAZLE_LIVEKIT_URL: "${FAZLE_LIVEKIT_URL:-}"
       FAZLE_LEARNING_ENGINE_URL: "http://fazle-learning-engine:8900"
       # Phase-5 Autonomous AI services
       FAZLE_AUTONOMY_ENGINE_URL: "http://fazle-autonomy-engine:9100"

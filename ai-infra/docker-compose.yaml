@@ -178,9 +178,9 @@ services:
       resources:
         limits:
           cpus: "4"
-          memory: 6G
+          memory: 4G
         reservations:
-          memory: 2G
+          memory: 1G
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/11434'"]
       interval: 15s
@@ -192,8 +192,9 @@ services:
         aliases:
           - ollama
 
-  # ── LiveKit — WebRTC Media Server ──────────────────────────
+  # ── LiveKit — WebRTC Media Server (DISABLED: voice profile) ──
   livekit:
+    profiles: ["voice"]
     image: livekit/livekit-server:v1.8.2
     container_name: livekit
     restart: unless-stopped
@@ -240,8 +241,9 @@ services:
       - app-network
       - db-network
 
-  # ── Coturn — TURN/STUN for NAT Traversal ─────────────────
+  # ── Coturn — TURN/STUN for NAT Traversal (DISABLED: voice profile) ─
   coturn:
+    profiles: ["voice"]
     image: coturn/coturn:4.6.2-r12-alpine
     container_name: coturn
     restart: unless-stopped
@@ -281,8 +283,9 @@ services:
     networks:
       - app-network
 
-  # ── Cloudflare Tunnel (optional fallback) ─────────────────
+  # ── Cloudflare Tunnel (DISABLED: voice profile) ─────────────
   cloudflared:
+    profiles: ["voice"]
     image: cloudflare/cloudflared:2024.10.1
     container_name: cloudflared-tunnel
     restart: unless-stopped

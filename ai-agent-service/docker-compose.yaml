@@ -1,5 +1,10 @@
+# STATUS: DISABLED (Phase 8.1 — WhatsApp-first pivot)
+# Voice agent dispatch moved to "voice" profile. To re-enable:
+#   docker compose --env-file ../.env --profile voice up -d
+
 services:
   ai-agent-service:
+    profiles: ["voice"]
     build: .
     container_name: ai-agent-service
     restart: unless-stopped
