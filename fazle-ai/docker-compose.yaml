@@ -29,7 +29,7 @@ services:
       FAZLE_TASK_URL: "http://fazle-task-engine:8400"
       FAZLE_TOOLS_URL: "http://fazle-web-intelligence:8500"
       FAZLE_TRAINER_URL: "http://fazle-trainer:8600"
-      # LiveKit (disabled � voice profile only)
+      # LiveKit (disabled � voice profile only)
       FAZLE_LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-}"
       FAZLE_LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-}"
       FAZLE_LIVEKIT_URL: "${FAZLE_LIVEKIT_URL:-}"
@@ -120,6 +120,7 @@ services:
       PERSONA_CACHE_TTL: "${PERSONA_CACHE_TTL:-300}"
       MEMORY_TOP_K: "${MEMORY_TOP_K:-2}"
       FAZLE_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
+      WBOM_URL: "http://fazle-wbom:9900"
     logging:
       driver: "json-file"
       options:
@@ -912,6 +913,46 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9800/health').read()\""]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    networks:
+      - ai-network
+      - app-network
+      - db-network
+
+  # ── Fazle WBOM — WhatsApp Business Operations Manager ──────
+  fazle-wbom:
+    build: ../fazle-system/wbom
+    container_name: fazle-wbom
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      WBOM_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
+      WBOM_BRAIN_URL: "http://fazle-brain:8200"
+      WBOM_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/8"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          memory: 128M
+    depends_on:
+      fazle-brain:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9900/health').read()\""]
       interval: 30s
       timeout: 30s
       retries: 5

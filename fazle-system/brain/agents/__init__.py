@@ -10,6 +10,7 @@ from .social_agent import SocialAgent
 from .voice_agent import VoiceAgent
 from .system_agent import SystemAgent
 from .learning_agent import LearningAgent
+from .wbom_agent import WBOMAgent
 from .strategy_agent import StrategyAgent, DomainRoute
 from .manager import AgentManager
 
@@ -27,6 +28,7 @@ __all__ = [
     "VoiceAgent",
     "SystemAgent",
     "LearningAgent",
+    "WBOMAgent",
     # Strategy
     "StrategyAgent",
     "DomainRoute",

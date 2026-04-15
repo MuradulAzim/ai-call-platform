@@ -108,6 +108,8 @@ class Settings(BaseSettings):
     owner_action_password: str = ""
     # Social engine URL for contact lookup
     social_engine_url: str = "http://fazle-social-engine:9800"
+    # WBOM service URL
+    wbom_url: str = "http://fazle-wbom:9900"
 
     class Config:
         env_prefix = ""
@@ -142,10 +144,11 @@ async def init_agents():
         learning_engine_url=settings.learning_engine_url,
         autonomy_engine_url=settings.autonomy_engine_url,
         redis_url=settings.redis_url,
+        wbom_url=settings.wbom_url,
     )
     logger.info(
         "Agent Manager initialized: identity_core + strategy + "
-        "4 domain agents (social, voice, system, learning) + 5 utility agents"
+        "5 domain agents (social, voice, system, learning, wbom) + 5 utility agents"
     )
 
     # ── Seed default owner profile if empty (Step 1) ──

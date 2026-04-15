@@ -21,6 +21,7 @@ class DomainRoute(str, Enum):
     OWNER = "owner"            # Direct owner conversation
     SYSTEM = "system"          # System/infra task
     LEARNING = "learning"      # Learning/memory task
+    WBOM = "wbom"              # Business operations (WhatsApp Business Ops)
     CONVERSATION = "conversation"  # General conversation (family etc.)
 
 
@@ -87,6 +88,11 @@ class StrategyAgent:
             if any(kw in msg_lower for kw in _SYSTEM_KEYWORDS):
                 return DomainRoute.SYSTEM
 
+        # Check for WBOM (business operations) keywords
+        from .wbom_agent import _WBOM_KEYWORDS
+        if any(kw in msg_lower for kw in _WBOM_KEYWORDS):
+            return DomainRoute.WBOM
+
         # Check for learning keywords
         from .learning_agent import _LEARNING_KEYWORDS
         if any(kw in msg_lower for kw in _LEARNING_KEYWORDS):
@@ -135,6 +141,10 @@ class StrategyAgent:
 
         elif route == DomainRoute.LEARNING:
             tasks.append(AgentTask("learning", "execute", priority=1))
+
+        elif route == DomainRoute.WBOM:
+            tasks.append(AgentTask("wbom", "build_prompt", priority=1))
+            tasks.append(AgentTask("learning", "log", priority=5))
 
         elif route == DomainRoute.CONVERSATION:
             # No domain agent needed — identity prompt + LLM

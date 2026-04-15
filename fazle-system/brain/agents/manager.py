@@ -23,6 +23,7 @@ from .social_agent import SocialAgent
 from .voice_agent import VoiceAgent
 from .system_agent import SystemAgent
 from .learning_agent import LearningAgent
+from .wbom_agent import WBOMAgent
 
 logger = logging.getLogger("fazle-agents.manager")
 
@@ -68,6 +69,7 @@ class AgentManager:
         learning_engine_url: str = "",
         autonomy_engine_url: str = "",
         redis_url: str = "",
+        wbom_url: str = "",
     ):
         # ── Identity Core ─────────────────────────────────
         self.identity = get_identity(redis_url)
@@ -99,11 +101,18 @@ class AgentManager:
             identity=self.identity,
         )
 
+        # WBOM agent
+        self.wbom_agent = WBOMAgent(
+            wbom_url=wbom_url,
+            identity=self.identity,
+        )
+
         # Register domain agents with strategy
         self.strategy.register_agent("social", self.social_agent)
         self.strategy.register_agent("voice", self.voice_agent)
         self.strategy.register_agent("system", self.system_agent)
         self.strategy.register_agent("learning", self.learning_agent_domain)
+        self.strategy.register_agent("wbom", self.wbom_agent)
 
         # ── Utility Agents (existing) ─────────────────────
         self.conversation_agent = ConversationAgent(
@@ -126,7 +135,7 @@ class AgentManager:
 
         logger.info(
             "AgentManager initialized: identity_core + strategy + "
-            "4 domain agents + 5 utility agents"
+            "5 domain agents (social, voice, system, learning, wbom) + 5 utility agents"
         )
 
     @property
