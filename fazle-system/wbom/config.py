@@ -31,6 +31,9 @@ class WBOMSettings(BaseSettings):
     auto_process_threshold: float = 0.9
     max_extraction_attempts: int = 3
 
+    # ── Internal service auth (zero-trust) ────────────────────
+    internal_key: str = ""  # WBOM_INTERNAL_KEY — shared secret for service-to-service calls
+
     # ── Business Rules ────────────────────────────────────────
     default_service_charge: int = 2000
     per_program_allowance: int = 500

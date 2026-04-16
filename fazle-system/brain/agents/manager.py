@@ -70,6 +70,7 @@ class AgentManager:
         autonomy_engine_url: str = "",
         redis_url: str = "",
         wbom_url: str = "",
+        wbom_internal_key: str = "",
     ):
         # ── Identity Core ─────────────────────────────────
         self.identity = get_identity(redis_url)
@@ -105,6 +106,7 @@ class AgentManager:
         self.wbom_agent = WBOMAgent(
             wbom_url=wbom_url,
             identity=self.identity,
+            wbom_internal_key=wbom_internal_key,
         )
 
         # Register domain agents with strategy

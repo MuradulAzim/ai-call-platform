@@ -17,6 +17,7 @@ import hashlib
 import time
 import asyncio
 import os
+import uuid
 from typing import Optional
 from datetime import datetime, timezone
 
@@ -24,7 +25,8 @@ import psycopg2
 import psycopg2.extras
 import redis
 
-logging.basicConfig(level=logging.INFO)
+from structured_log import setup_structured_logging
+setup_structured_logging("fazle-llm-gateway")
 logger = logging.getLogger("fazle-llm-gateway")
 
 
@@ -170,6 +172,16 @@ def _log_to_db(caller: str, user_id: str, provider: str, model: str,
 app = FastAPI(title="Fazle LLM Gateway", version="2.0.0")
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+
+@app.middleware("http")
+async def request_id_middleware(request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # ── Prometheus Counters & Histograms ────────────────────────
 

@@ -2,14 +2,16 @@
 # WBOM — WhatsApp Business Operations Manager
 # FastAPI service entry-point  |  Port 9900
 # ============================================================
-import logging, os
+import logging, os, uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from database import ensure_wbom_tables
+from config import settings as _cfg
 
 # ---- routers ------------------------------------------------
 from routes.contacts import router as contacts_router
@@ -25,11 +27,33 @@ from routes.subagent import router as subagent_router
 from routes.reports import router as reports_router
 
 # ---- logging ------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+from structured_log import setup_structured_logging
+setup_structured_logging("wbom")
 log = logging.getLogger("wbom")
+
+# ── Paths that skip internal auth (health checks) ────────────
+_PUBLIC_PATHS = frozenset(["/health", "/", "/metrics"])
+
+
+class InternalAuthMiddleware(BaseHTTPMiddleware):
+    """Reject requests without a valid X-INTERNAL-KEY header.
+    Health-check and root paths are exempt so Docker/Prometheus keep working."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _PUBLIC_PATHS:
+            return await call_next(request)
+        expected = _cfg.internal_key
+        if expected:
+            provided = request.headers.get("x-internal-key", "")
+            if provided != expected:
+                log.warning("Rejected request %s %s — bad/missing X-INTERNAL-KEY",
+                            request.method, request.url.path)
+                return Response(
+                    content='{"detail":"Forbidden — invalid internal key"}',
+                    status_code=403,
+                    media_type="application/json",
+                )
+        return await call_next(request)
 
 
 # ---- lifespan -----------------------------------------------
@@ -58,8 +82,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Internal service auth (zero-trust)
+app.add_middleware(InternalAuthMiddleware)
+
 # Prometheus
 Instrumentator().instrument(app).expose(app)
+
+
+# X-Request-ID tracing
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # ---- mount routers ------------------------------------------
 app.include_router(contacts_router, prefix="/api/wbom")

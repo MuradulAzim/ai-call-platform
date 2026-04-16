@@ -15,6 +15,7 @@ import logging
 import os
 import io
 import base64
+import uuid
 from typing import Optional
 from datetime import datetime
 
@@ -64,7 +65,8 @@ from database import (
 from audit import ensure_audit_table, log_action, get_audit_logs
 from admin_routes import router as admin_router
 
-logging.basicConfig(level=logging.INFO)
+from structured_log import setup_structured_logging
+setup_structured_logging("fazle-api")
 logger = logging.getLogger("fazle-api")
 
 # Allowed file extensions for upload
@@ -95,6 +97,7 @@ class Settings(BaseSettings):
     workflow_engine_url: str = "http://fazle-workflow-engine:9700"
     social_engine_url: str = "http://fazle-social-engine:9800"
     wbom_url: str = "http://fazle-wbom:9900"
+    wbom_internal_key: str = ""
     redis_url: str = "redis://redis:6379/7"
     rate_limit_rpm: int = 120
     rate_limit_per_ip_rps: int = 10
@@ -123,6 +126,18 @@ app = FastAPI(
 )
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+
+# ── X-Request-ID Middleware ──────────────────────────────────
+@app.middleware("http")
+async def request_id_middleware(request, call_next):
+    """Generate or propagate X-Request-ID for distributed tracing."""
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # ── Redis for Rate Limiting ──────────────────────────────────
 _redis_client: redis.Redis | None = None

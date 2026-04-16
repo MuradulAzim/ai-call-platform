@@ -61,7 +61,12 @@ def ensure_wbom_tables():
         ON wbom_cash_transactions (employee_id, transaction_date, amount, transaction_type, payment_method)
         WHERE status = 'Completed';
     """
-    for label, mig_sql in (("012_dedup_index", _DEDUP_INDEX_SQL),):
+    _WAMSG_DEDUP_INDEX_SQL = """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_wbom_transactions_wa_msg_dedup
+        ON wbom_cash_transactions (whatsapp_message_id)
+        WHERE whatsapp_message_id IS NOT NULL AND whatsapp_message_id != '';
+    """
+    for label, mig_sql in (("012_dedup_index", _DEDUP_INDEX_SQL), ("013_wa_msg_dedup", _WAMSG_DEDUP_INDEX_SQL)):
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:

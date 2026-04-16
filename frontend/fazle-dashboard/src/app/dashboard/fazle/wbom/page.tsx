@@ -51,7 +51,27 @@ import {
 
 // ── Constants ────────────────────────────────────────────────
 const PAGE_SIZE = 20;
+const AUTO_REFRESH_INTERVAL = 30_000; // 30 seconds
 type Tab = 'employees' | 'programs' | 'transactions';
+
+// ── Auto-refresh hook ────────────────────────────────────────
+function useAutoRefresh(fetchFn: () => void, enabled: boolean = true) {
+  const [lastUpdated, setLastUpdated] = React.useState<Date>(new Date());
+  const [autoRefresh, setAutoRefresh] = React.useState(true);
+
+  React.useEffect(() => {
+    if (!enabled || !autoRefresh) return;
+    const id = setInterval(() => {
+      fetchFn();
+      setLastUpdated(new Date());
+    }, AUTO_REFRESH_INTERVAL);
+    return () => clearInterval(id);
+  }, [fetchFn, enabled, autoRefresh]);
+
+  const markUpdated = React.useCallback(() => setLastUpdated(new Date()), []);
+
+  return { lastUpdated, autoRefresh, setAutoRefresh, markUpdated };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // MAIN PAGE
@@ -488,8 +508,10 @@ function EmployeesTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'erro
     }
   }, [filters, page, showMsg]);
 
+  const { lastUpdated, autoRefresh, setAutoRefresh, markUpdated } = useAutoRefresh(fetchData);
+
   React.useEffect(() => {
-    const t = setTimeout(fetchData, 300);
+    const t = setTimeout(() => { fetchData(); markUpdated(); }, 300);
     return () => clearTimeout(t);
   }, [fetchData]);
 
@@ -565,11 +587,15 @@ function EmployeesTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'erro
               <Button variant="outline" size="sm" onClick={() => setShowFilters(!showFilters)}>
                 <Filter className="h-4 w-4" />
               </Button>
-              <Button variant="outline" size="sm" onClick={fetchData}>
+              <Button variant="outline" size="sm" onClick={() => { fetchData(); markUpdated(); }}>
                 <RefreshCw className="h-4 w-4" />
+              </Button>
+              <Button variant={autoRefresh ? 'default' : 'outline'} size="sm" onClick={() => setAutoRefresh(!autoRefresh)} title={autoRefresh ? 'Auto-refresh ON (30s)' : 'Auto-refresh OFF'}>
+                {autoRefresh ? '⏱ Live' : '⏸ Paused'}
               </Button>
             </div>
           </div>
+          <p className="text-xs text-muted-foreground mt-1">Last updated: {lastUpdated.toLocaleTimeString()}</p>
 
           {/* Search */}
           <div className="relative mt-3">
@@ -798,7 +824,9 @@ function ProgramsTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'error
     }
   }, [filters, page, showMsg]);
 
-  React.useEffect(() => { fetchData(); }, [fetchData]);
+  const { lastUpdated, autoRefresh, setAutoRefresh, markUpdated } = useAutoRefresh(fetchData);
+
+  React.useEffect(() => { fetchData(); markUpdated(); }, [fetchData]);
   React.useEffect(() => { setPage(0); }, [statusFilter, shiftFilter, dateFrom, dateTo, search]);
 
   const handleSave = async () => {
@@ -857,11 +885,15 @@ function ProgramsTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'error
             <Button variant="outline" size="sm" onClick={() => setShowFilters(!showFilters)}>
               <Filter className="h-4 w-4" />
             </Button>
-            <Button variant="outline" size="sm" onClick={fetchData}>
+            <Button variant="outline" size="sm" onClick={() => { fetchData(); markUpdated(); }}>
               <RefreshCw className="h-4 w-4" />
+            </Button>
+            <Button variant={autoRefresh ? 'default' : 'outline'} size="sm" onClick={() => setAutoRefresh(!autoRefresh)} title={autoRefresh ? 'Auto-refresh ON (30s)' : 'Auto-refresh OFF'}>
+              {autoRefresh ? '⏱ Live' : '⏸ Paused'}
             </Button>
           </div>
         </div>
+        <p className="text-xs text-muted-foreground mt-1">Last updated: {lastUpdated.toLocaleTimeString()}</p>
 
         {/* Search */}
         <div className="relative mt-3">
@@ -1020,7 +1052,9 @@ function TransactionsTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'e
     }
   }, [filters, page, showMsg]);
 
-  React.useEffect(() => { fetchData(); }, [fetchData]);
+  const { lastUpdated, autoRefresh, setAutoRefresh, markUpdated } = useAutoRefresh(fetchData);
+
+  React.useEffect(() => { fetchData(); markUpdated(); }, [fetchData]);
   React.useEffect(() => { setPage(0); }, [methodFilter, typeFilter, dateFrom, dateTo, search]);
 
   const handleSave = async () => {
@@ -1081,11 +1115,15 @@ function TransactionsTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'e
             <Button variant="outline" size="sm" onClick={() => setShowFilters(!showFilters)}>
               <Filter className="h-4 w-4" />
             </Button>
-            <Button variant="outline" size="sm" onClick={fetchData}>
+            <Button variant="outline" size="sm" onClick={() => { fetchData(); markUpdated(); }}>
               <RefreshCw className="h-4 w-4" />
+            </Button>
+            <Button variant={autoRefresh ? 'default' : 'outline'} size="sm" onClick={() => setAutoRefresh(!autoRefresh)} title={autoRefresh ? 'Auto-refresh ON (30s)' : 'Auto-refresh OFF'}>
+              {autoRefresh ? '⏱ Live' : '⏸ Paused'}
             </Button>
           </div>
         </div>
+        <p className="text-xs text-muted-foreground mt-1">Last updated: {lastUpdated.toLocaleTimeString()}</p>
 
         {/* Search */}
         <div className="relative mt-3">

@@ -36,9 +36,10 @@ class WBOMAgent(BaseAgent):
     name = "wbom"
     description = "WhatsApp Business Operations Manager — contacts, escort programs, billing, salary, message processing"
 
-    def __init__(self, wbom_url: str, identity: IdentityProfile):
+    def __init__(self, wbom_url: str, identity: IdentityProfile, wbom_internal_key: str = ""):
         self.wbom_url = wbom_url.rstrip("/")
         self.identity = identity
+        self._internal_key = wbom_internal_key
 
     async def can_handle(self, ctx: AgentContext) -> bool:
         """Check if message relates to business operations."""
@@ -55,7 +56,10 @@ class WBOMAgent(BaseAgent):
             wbom_data = {}
 
             # Try to get relevant data from WBOM service
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            _headers = {}
+            if self._internal_key:
+                _headers["X-INTERNAL-KEY"] = self._internal_key
+            async with httpx.AsyncClient(timeout=10.0, headers=_headers) as client:
                 # Search across WBOM data for context
                 try:
                     resp = await client.get(

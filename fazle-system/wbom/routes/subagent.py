@@ -110,6 +110,7 @@ def subagent_complete_template(req: TemplateCompletionRequest):
             payment_method=req.template_data.get("payment_method", "Cash"),
             payment_mobile=mobile,
             message_id=req.message_id,
+            whatsapp_msg_id=req.template_data.get("whatsapp_msg_id", ""),
         )
 
     # Update message status

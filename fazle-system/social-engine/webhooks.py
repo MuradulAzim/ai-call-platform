@@ -651,6 +651,7 @@ async def handle_whatsapp_webhook(
     payload: dict, db_conn_fn, brain_url: str, get_creds_fn,
     owner_phone: str = "", learning_engine_url: str = "",
     wbom_url: str = "",
+    wbom_internal_key: str = "",
 ) -> dict:
     """Process an incoming WhatsApp webhook event.
     Flow: parse message → store → forward to WBOM → owner detection → call Brain OR store training."""
@@ -699,21 +700,32 @@ async def handle_whatsapp_webhook(
                 )
             conn.commit()
 
-        # ── Forward to WBOM for business operations processing (fire-and-forget) ──
+        # ── Forward to WBOM for business operations processing ──
         if wbom_url and has_text and not is_owner_msg:
+            _wbom_payload = {
+                "sender_number": msg["sender_id"],
+                "message_body": msg["text"],
+                "whatsapp_msg_id": msg_id or "",
+            }
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(
+                _wbom_headers = {}
+                if wbom_internal_key:
+                    _wbom_headers["X-INTERNAL-KEY"] = wbom_internal_key
+                async with httpx.AsyncClient(timeout=5.0, headers=_wbom_headers) as client:
+                    _resp = await client.post(
                         f"{wbom_url}/api/subagent/wbom/process-message",
-                        json={
-                            "sender_number": msg["sender_id"],
-                            "message_body": msg["text"],
-                            "whatsapp_msg_id": msg_id or "",
-                        },
+                        json=_wbom_payload,
                     )
+                    if _resp.status_code >= 500:
+                        raise httpx.HTTPStatusError("server error", request=_resp.request, response=_resp)
                 logger.info("Forwarded message to WBOM from %s", msg["sender_id"])
             except Exception as e:
-                logger.warning("WBOM forwarding failed (non-critical): %s", e)
+                logger.warning("WBOM forwarding failed, queuing retry: %s", e)
+                try:
+                    from wbom_retry import enqueue_failed_message
+                    enqueue_failed_message(_wbom_payload)
+                except Exception:
+                    logger.error("WBOM retry enqueue also failed")
 
         # ──────────── MEDIA MESSAGE (image/audio/video/document) ────────────
         if has_media and msg_type in ("image", "audio", "video", "document"):

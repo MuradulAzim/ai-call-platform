@@ -44,6 +44,7 @@ services:
       FAZLE_WORKFLOW_ENGINE_URL: "http://fazle-workflow-engine:9700"
       FAZLE_SOCIAL_ENGINE_URL: "http://fazle-social-engine:9800"
       FAZLE_WBOM_URL: "http://fazle-wbom:9900"
+      FAZLE_WBOM_INTERNAL_KEY: "${WBOM_INTERNAL_KEY:-}"
       FAZLE_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/7"
       FAZLE_RATE_LIMIT_RPM: "${FAZLE_RATE_LIMIT_RPM:-120}"
       FAZLE_RATE_LIMIT_PER_IP_RPS: "${FAZLE_RATE_LIMIT_PER_IP_RPS:-10}"
@@ -122,6 +123,7 @@ services:
       MEMORY_TOP_K: "${MEMORY_TOP_K:-2}"
       FAZLE_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
       WBOM_URL: "http://fazle-wbom:9900"
+      WBOM_INTERNAL_KEY: "${WBOM_INTERNAL_KEY:-}"
     logging:
       driver: "json-file"
       options:
@@ -897,6 +899,7 @@ services:
       SOCIAL_META_APP_SECRET: "${SOCIAL_META_APP_SECRET:-}"
       SOCIAL_WORKFLOW_ENGINE_URL: "http://fazle-workflow-engine:9700"
       SOCIAL_WBOM_URL: "http://fazle-wbom:9900"
+      SOCIAL_WBOM_INTERNAL_KEY: "${WBOM_INTERNAL_KEY:-}"
       SOCIAL_OWNER_PHONE: "${SOCIAL_OWNER_PHONE:-}"
       SOCIAL_LEARNING_ENGINE_URL: "http://fazle-learning-engine:8900"
     logging:
@@ -941,6 +944,8 @@ services:
       WBOM_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
       WBOM_BRAIN_URL: "http://fazle-brain:8200"
       WBOM_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/8"
+      WBOM_INTERNAL_KEY: "${WBOM_INTERNAL_KEY:-}"
+      WBOM_INTERNAL_KEY: "${WBOM_INTERNAL_KEY:-}"
     logging:
       driver: "json-file"
       options:

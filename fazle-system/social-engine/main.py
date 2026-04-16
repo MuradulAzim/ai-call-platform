@@ -27,7 +27,8 @@ from tasks import trigger_workflow, check_keyword_rules
 import whatsapp as wa_module
 import facebook as fb_module
 
-logging.basicConfig(level=logging.INFO)
+from structured_log import setup_structured_logging
+setup_structured_logging("fazle-social-engine")
 logger = logging.getLogger("fazle-social-engine")
 
 psycopg2.extras.register_uuid()
@@ -52,6 +53,7 @@ class Settings(BaseSettings):
     owner_phone: str = ""  # SOCIAL_OWNER_PHONE — owner's WhatsApp phone number
     learning_engine_url: str = "http://fazle-learning-engine:8900"
     wbom_url: str = "http://fazle-wbom:9900"  # SOCIAL_WBOM_URL — WBOM service for business ops
+    wbom_internal_key: str = ""  # SOCIAL_WBOM_INTERNAL_KEY — shared secret for WBOM calls
 
     class Config:
         env_prefix = "SOCIAL_"
@@ -60,6 +62,16 @@ class Settings(BaseSettings):
 settings = Settings()
 
 app = FastAPI(title="Fazle Social Engine", version="2.0.0", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def request_id_middleware(request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # ── Database ────────────────────────────────────────────────
 _pool = None
@@ -596,6 +608,10 @@ def startup():
         ensure_tables()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
+    # Initialise WBOM retry queue
+    from wbom_retry import init_retry_worker, start_retry_loop
+    init_retry_worker(settings.redis_url, settings.wbom_url, settings.wbom_internal_key)
+    start_retry_loop()
 
 
 @app.get("/health")
@@ -881,6 +897,7 @@ async def whatsapp_webhook_receive(request: Request):
                 payload, _get_conn, settings.brain_url, _get_integration_creds,
                 owner_phone=settings.owner_phone, learning_engine_url=settings.learning_engine_url,
                 wbom_url=settings.wbom_url,
+                wbom_internal_key=settings.wbom_internal_key,
             )
             await trigger_workflow(settings.workflow_engine_url, "whatsapp.message.received", result)
         except Exception as exc:

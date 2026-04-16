@@ -75,7 +75,8 @@ from autonomous_intelligence import (
     get_learning_stats,
 )
 
-logging.basicConfig(level=logging.INFO)
+from structured_log import setup_structured_logging
+setup_structured_logging("fazle-brain")
 logger = logging.getLogger("fazle-brain")
 
 
@@ -110,6 +111,8 @@ class Settings(BaseSettings):
     social_engine_url: str = "http://fazle-social-engine:9800"
     # WBOM service URL
     wbom_url: str = "http://fazle-wbom:9900"
+    # WBOM internal auth key
+    wbom_internal_key: str = ""
 
     class Config:
         env_prefix = ""
@@ -120,6 +123,16 @@ settings = Settings()
 app = FastAPI(title="Fazle Brain — Reasoning Engine", version="2.0.0")
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+
+@app.middleware("http")
+async def request_id_middleware(request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # ── Agent Manager (multi-agent orchestration) ───────────────
 agent_manager: AgentManager | None = None
@@ -145,6 +158,7 @@ async def init_agents():
         autonomy_engine_url=settings.autonomy_engine_url,
         redis_url=settings.redis_url,
         wbom_url=settings.wbom_url,
+        wbom_internal_key=settings.wbom_internal_key,
     )
     logger.info(
         "Agent Manager initialized: identity_core + strategy + "
@@ -289,15 +303,22 @@ def _humanize_reply(reply: str) -> str:
     return reply
 
 
+# Request types that must bypass LLM cache (financial / WBOM data)
+_NOCACHE_REQUEST_TYPES = frozenset(["wbom", "wbom_query", "financial", "payment", "billing"])
+
 async def query_gateway(messages: list[dict], model: str = None, max_tokens: int = None,
-                        caller: str = "fazle-brain", request_type: str = "user_chat") -> dict:
+                        caller: str = "fazle-brain", request_type: str = "user_chat",
+                        cache: bool = True) -> dict:
     """Call LLM Gateway — the ONLY LLM entry point. Gateway handles provider routing and fallback."""
+    # Auto-disable cache for financial/WBOM request types
+    use_cache = cache and request_type not in _NOCACHE_REQUEST_TYPES
     payload = {
         "messages": messages,
         "response_format": "json",
         "caller": caller,
         "temperature": 0.7,
         "request_type": request_type,
+        "cache": use_cache,
     }
     if model:
         payload["model"] = model
@@ -322,15 +343,18 @@ async def query_llm(messages: list[dict], request_type: str = "user_chat") -> di
 
 
 async def stream_llm_gateway(messages: list[dict], max_tokens: int = None,
-                              caller: str = "fazle-brain-stream", request_type: str = "user_chat"):
+                              caller: str = "fazle-brain-stream", request_type: str = "user_chat",
+                              cache: bool = True):
     """Stream from LLM Gateway SSE endpoint, yields text chunks.
     Handles both OpenAI-style and Ollama-style SSE from the gateway."""
+    use_cache = cache and request_type not in _NOCACHE_REQUEST_TYPES
     payload = {
         "messages": messages,
         "caller": caller,
         "temperature": 0.7,
         "stream": True,
         "request_type": request_type,
+        "cache": use_cache,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens

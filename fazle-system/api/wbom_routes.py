@@ -18,6 +18,11 @@ def _get_wbom_url() -> str:
     return settings.wbom_url
 
 
+def _get_wbom_internal_key() -> str:
+    from main import settings
+    return getattr(settings, "wbom_internal_key", "")
+
+
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def wbom_proxy(path: str, request: Request, _user: dict = Depends(require_admin)):
     """Authenticated catch-all proxy to the WBOM microservice."""
@@ -31,6 +36,9 @@ async def wbom_proxy(path: str, request: Request, _user: dict = Depends(require_
         "content-type": request.headers.get("content-type", "application/json"),
         "accept": request.headers.get("accept", "application/json"),
     }
+    internal_key = _get_wbom_internal_key()
+    if internal_key:
+        headers["X-INTERNAL-KEY"] = internal_key
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:

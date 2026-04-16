@@ -202,11 +202,13 @@ class PaymentProcessor:
         transaction_type: str = "Advance",
         program_id: Optional[int] = None,
         message_id: Optional[int] = None,
+        whatsapp_msg_id: Optional[str] = None,
     ) -> dict:
         """Step 3: Record a cash transaction + complete program ATOMICALLY.
 
         Uses a single DB connection + transaction so both succeed or both roll back.
         Duplicate transactions (same employee, date, amount, type, method) are rejected.
+        WhatsApp message ID dedup provides an additional safety layer.
         """
         tx_data = {
             "employee_id": employee_id,
@@ -220,8 +222,10 @@ class PaymentProcessor:
             tx_data["payment_mobile"] = payment_mobile
         if program_id:
             tx_data["program_id"] = program_id
-        if message_id:
-            tx_data["whatsapp_message_id"] = str(message_id)
+        # Prefer actual WhatsApp message ID, fall back to internal message_id
+        wa_id = whatsapp_msg_id or (str(message_id) if message_id else None)
+        if wa_id:
+            tx_data["whatsapp_message_id"] = wa_id
 
         cols = list(tx_data.keys())
         placeholders = ["%s"] * len(cols)
