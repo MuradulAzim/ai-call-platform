@@ -11,8 +11,7 @@ export default function TransactionsPage() {
   useEffect(() => {
     async function load() {
       try {
-        const today = new Date().toISOString().slice(0, 10);
-        const data = await get(`/transactions/daily-summary?date=${today}`);
+        const data = await get("/transactions?limit=100");
         setTransactions(Array.isArray(data) ? data : []);
       } catch (e) {
         setError(e.message);

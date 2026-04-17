@@ -26,13 +26,13 @@ export default function WbomDashboard() {
     async function load() {
       try {
         const [empCount, txCount, pendingPayments] = await Promise.all([
-          get("/employees/count").catch(() => ({ count: "?" })),
-          get("/transactions/count").catch(() => ({ count: "?" })),
+          get("/employees/count").catch(() => ({ total: "?" })),
+          get("/transactions/count").catch(() => ({ total: "?" })),
           get("/payment/pending?limit=5").catch(() => []),
         ]);
         setStats({
-          employees: empCount?.count ?? "?",
-          transactions: txCount?.count ?? "?",
+          employees: empCount?.total ?? "?",
+          transactions: txCount?.total ?? "?",
           pendingPayments: Array.isArray(pendingPayments) ? pendingPayments.length : 0,
         });
       } catch (e) {
