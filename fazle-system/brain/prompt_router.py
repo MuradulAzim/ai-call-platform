@@ -79,7 +79,7 @@ ROUTE_CONTEXT_FLAGS: dict[str, dict[str, bool]] = {
         "knowledge": True,
         "conversation_memory": False,
         "wbom": False,
-        "identity": True,
+        "identity": False,
         "contact": False,
         "history": True,
         "anti_rep": False,
