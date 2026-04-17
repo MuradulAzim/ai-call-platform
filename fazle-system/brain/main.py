@@ -1216,7 +1216,7 @@ async def chat(request: ChatRequest):
         "You are Azim, Al-Aqsa Security (BD). Reply in Bangla. Short, natural, 1-2 sentences. "
         "Use CONVERSATION KNOWLEDGE as reference. Never copy raw text. Never say you're AI."
     )
-    _MAX_SYSTEM_CHARS = 800  # Tight limit for fast LLM inference
+    _MAX_SYSTEM_CHARS = 3000  # Raised for qwen2.5:1.5b — enough context without CPU timeout
     if len(system_prompt) > _MAX_SYSTEM_CHARS:
         logger.info(f"System prompt truncated: {len(system_prompt)} -> {_MAX_SYSTEM_CHARS} chars")
         # Keep core identity + as much persona detail as fits

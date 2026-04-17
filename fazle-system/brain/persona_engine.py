@@ -120,47 +120,49 @@ def _get_language_prompt(contact_id: str) -> str:
         return ""
 
 
+# Priority fields for compact identity (order matters)
+_IDENTITY_PRIORITY_FIELDS = [
+    "full_name", "role", "personality", "communication_style",
+    "business_info", "family", "location", "occupation",
+]
+_IDENTITY_MAX_CHARS = 1200
+
+
 def build_identity_context() -> str:
-    """Build Azim's identity context from stored profile for prompt injection.
-    This is injected into ALL prompts so the AI truly understands Azim."""
+    """Build compact Azim identity context for prompt injection.
+    Caps output to ~1200 chars to avoid Ollama CPU timeouts."""
     profile = azim_profile_all()
     if not profile:
         return ""
-    parts = ["\n--- AZIM'S IDENTITY (PRIMARY SOURCE OF TRUTH) ---"]
-    _FIELD_LABELS = {
-        "full_name": "Full Name",
-        "role": "Role",
-        "personality": "Personality Traits",
-        "communication_style": "Communication Style",
-        "business_info": "Business Info",
-        "family": "Family & Friends",
-        "preferences": "Preferences",
-        "ideology": "Ideology & Values",
-        "location": "Location",
-        "occupation": "Occupation",
-        "hobbies": "Hobbies & Interests",
-        "language": "Languages",
-        "religion": "Religion",
-        "education": "Education",
-        "daily_routine": "Daily Routine",
-        "goals": "Goals & Ambitions",
-        "dislikes": "Dislikes",
-        "food": "Food Preferences",
-        "music": "Music Taste",
-        "tech_stack": "Tech Stack",
-        # Personality Lock v2 fields
-        "greeting_style": "Greeting Style",
-        "tone_variation": "Tone Variation Rules",
-        "humor_level": "Humor Level (1-10)",
-        "strictness": "Strictness Level (1-10)",
-    }
+    parts = ["\n--- AZIM'S IDENTITY ---"]
+    budget = _IDENTITY_MAX_CHARS - 60  # header + footer
+    used = 0
+    # Priority fields first (capped at 200 chars each)
+    for field in _IDENTITY_PRIORITY_FIELDS:
+        value = profile.get(field)
+        if not value:
+            continue
+        label = field.replace("_", " ").title()
+        entry = str(value)[:200]
+        line = f"  {label}: {entry}"
+        if used + len(line) > budget:
+            break
+        parts.append(line)
+        used += len(line) + 1
+    # Remaining fields if budget allows (capped at 100 chars each)
     for field, value in profile.items():
-        label = _FIELD_LABELS.get(field, field.replace("_", " ").title())
-        parts.append(f"  {label}: {value}")
-    parts.append("Use this knowledge when speaking as Azim. This is who you ARE.")
+        if field in _IDENTITY_PRIORITY_FIELDS:
+            continue
+        label = field.replace("_", " ").title()
+        entry = str(value)[:100]
+        line = f"  {label}: {entry}"
+        if used + len(line) > budget:
+            break
+        parts.append(line)
+        used += len(line) + 1
     parts.append("--- END IDENTITY ---")
 
-    # ── Personality Lock v2: Enforce personality constraints ──
+    # Personality Lock v2
     personality_lock = _build_personality_lock(profile)
     if personality_lock:
         parts.append(personality_lock)
