@@ -1,32 +1,32 @@
 "use client";
 
 import { useSession } from "next-auth/react";
-import { useCallback } from "react";
+import { useCallback, useRef, useEffect } from "react";
 
 const BASE = "/api/wbom";
 
 export function useWbomApi() {
   const { data: session } = useSession();
+  const tokenRef = useRef(session?.accessToken);
 
-  const headers = useCallback(() => ({
-    "Content-Type": "application/json",
-    ...(session?.accessToken
-      ? { Authorization: `Bearer ${session.accessToken}` }
-      : {}),
-  }), [session?.accessToken]);
+  useEffect(() => {
+    tokenRef.current = session?.accessToken;
+  }, [session?.accessToken]);
 
   const request = useCallback(async (path, options = {}) => {
     const url = `${BASE}${path}`;
+    const hdrs = { "Content-Type": "application/json" };
+    if (tokenRef.current) hdrs.Authorization = `Bearer ${tokenRef.current}`;
     const res = await fetch(url, {
       ...options,
-      headers: { ...headers(), ...options.headers },
+      headers: { ...hdrs, ...options.headers },
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || `Request failed: ${res.status}`);
     }
     return res.json();
-  }, [headers]);
+  }, []);
 
   const get = useCallback((path) => request(path), [request]);
 
