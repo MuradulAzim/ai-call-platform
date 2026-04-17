@@ -7,11 +7,12 @@ from typing import Optional
 
 from database import execute_query
 from models import AuditLogResponse
+from response import api_response
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
 
-@router.get("", response_model=list[AuditLogResponse])
+@router.get("")
 def list_audit_logs(
     event: Optional[str] = None,
     actor: Optional[str] = None,
@@ -37,9 +38,17 @@ def list_audit_logs(
         params.append(entity_id)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    params += [limit, offset]
 
-    return execute_query(
+    # Get total count
+    count_rows = execute_query(
+        f"SELECT COUNT(*) as total FROM wbom_audit_logs {where}",
+        tuple(params),
+    )
+    total = count_rows[0]["total"] if count_rows else 0
+
+    params += [limit, offset]
+    rows = execute_query(
         f"SELECT * FROM wbom_audit_logs {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
         tuple(params),
     )
+    return api_response(rows, entity="audit", total=total)

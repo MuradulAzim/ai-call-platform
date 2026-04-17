@@ -1,10 +1,10 @@
 # Fazle AI — WhatsApp-First Business Platform
 
-> AI-powered business management platform focused on WhatsApp automation, recruitment, client handling, employee management, and role-based database operations. Built on a multi-agent AI brain that plans, reasons, learns, and self-improves.
+> AI-powered business management platform: WhatsApp automation, recruitment, client handling, employee/salary management, role-based database operations, and a multi-agent AI brain that plans, reasons, learns, and self-improves.
 
-**Domain:** `iamazim.com` &nbsp;|&nbsp; **VPS:** Contabo (4 CPUs, 7.8 GB RAM, 73 GB disk, Ubuntu)  
-**Version:** Phase 8.1 — WhatsApp-First Business Pivot &nbsp;|&nbsp; **Active Containers:** ~28 (voice stack disabled)  
-**Last updated:** 2026-04-14
+**Domain:** `iamazim.com` &nbsp;|&nbsp; **VPS:** Contabo (4 CPUs, 7.8 GB RAM, 73 GB disk, Ubuntu)
+**Version:** Phase 9 — Production WBOM &nbsp;|&nbsp; **Active Containers:** 32 (voice stack disabled)
+**Last updated:** 2026-04-18
 
 ---
 
@@ -24,6 +24,7 @@
   - [Multi-Agent Brain](#multi-agent-brain)
   - [LLM Gateway](#llm-gateway)
   - [How a Call Flows](#how-a-call-flows)
+- [WBOM — WhatsApp Business Operations Manager](#wbom--whatsapp-business-operations-manager)
 - [Dashboard](#dashboard)
 - [Networking & Domains](#networking--domains)
 - [Monitoring & Observability](#monitoring--observability)
@@ -42,18 +43,22 @@
 
 ## Overview
 
-The platform combines two systems:
+The platform combines three systems:
 
 | System | Purpose |
 |--------|---------|
 | **Fazle** | Custom autonomous AI layer — multi-agent reasoning, WhatsApp/Facebook automation, recruitment AI, client handling, employee management, role-based database updates, knowledge graph, semantic memory, self-learning, and workflow automation. |
+| **WBOM** | WhatsApp Business Operations Manager — production-grade business backend with employees, transactions (payment lifecycle: pending → staged → approved → paid), job applications, clients, audit trail, and role-based access control. |
 | **Dograh** | _(DISABLED)_ Open-source voice AI SaaS — handles inbound/outbound phone calls with real-time STT/TTS, LiveKit WebRTC streaming, and Twilio SIP integration. Can be re-enabled via `--profile voice`. |
 
 Together they deliver an AI-powered business platform that manages WhatsApp conversations, automates recruitment and client handling, tracks employees and programs, updates databases via role-based WhatsApp commands, builds a knowledge graph from interactions, learns from its own behavior, and maintains relationship-specific behavior with content safety boundaries.
 
 **Key capabilities:**
 - **WhatsApp-first business automation** — recruitment, client handling, employee management via WhatsApp messages
+- **WBOM** — Production business operations backend: employees, transactions, payment lifecycle (pending→staged→approved→paid), job applications, clients, audit trail
 - **Role-based database updates** — user roles control what data can be modified via WhatsApp commands
+- **Payment lifecycle** — maker/checker separation with 30-min staging TTL, full audit trail
+- **Always-reply guarantee** — WhatsApp webhook wraps every message in try/catch, ensures response even on internal errors
 - **Ollama-first LLM** — all chat routed through local `qwen2.5:1.5b` with automatic OpenAI `gpt-4o` fallback (10 s timeout)
 - Multi-agent brain with 9+ specialized agents (conversation, memory, research, task, tool, social, system, learning)
 - LLM gateway with caching (300 s TTL), rate limiting (60 RPM), request batching, PostgreSQL conversation logging, and trainable data export
@@ -123,10 +128,10 @@ cd ai-agent-service && docker compose --env-file ../.env --profile voice up -d &
 |----------|----------|
 | **Infrastructure** | PostgreSQL + pgvector, Redis, Qdrant, Ollama, MinIO |
 | **AI Core** | Brain (multi-agent), Memory, LLM Gateway, Queue + Workers |
-| **Business** | API Gateway, Social Engine (WhatsApp/Facebook), Task Engine, Web Intelligence, Trainer |
+| **Business** | API Gateway, Social Engine (WhatsApp/Facebook), WBOM, Task Engine, Web Intelligence, Trainer |
 | **Autonomous AI** | Autonomy Engine, Tool Engine, Knowledge Graph, Autonomous Runner, Self-Learning |
 | **Extended** | Guardrail Engine, Workflow Engine, Learning Engine |
-| **Frontend** | Fazle UI (Next.js dashboard) |
+| **Frontend** | Fazle UI (Next.js dashboard + WBOM pages) |
 | **Observability** | Prometheus, Grafana, Loki, Promtail, node-exporter, cAdvisor, OTel Collector |
 
 ---
@@ -207,10 +212,10 @@ As of 2026-04-11, the platform runs **Ollama-first** with automatic OpenAI fallb
              │  │ Social   │ │Workflow  │ │Guardrail │ │
              │  │ :9800    │ │ :9700    │ │ :9600    │ │
              │  └──────────┘ └──────────┘ └──────────┘ │
-             │  ┌──────────────────┐                    │
-             │  │ Web Intelligence │                    │
-             │  │     :8500        │                    │
-             │  └──────────────────┘                    │
+             │  ┌──────────────────┐ ┌──────────────┐  │
+             │  │ Web Intelligence │ │  WBOM :9900  │  │
+             │  │     :8500        │ │  (Business)  │  │
+             │  └──────────────────┘ └──────────────┘  │
              │                                           │
              │  Autonomous: Autonomy(:9100) Tool(:9200) │
              │  KnowledgeGraph(:9300) Runner(:9400)     │
@@ -235,7 +240,7 @@ As of 2026-04-11, the platform runs **Ollama-first** with automatic OpenAI fallb
 
 ## Services
 
-The system deploys as **five Docker Compose stacks** plus host-level Nginx, totaling **40 containers**.
+The system deploys as **five Docker Compose stacks** plus host-level Nginx, totaling **32 active containers** (voice stack disabled).
 
 ### Stack 1 — ai-infra (Foundation)
 
@@ -297,8 +302,10 @@ All Fazle services — core intelligence, Phase-5 autonomous services, and suppo
 | **Extended Services** | | |
 | fazle-guardrail-engine | 9600 | Content safety — input/output moderation |
 | fazle-workflow-engine | 9700 | Multi-step workflow automation |
-| fazle-social-engine | 9800 | WhatsApp/Facebook — intent detection, contact intelligence |
+| fazle-social-engine | 9800 | WhatsApp/Facebook — intent detection, contact intelligence, always-reply guarantee |
 | fazle-learning-engine | 8900 | Self-improvement — conversation analysis, knowledge extraction |
+| **Business Operations** | | |
+| fazle-wbom | 9900 | WhatsApp Business Operations Manager — employees, transactions, payments, clients, applications, audit |
 | **Observability** | | |
 | fazle-otel-collector | 4317-4318 | OpenTelemetry collector — distributed tracing |
 
@@ -395,7 +402,8 @@ Layer 4  LLM Gateway (fazle-llm-gateway :8800)
            └── Trainable data export (/training-data)
            │
 Layer 5  Extended Services
-           ├── Social Engine (:9800) — WhatsApp/FB platform routing
+           ├── Social Engine (:9800) — WhatsApp/FB platform routing + always-reply guarantee
+           ├── WBOM (:9900) — Business operations (employees, payments, clients, audit)
            ├── Workflow Engine (:9700) — multi-step automation
            ├── Guardrail Engine (:9600) — content safety
            ├── Learning Engine (:8900) — conversation analysis
@@ -491,6 +499,75 @@ Every LLM request/response is logged with: provider, model, system prompt hash, 
 
 ---
 
+## WBOM — WhatsApp Business Operations Manager
+
+Production-grade business operations backend (FastAPI, port 9900) with 18 routers, `X-INTERNAL-KEY` authentication middleware, and full payment lifecycle management.
+
+### Core Features
+
+| Feature | Description |
+|---------|-------------|
+| **Employee Management** | Full CRUD with departments, positions, salary tracking, status lifecycle |
+| **Transaction Ledger** | Type-categorized transactions (salary/payment/expense/invoice/adjustment/refund) with line-item breakdowns |
+| **Payment Lifecycle** | `pending → staged → approved → paid` flow with maker/checker separation and audit stamps |
+| **Job Applications** | Candidate pipeline from `received → screening → interview → offered → hired/rejected` |
+| **Client Management** | Client profiles with contact info, industry, status tracking |
+| **Audit Trail** | Append-only `wbom_audit_log` table — every mutation logged with actor, action, old/new values |
+| **Role-Based Access** | Employee roles control what operations are allowed via WhatsApp |
+
+### Payment Lifecycle
+
+```
+pending ──→ staged ──→ approved ──→ paid
+              │                       │
+              └── rejected            └── audit_log entry
+```
+
+- **stage_payment** — Validates employee exists, transaction exists, amount > 0; writes `staged_by`, `staged_at`
+- **approve_payment** — Only works on staged payments; writes `approved_by`, `approved_at`
+- Maker/checker: the person who stages cannot be the same as approver (enforced in logic)
+- Every state transition creates an `wbom_audit_log` entry
+
+### Brain Integration (Control Layer)
+
+The Brain's `control_layer.py` acts as the unified decision engine for WBOM operations via WhatsApp:
+
+- **30-minute TTL** for payment staging — prevents stale approvals
+- **Always-reply guarantee** — `social-engine/webhooks.py` wraps every WhatsApp message in try/catch to ensure a response is always sent, even on internal errors
+- **Intent-based routing** — Social engine detects WBOM intents from WhatsApp messages and routes to control layer
+- **Structured responses** — Control layer returns formatted results for WhatsApp display
+
+### Database (Migration 015)
+
+| Table | Purpose |
+|-------|---------|
+| `wbom_employees` | id, name, email, phone, department, position, salary, status, hire_date |
+| `wbom_transactions` | id, type, amount, description, status, employee_id, line_items (JSONB) |
+| `wbom_payments` | id, employee_id, transaction_id, amount, status, staged_by/at, approved_by/at |
+| `wbom_job_applications` | id, candidate_name, position, status, resume_url, notes, applied_at |
+| `wbom_clients` | id, name, email, phone, company, industry, status |
+| `wbom_audit_log` | id, table_name, record_id, action, actor, old_values, new_values, timestamp |
+
+### UI Pages
+
+WBOM has a dedicated frontend section at `/dashboard/wbom/` with server-side API proxy (`/api/wbom/[...path]/route.js`) that injects the `X-INTERNAL-KEY` header:
+
+| Page | Route | Purpose |
+|------|-------|---------|
+| Dashboard | `/dashboard/wbom` | Overview stats (employees, transactions, clients, applications) |
+| Employees | `/dashboard/wbom/employees` | Employee directory, department filter, salary view |
+| Transactions | `/dashboard/wbom/transactions` | Transaction ledger with type filter |
+| Payments | `/dashboard/wbom/payments` | Payment lifecycle management (stage/approve/reject) |
+| Clients | `/dashboard/wbom/clients` | Client list with status management |
+| Applications | `/dashboard/wbom/applications` | Job application pipeline with stage transitions |
+| Audit | `/dashboard/wbom/audit` | Searchable audit log of all mutations |
+
+### Redis
+
+WBOM uses Redis DB 8 for caching and session data.
+
+---
+
 ## Dashboard
 
 The Fazle UI (Next.js 14, TypeScript, Tailwind CSS) provides a control dashboard at `fazle.iamazim.com` with the following pages:
@@ -519,6 +596,14 @@ The Fazle UI (Next.js 14, TypeScript, Tailwind CSS) provides a control dashboard
 | Privacy | `/dashboard/fazle/privacy` | Privacy controls |
 | GDPR Admin | `/dashboard/fazle/gdpr-admin` | GDPR compliance administration |
 | Settings | `/dashboard/fazle/settings` | Brain, memory, voice configuration |
+| **WBOM** | | |
+| WBOM Dashboard | `/dashboard/wbom` | Business overview — employee/transaction/client counts |
+| WBOM Employees | `/dashboard/wbom/employees` | Employee directory and management |
+| WBOM Transactions | `/dashboard/wbom/transactions` | Transaction ledger |
+| WBOM Payments | `/dashboard/wbom/payments` | Payment lifecycle (stage/approve) |
+| WBOM Clients | `/dashboard/wbom/clients` | Client management |
+| WBOM Applications | `/dashboard/wbom/applications` | Job application pipeline |
+| WBOM Audit | `/dashboard/wbom/audit` | Audit log viewer |
 
 ---
 
@@ -599,6 +684,12 @@ Nginx runs on the host (not Docker), with configs at `/etc/nginx/sites-available
 | `fazle_web_intelligence_cache` | Fazle | Cached web search results & summaries |
 | `llm_conversation_log` | Gateway | Every LLM request/response — provider, model, latency, fallback flag, trainable flag |
 | `telephony_events` | Telephony Webhook | Inbound call log — CallSid (unique), workflow_id, from/to, payload, status, retry_count, locked_at |
+| `wbom_employees` | WBOM | Employee records — name, email, phone, department, position, salary, status, hire_date |
+| `wbom_transactions` | WBOM | Typed transactions — salary/payment/expense/invoice/adjustment/refund, line_items (JSONB) |
+| `wbom_payments` | WBOM | Payment lifecycle — status (pending/staged/approved/paid), staged_by/at, approved_by/at |
+| `wbom_job_applications` | WBOM | Candidate pipeline — received → screening → interview → offered → hired/rejected |
+| `wbom_clients` | WBOM | Client profiles — company, industry, contact info, status |
+| `wbom_audit_log` | WBOM | Append-only mutation log — table, record_id, action, actor, old/new values |
 
 ### Vector Storage
 
@@ -612,8 +703,9 @@ Nginx runs on the host (not Docker), with configs at `/etc/nginx/sites-available
 |-------|---------------|
 | **Authentication** | JWT tokens (PyJWT) + bcrypt password hashing |
 | **Service-to-service auth** | FAZLE_API_KEY with `hmac.compare_digest` (timing-safe) |
+| **WBOM internal auth** | `X-INTERNAL-KEY` header middleware — UI uses server-side proxy (`/api/wbom/[...path]/route.js`) to inject key |
 | **Row-Level Security** | RLS policies via `_rls_conn()` on all tables — user isolation enforced at DB level |
-| **Audit logging** | Append-only `fazle_audit_log` table (RLS prevents updates/deletes) |
+| **Audit logging** | Append-only `fazle_audit_log` + `wbom_audit_log` tables (RLS prevents updates/deletes) |
 | **Transport** | HTTPS everywhere + HSTS; HTTP → HTTPS redirect |
 | **CORS** | Restricted to `iamazim.com` and `fazle.iamazim.com` |
 | **Input validation** | Pydantic schemas with length limits and regex patterns |
@@ -798,6 +890,7 @@ Secrets are generated and managed by `scripts/gen-secrets.sh` and stored in `.en
 | `FAZLE_JWT_SECRET` | Fazle JWT signing | Invalidates user sessions |
 | `NEXTAUTH_SECRET` | Fazle UI session signing | Invalidates UI sessions |
 | `GRAFANA_PASSWORD` | Grafana login | Only Grafana affected |
+| `WBOM_INTERNAL_KEY` | WBOM service-to-service auth | Breaks UI→WBOM proxy calls |
 
 ### Commands
 
@@ -954,6 +1047,8 @@ bash scripts/health-check.sh
 | 3 | LLM Gateway | Response cache (300s TTL), rate limits (10 req/s), Ollama→OpenAI fallback stats |
 | 4 | Learning Engine | Relationship graph, user corrections |
 | 5 | Queue + Workers | Redis Streams for async LLM requests |
+| 6 | Social Engine | WhatsApp/Facebook session state, contact cache |
+| 8 | WBOM | Business operations cache, payment staging TTL |
 
 ---
 
@@ -980,6 +1075,8 @@ bash scripts/health-check.sh
 | Learning Engine  | 0.5  | 512 MB | 128 MB   | Active |
 | Queue            | 0.5  | 512 MB | 128 MB   | Active |
 | Workers ×2       | 1 ea | 1 GB ea| 256 MB ea| Active |
+| WBOM             | 0.5  | 512 MB | 128 MB   | Active |
+| Social Engine    | 0.5  | 512 MB | 128 MB   | Active |
 | Prometheus       | 0.5  | 512 MB | 256 MB   | Active |
 | Grafana          | 0.5  | 256 MB | 128 MB   | Active |
 | Loki             | 0.5  | 512 MB | 256 MB   | Active |
@@ -1100,14 +1197,11 @@ docker exec ai-postgres psql -U postgres -d postgres \
 | Phase 5 | Autonomous AI — multi-agent brain, autonomy engine, tool engine, knowledge graph, runner, self-learning | Deployed (2026-03-19) |
 | Phase 6 | Ollama-first LLM gateway — caching, fallback, DB logging, training data export | Deployed (2026-04-10) |
 | Phase 7 | Telephony webhook hardening — Nginx-first routing, header re-injection proxy, idempotent event store, retry & dead-letter | Deployed (2026-04-13) |
-| Phase 8.1 | **WhatsApp-first business pivot** — Disabled voice stack (Dograh, LiveKit, Coturn, telephony-webhook, ai-agent-service, fazle-voice) via Docker profiles. Freed ~3.8 GB RAM. Focus on WhatsApp automation, recruitment, client/employee management, role-based DB updates | Deployed (2026-04-14) |
+| Phase 8.1 | **WhatsApp-first business pivot** — Disabled voice stack (Dograh, LiveKit, Coturn, telephony-webhook, ai-agent-service, fazle-voice) via Docker profiles. Freed ~3.8 GB RAM | Deployed (2026-04-14) |
+| Phase 9 | **Production WBOM** — WhatsApp Business Operations Manager with employees, transactions, payment lifecycle (pending→staged→approved→paid), job applications, clients, audit trail, 18 API routers, control layer integration, always-reply guarantee, 7 dashboard pages, server-side auth proxy | Deployed (2026-04-18) |
 
 ### Planned
 
-- **WhatsApp role-based commands** — User roles (admin, manager, employee) control which database operations are allowed via WhatsApp messages
-- **Recruitment AI pipeline** — Automated candidate screening, interview scheduling, and follow-up via WhatsApp
-- **Client management automation** — Automated client onboarding and program enrollment via WhatsApp
-- **Employee management** — Shift scheduling, task assignment, and performance tracking via WhatsApp commands
 - **Single gateway architecture** — Remove brain's parallel fan-out, route ALL LLM calls through gateway only
 - **Embedding migration** — Switch memory service to Ollama `nomic-embed-text` primary, OpenAI fallback
 - **Ollama fine-tuning** — Train on collected OpenAI fallback responses from `llm_conversation_log`

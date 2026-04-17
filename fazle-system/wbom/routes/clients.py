@@ -5,22 +5,23 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
-from database import insert_row, get_row, update_row, delete_row, list_rows, search_rows, audit_log
+from database import insert_row, get_row, update_row, delete_row, list_rows, audit_log, count_rows
 from models import ClientCreate, ClientUpdate, ClientResponse
+from response import api_response, api_single
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
 
-@router.post("", response_model=ClientResponse, status_code=201)
+@router.post("", status_code=201)
 def create_client(data: ClientCreate):
     row = insert_row("wbom_clients", data.model_dump(exclude_none=True))
     audit_log("client.created", entity_type="client",
               entity_id=row.get("client_id"),
               payload={"name": data.name, "type": data.client_type})
-    return row
+    return api_single(row, entity="clients")
 
 
-@router.get("", response_model=list[ClientResponse])
+@router.get("")
 def list_clients(
     client_type: Optional[str] = None,
     is_active: Optional[bool] = None,
@@ -32,23 +33,30 @@ def list_clients(
         filters["client_type"] = client_type
     if is_active is not None:
         filters["is_active"] = is_active
-    return list_rows("wbom_clients", filters=filters, limit=limit, offset=offset)
+    rows = list_rows("wbom_clients", filters=filters, limit=limit, offset=offset)
+    total = count_rows("wbom_clients", filters if filters else None)
+    return api_response(rows, entity="clients", total=total)
 
 
 @router.get("/search")
 def search_clients(q: str = Query(..., min_length=1), limit: int = Query(10, le=50)):
-    return search_rows("wbom_clients", q, ["name", "company_name", "phone"], limit=limit)
+    from database import execute_query
+    rows = execute_query(
+        "SELECT * FROM wbom_clients WHERE name ILIKE %s OR company_name ILIKE %s OR phone ILIKE %s LIMIT %s",
+        (f"%{q}%", f"%{q}%", f"%{q}%", limit),
+    )
+    return api_response(rows, entity="clients")
 
 
-@router.get("/{client_id}", response_model=ClientResponse)
+@router.get("/{client_id}")
 def get_client(client_id: int):
     row = get_row("wbom_clients", "client_id", client_id)
     if not row:
         raise HTTPException(404, "Client not found")
-    return row
+    return api_single(row, entity="clients")
 
 
-@router.put("/{client_id}", response_model=ClientResponse)
+@router.put("/{client_id}")
 def update_client(client_id: int, data: ClientUpdate):
     updates = data.model_dump(exclude_none=True)
     if not updates:
@@ -58,7 +66,7 @@ def update_client(client_id: int, data: ClientUpdate):
         raise HTTPException(404, "Client not found")
     audit_log("client.updated", entity_type="client",
               entity_id=client_id, payload=updates)
-    return row
+    return api_single(row, entity="clients")
 
 
 @router.delete("/{client_id}")

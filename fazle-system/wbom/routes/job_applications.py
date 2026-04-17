@@ -5,22 +5,23 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
-from database import insert_row, get_row, update_row, delete_row, list_rows, search_rows, audit_log
+from database import insert_row, get_row, update_row, delete_row, list_rows, audit_log, count_rows
 from models import JobApplicationCreate, JobApplicationUpdate, JobApplicationResponse
+from response import api_response, api_single
 
 router = APIRouter(prefix="/job-applications", tags=["job_applications"])
 
 
-@router.post("", response_model=JobApplicationResponse, status_code=201)
+@router.post("", status_code=201)
 def create_application(data: JobApplicationCreate):
     row = insert_row("wbom_job_applications", data.model_dump(exclude_none=True))
     audit_log("job_application.created", actor=data.source or "system",
               entity_type="job_application", entity_id=row.get("application_id"),
               payload={"applicant": data.applicant_name, "position": data.position})
-    return row
+    return api_single(row, entity="applications")
 
 
-@router.get("", response_model=list[JobApplicationResponse])
+@router.get("")
 def list_applications(
     status: Optional[str] = None,
     position: Optional[str] = None,
@@ -32,18 +33,20 @@ def list_applications(
         filters["status"] = status
     if position:
         filters["position"] = position
-    return list_rows("wbom_job_applications", filters=filters, limit=limit, offset=offset)
+    rows = list_rows("wbom_job_applications", filters=filters, limit=limit, offset=offset)
+    total = count_rows("wbom_job_applications", filters if filters else None)
+    return api_response(rows, entity="applications", total=total)
 
 
-@router.get("/{application_id}", response_model=JobApplicationResponse)
+@router.get("/{application_id}")
 def get_application(application_id: int):
     row = get_row("wbom_job_applications", "application_id", application_id)
     if not row:
         raise HTTPException(404, "Application not found")
-    return row
+    return api_single(row, entity="applications")
 
 
-@router.put("/{application_id}", response_model=JobApplicationResponse)
+@router.put("/{application_id}")
 def update_application(application_id: int, data: JobApplicationUpdate):
     updates = data.model_dump(exclude_none=True)
     if not updates:
@@ -53,7 +56,7 @@ def update_application(application_id: int, data: JobApplicationUpdate):
         raise HTTPException(404, "Application not found")
     audit_log("job_application.updated", entity_type="job_application",
               entity_id=application_id, payload=updates)
-    return row
+    return api_single(row, entity="applications")
 
 
 @router.delete("/{application_id}")

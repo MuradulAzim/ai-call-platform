@@ -32,6 +32,7 @@ from routes.payment import router as payment_router
 from routes.job_applications import router as job_applications_router
 from routes.clients import router as clients_router
 from routes.audit import router as audit_router
+from routes.schema import router as schema_router
 
 # ---- logging ------------------------------------------------
 from structured_log import setup_structured_logging
@@ -125,6 +126,7 @@ app.include_router(payment_router, prefix="/api/wbom")
 app.include_router(job_applications_router, prefix="/api/wbom")
 app.include_router(clients_router, prefix="/api/wbom")
 app.include_router(audit_router, prefix="/api/wbom")
+app.include_router(schema_router, prefix="/api/wbom")
 
 
 # ---- health --------------------------------------------------
