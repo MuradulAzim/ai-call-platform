@@ -19,6 +19,7 @@ import os
 from datetime import datetime
 from memory_manager import conversation_get, conversation_set
 from context_builder import build_knowledge_context, build_smart_context, detect_intents, normalize_text, KNOWLEDGE_FALLBACK_BN, get_cached_context, set_cached_context
+from prompt_router import build_route_prompt, get_route_flags
 from intent_engine import process_social_intent, _get_state as _get_intent_state
 from lead_capture import try_capture_lead
 from persona_engine import build_system_prompt, build_system_prompt_async
@@ -1089,19 +1090,53 @@ async def chat(request: ChatRequest):
                     "memory_updates": [],
                 }
 
-    # Build social context with intent classification for social interactions
+    # ── User-scoped identifiers ───────────────────────────────
+    platform = "app"
+    user_identifier = user_id or conversation_id
+    if conversation_id and conversation_id.startswith("social-"):
+        parts = conversation_id.split("-", 2)
+        if len(parts) >= 3:
+            platform = parts[1]
+            user_identifier = parts[2]
+
+    # ── STEP A: Route FIRST — determine domain before building any prompt ──
+    domain_route = "conversation"  # default
+    domain_result = None
+    memories = []
+    if agent_manager:
+        ctx = AgentContext(
+            message=request.message,
+            user_name=user_name,
+            user_id=user_id,
+            relationship=relationship,
+            conversation_id=conversation_id,
+            memories=memories,
+            metadata={"source": "text"},
+        )
+        try:
+            domain_route = agent_manager.route_domain(ctx).value
+        except Exception as e:
+            logger.debug(f"Domain routing fallback: {e}")
+
+    route_flags = get_route_flags(domain_route)
+    logger.info(f"Route determined: {domain_route} for rel={relationship}")
+
+    # ── STEP B: Build ONLY the context this route needs ──────
+
+    # Social context (social route only)
     social_context = None
     contact_data = None
+    contact_context_str = ""
     if relationship == "social":
         from persona_engine import classify_social_intent
         intent = classify_social_intent(request.message)
-        context_parts = [f"user_intent: {intent}"]
+        _ctx_parts = [f"user_intent: {intent}"]
         if request.context:
-            context_parts.append(request.context)
-        social_context = "\n".join(context_parts)
+            _ctx_parts.append(request.context)
+        social_context = "\n".join(_ctx_parts)
 
-        # Fetch contact data from social engine for personalized responses
-        if conversation_id and conversation_id.startswith("social-"):
+        # Fetch contact data if route needs it
+        if route_flags.get("contact") and conversation_id and conversation_id.startswith("social-"):
             _parts = conversation_id.split("-", 2)
             if len(_parts) >= 3:
                 _platform = _parts[1]
@@ -1114,121 +1149,98 @@ async def chat(request: ChatRequest):
                         )
                         if _resp.status_code == 200:
                             contact_data = _resp.json().get("contact")
+                            if contact_data:
+                                from persona_engine import build_contact_context
+                                contact_context_str = build_contact_context(contact_data)
                 except Exception as _e:
                     logger.debug(f"Contact lookup failed: {_e}")
 
-    # FIX 7+8: Run persona build + memory searches in parallel (limited to 5 items max)
-    # NOTE: Memory retrieval skipped — base system_prompt is always >500 chars
-    # and we truncate to 500, so appended contexts are always lost. Saves 2-3s.
-    system_prompt_task = build_system_prompt_async(
-        user_name=user_name,
-        relationship=relationship,
-        user_id=user_id,
-        learning_engine_url=settings.learning_engine_url,
-        social_context=social_context,
-        contact_data=contact_data,
-    )
+    # Identity context (only for routes that need it)
+    identity_context_str = ""
+    if route_flags.get("identity"):
+        identity_context_str = build_identity_context()
 
-    system_prompt = await system_prompt_task
-    memories = []
-    memory_context = ""
-
-    # ── User-scoped conversation intelligence ───────────────
-    platform = "app"
-    user_identifier = user_id or conversation_id
-    if conversation_id and conversation_id.startswith("social-"):
-        parts = conversation_id.split("-", 2)
-        if len(parts) >= 3:
-            platform = parts[1]
-            user_identifier = parts[2]
-
-    user_history_context = ""
-    anti_rep_context = ""
-    awareness_context = ""
-
-    # ── Owner style learning (STEP 6) — skipped, always truncated ──
-    owner_style_context = ""
-
-    # ── Knowledge Base context injection (Phase 7: Smart Retrieval) ──
+    # Knowledge context (only for routes that need it)
     knowledge_context = ""
-    try:
-        knowledge_context = await build_smart_context(
-            message=request.message,
-            caller_id=user_id or user_identifier,
-            caller_role=relationship,
-            memory_url=settings.memory_url,
-            api_url=f"http://fazle-api:8100",
-        )
-        if knowledge_context:
-            logger.info(f"Smart knowledge context injected: {len(knowledge_context)} chars")
-    except Exception as _kb_err:
-        logger.debug(f"Smart knowledge context failed, trying legacy: {_kb_err}")
+    if route_flags.get("knowledge"):
         try:
-            knowledge_context = await build_knowledge_context(
+            knowledge_context = await build_smart_context(
                 message=request.message,
                 caller_id=user_id or user_identifier,
                 caller_role=relationship,
+                memory_url=settings.memory_url,
+                api_url=f"http://fazle-api:8100",
+            )
+            if knowledge_context:
+                logger.info(f"Knowledge context injected: {len(knowledge_context)} chars")
+        except Exception as _kb_err:
+            logger.debug(f"Smart context failed, trying legacy: {_kb_err}")
+            try:
+                knowledge_context = await build_knowledge_context(
+                    message=request.message,
+                    caller_id=user_id or user_identifier,
+                    caller_role=relationship,
+                    api_url=f"http://fazle-api:8100",
+                )
+            except Exception:
+                pass
+
+    # WBOM data (ONLY for wbom route)
+    wbom_context = ""
+    if route_flags.get("wbom") and agent_manager:
+        try:
+            domain_result = await agent_manager.process_domain(ctx)
+            _wbom_results = domain_result.get("results", {}).get("wbom", {})
+            _wbom_meta = _wbom_results.get("metadata", {})
+            _wbom_data = _wbom_meta.get("wbom_data", {})
+            if _wbom_data.get("search_results"):
+                _parts_w = []
+                for table, rows in _wbom_data["search_results"].items():
+                    if rows:
+                        _parts_w.append(f"[{table}]: {len(rows)} records")
+                        for row in rows[:3]:
+                            if isinstance(row, dict):
+                                _parts_w.append("  " + ", ".join(f"{k}={v}" for k, v in list(row.items())[:5]))
+                wbom_context = "\n".join(_parts_w)
+        except Exception as e:
+            logger.debug(f"WBOM context fetch failed: {e}")
+
+    # Anti-repetition context (only for routes that need it)
+    anti_rep_context = ""
+    if route_flags.get("anti_rep"):
+        recent_replies = user_replies_get(platform, user_identifier)
+        if recent_replies:
+            anti_rep_context = build_anti_repetition_context(recent_replies)
+
+    # Conversation memory (only for social/conversation routes)
+    conversation_memory = ""
+    if route_flags.get("conversation_memory"):
+        try:
+            from context_builder import build_conversation_context
+            conversation_memory = await build_conversation_context(
+                message=request.message,
+                caller_id=user_id or user_identifier,
                 api_url=f"http://fazle-api:8100",
             )
         except Exception:
             pass
 
-    # Inject context — knowledge_context goes FIRST (highest priority for truncation survival)
-    # Then other optional contexts follow
-    system_prompt = system_prompt + knowledge_context + memory_context + user_history_context + anti_rep_context + awareness_context + owner_style_context
-
-    # ── Strategy Agent: domain routing + identity enforcement ──
-    domain_result = None
-    if agent_manager:
-        ctx = AgentContext(
-            message=request.message,
-            user_name=user_name,
-            user_id=user_id,
-            relationship=relationship,
-            conversation_id=conversation_id,
-            memories=memories,
-            metadata={"source": "text"},
-        )
-        try:
-            domain_result = await agent_manager.process_domain(ctx)
-            domain_prompt = domain_result.get("system_prompt")
-            logger.debug(f"domain_prompt_len={len(domain_prompt) if domain_prompt else 0}")
-            if domain_prompt:
-                system_prompt = domain_prompt + knowledge_context + memory_context + user_history_context + anti_rep_context + awareness_context + owner_style_context
-            else:
-                # Skip identity_prompt for social — BASE_IDENTITY covers it, saves ~450 chars (~6s on CPU)
-                if relationship != "social":
-                    identity_prompt = domain_result.get("identity_prompt", "")
-                    if identity_prompt:
-                        system_prompt = identity_prompt + "\n\n" + system_prompt
-        except Exception as e:
-            logger.debug(f"Domain routing skipped: {e}")
-
-    # FIX 2: FORCE system prompt as first message, always role=system
-    # Build conversation history — FIX 7: limit to last 5 turns
-    history = conversation_get(conversation_id)
-    logger.debug(f"sys_prompt_len={len(system_prompt)} history={len(history)}")
-
-    # Truncate system prompt to prevent Ollama CPU timeout on large prompts
-    # Core identity is always preserved even after truncation
-    # Phase 7: Lightweight prompt — shorter core identity, tighter limits
-    _CORE_IDENTITY = (
-        "You are Azim, Al-Aqsa Security (BD). Reply in Bangla. Short, natural, 1-2 sentences. "
-        "Use CONVERSATION KNOWLEDGE as reference. Never copy raw text. Never say you're AI."
+    # ── STEP C: Assemble route-specific prompt (no truncation needed) ──
+    system_prompt = build_route_prompt(
+        route=domain_route,
+        relationship=relationship,
+        social_context=social_context,
+        contact_context=contact_context_str,
+        identity_context=identity_context_str,
+        knowledge_context=knowledge_context,
+        wbom_context=wbom_context,
+        conversation_memory=conversation_memory,
+        anti_rep_context=anti_rep_context,
     )
-    _MAX_SYSTEM_CHARS = 3000  # Raised for qwen2.5:1.5b — enough context without CPU timeout
-    if len(system_prompt) > _MAX_SYSTEM_CHARS:
-        logger.info(f"System prompt truncated: {len(system_prompt)} -> {_MAX_SYSTEM_CHARS} chars")
-        # Keep core identity + as much persona detail as fits
-        remaining = _MAX_SYSTEM_CHARS - len(_CORE_IDENTITY) - 2  # 2 for \n\n
-        if remaining > 100:
-            detail = system_prompt[:remaining]
-            last_newline = detail.rfind("\n")
-            if last_newline > remaining // 2:
-                detail = detail[:last_newline]
-            system_prompt = _CORE_IDENTITY + "\n\n" + detail
-        else:
-            system_prompt = _CORE_IDENTITY
+
+    # Build conversation history
+    history = conversation_get(conversation_id)
+    logger.info(f"Prompt assembled: route={domain_route} len={len(system_prompt)} history={len(history)}")
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1410,9 +1422,9 @@ async def chat(request: ChatRequest):
         "reply": reply,
         "conversation_id": conversation_id,
         "memory_updates": memory_updates,
-        "domain_route": domain_result.get("route") if domain_result else None,
+        "domain_route": domain_route,
         "agents_used": domain_result.get("tasks_executed", []) if domain_result else [],
-        "intelligence": {"complexity": complexity, "route": "fast" if complexity == "simple" else "standard"},
+        "intelligence": {"complexity": complexity, "route": domain_route},
         "presence": presence,
     }
 
