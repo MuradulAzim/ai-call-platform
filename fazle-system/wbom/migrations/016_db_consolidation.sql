@@ -249,7 +249,7 @@ DO $$ BEGIN
     SELECT
         COALESCE(fsm.contact_identifier, ''),
         COALESCE(fsm.direction, 'incoming'),
-        COALESCE(fsm.content, fsm.message_text, ''),
+        COALESCE(fsm.content, ''),
         COALESCE(fsm.direction, 'incoming'),
         COALESCE(fsm.contact_identifier, ''),
         COALESCE(fsm.ai_response, ''),
@@ -267,8 +267,8 @@ DO $$ BEGIN
           AND wm.direction = COALESCE(fsm.direction, 'incoming')
     );
     RAISE NOTICE 'STEP 6: fazle_social_messages migrated';
-EXCEPTION WHEN undefined_table THEN
-    RAISE NOTICE 'STEP 6: fazle_social_messages not found — skipping';
+EXCEPTION WHEN undefined_table OR undefined_column THEN
+    RAISE NOTICE 'STEP 6: fazle_social_messages not found or schema mismatch — skipping';
 END $$;
 
 
