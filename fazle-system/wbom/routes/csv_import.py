@@ -31,6 +31,24 @@ _SKIP_COLUMNS = frozenset([
     "completion_time", "approved_at", "responded_at",
 ])
 
+# Column aliases: CSV header → DB column name
+_COLUMN_ALIASES = {
+    "wbom_cash_transactions": {
+        "method": "payment_method",
+        "payment_date": "transaction_date",
+        "paid_by": "created_by",
+        "payment_number": "payment_mobile",
+        "category": "transaction_type",
+    },
+}
+
+# Method normalization sets
+_BKASH_VALS = frozenset({"bkash", "b", "(b)"})
+_NAGAD_VALS = frozenset({"nagad", "n", "(n)"})
+
+# Shared office expense employee
+_OFFICE_EXPENSE_MOBILE = "01958122300"
+
 
 @router.get("/tables")
 def list_importable_tables():
@@ -120,16 +138,38 @@ async def upload_csv(table: str, file: UploadFile = File(...)):
 
     for row_num, raw_row in enumerate(reader, start=2):  # row 1 is header
         try:
+            # Pre-process transactions: aliases, employee, method, mobile, dates
+            _txn_emp_info = None
+            if table == "wbom_cash_transactions":
+                processed, skip_reason, _txn_emp_info = _pre_process_transaction(raw_row)
+                if skip_reason:
+                    failures.append({
+                        "row": row_num,
+                        "reason": skip_reason,
+                        "data": {k: v for k, v in raw_row.items() if v and v.strip()},
+                    })
+                    continue
+                raw_row = processed
+
             cleaned = _clean_row(raw_row, col_meta, pk)
             if not cleaned:
                 skipped += 1
                 continue
 
-            # Smart handling for transactions
-            if table == "wbom_cash_transactions" and isinstance(cleaned, dict) and "employee_id" in cleaned:
-                cleaned, emp_info = _handle_transaction_employee(cleaned)
-                if emp_info:
-                    auto_created_employees.append(emp_info)
+            # Transaction: collect auto-created employees + dedup
+            if table == "wbom_cash_transactions":
+                if _txn_emp_info:
+                    auto_created_employees.append(_txn_emp_info)
+                # Dedup: skip if (employee_id, amount, transaction_date) already in DB
+                _dup = execute_query(
+                    "SELECT transaction_id FROM wbom_cash_transactions "
+                    "WHERE employee_id = %s AND amount = %s AND transaction_date = %s LIMIT 1",
+                    (cleaned.get("employee_id", 0), cleaned.get("amount", 0),
+                     cleaned.get("transaction_date")),
+                )
+                if _dup:
+                    skipped += 1
+                    continue
 
             # Smart handling for escort programs
             if table == "wbom_escort_programs":
@@ -261,6 +301,8 @@ def _to_date(val: str) -> Optional[str]:
     val = val.strip()
     if not val:
         return None
+    # Fix comma used as separator (e.g. "14,03.2026" → "14.03.2026")
+    val = val.replace(",", ".")
     # Expand 2-digit year → 4-digit (e.g. 18.01.26 → 18.01.2026)
     for sep in (".", "-", "/"):
         parts = val.split(sep)
@@ -331,6 +373,125 @@ def _handle_transaction_employee(cleaned: dict) -> tuple[dict, Optional[dict]]:
         "employee_mobile": emp_id_str,
         "employee_name": new_emp["employee_name"],
     }
+
+
+def _pre_process_transaction(raw_row: dict) -> tuple[dict | None, str | None, dict | None]:
+    """Pre-process a cash transaction CSV row before _clean_row().
+    Applies column aliases, resolves employee, normalizes method,
+    cleans payment mobile, fixes date issues.
+    Returns (processed_row, skip_reason, auto_created_emp_info).
+    """
+    # 1. Apply column aliases
+    aliases = _COLUMN_ALIASES.get("wbom_cash_transactions", {})
+    aliased = {}
+    for col, val in raw_row.items():
+        col_lower = col.strip().lower()
+        mapped = aliases.get(col_lower, col_lower)
+        aliased[mapped] = val if val else ""
+
+    # 2. Skip rows with "?" or empty employee_id
+    emp_raw = aliased.get("employee_id", "").strip()
+    if not emp_raw or emp_raw == "?":
+        return None, f"employee_id='{emp_raw}'", None
+
+    # 3. Determine mobile number
+    core = emp_raw.lstrip("0")
+    if core.startswith("195812230") and len(core) == 10:
+        # Shared office expense IDs (19581223xx) → single OfficeExpance employee
+        mobile = _OFFICE_EXPENSE_MOBILE
+    elif len(emp_raw) == 10 and emp_raw.isdigit():
+        mobile = "0" + emp_raw
+    elif len(emp_raw) == 11 and emp_raw.startswith("0") and emp_raw.isdigit():
+        mobile = emp_raw
+    else:
+        return None, f"invalid employee_id='{emp_raw}'", None
+
+    # 4. Lookup or auto-create employee
+    found = execute_query(
+        "SELECT employee_id FROM wbom_employees WHERE employee_mobile = %s LIMIT 1",
+        (mobile,),
+    )
+    emp_info = None
+    if found:
+        aliased["employee_id"] = str(found[0]["employee_id"])
+    else:
+        emp_name = "OfficeExpance" if mobile == _OFFICE_EXPENSE_MOBILE else f"Auto-{mobile}"
+        new_emp = insert_row("wbom_employees", {
+            "employee_mobile": mobile,
+            "employee_name": emp_name,
+            "designation": "Labor",
+            "status": "Active",
+        })
+        aliased["employee_id"] = str(new_emp["employee_id"])
+        emp_info = {
+            "employee_id": new_emp["employee_id"],
+            "employee_mobile": mobile,
+            "employee_name": emp_name,
+        }
+        logger.info("Auto-created employee %s (%s) for transaction import", mobile, emp_name)
+
+    # 5. Normalize payment_method
+    _normalize_transaction_method(aliased)
+
+    # 6. Clean payment_mobile
+    pm = aliased.get("payment_mobile", "").strip()
+    aliased["payment_mobile"] = _clean_payment_mobile(pm)
+
+    # 7. Fix comma in dates (e.g. "14,03.2026" → "14.03.2026")
+    date_val = aliased.get("transaction_date", "").strip()
+    if "," in date_val:
+        aliased["transaction_date"] = date_val.replace(",", ".")
+
+    return aliased, None, emp_info
+
+
+def _normalize_transaction_method(row: dict):
+    """Normalize payment_method: B/(B)/Bkash→Bkash, N/(N)/Nagad→Nagad, Cash→Cash.
+    Non-payment-method values (SG, sukani, Food-18, etc.) move to remarks."""
+    method = row.get("payment_method", "").strip()
+    if not method:
+        return
+    method_lower = method.lower().strip()
+    if method_lower in _BKASH_VALS:
+        row["payment_method"] = "Bkash"
+    elif method_lower in _NAGAD_VALS:
+        row["payment_method"] = "Nagad"
+    elif method_lower == "cash":
+        row["payment_method"] = "Cash"
+    else:
+        # Not a recognized payment method — move to remarks
+        existing = row.get("remarks", "").strip()
+        row["remarks"] = f"{existing}; method: {method}".lstrip("; ") if existing else f"method: {method}"
+        row["payment_method"] = ""
+
+
+def _clean_payment_mobile(val: str) -> str:
+    """Clean payment_mobile: strip dashes, handle scientific notation,
+    remove method annotations, handle country codes, add 0-prefix."""
+    if not val or val == "?":
+        return ""
+    # Remove method annotations at end, e.g. " (N)", "(B)"
+    for suffix in (" (N)", " (B)", " (n)", " (b)", "(N)", "(B)"):
+        if val.endswith(suffix):
+            val = val[:-len(suffix)].strip()
+            break
+    # Handle scientific notation (e.g. 8.80185E+12)
+    if "e" in val.lower() and "+" in val:
+        try:
+            val = str(int(float(val)))
+        except (ValueError, OverflowError):
+            pass
+    # Strip dashes
+    val = val.replace("-", "")
+    # Handle country code +88 or 88 prefix
+    if val.startswith("+88"):
+        val = val[3:]
+    elif val.startswith("88") and len(val) >= 13:
+        val = val[2:]
+    # Prepend 0 if 10-digit
+    if len(val) == 10 and val.isdigit():
+        val = "0" + val
+    return val
 
 
 def _handle_escort_employee(cleaned: dict) -> tuple[dict | None, str | None]:
