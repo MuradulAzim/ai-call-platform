@@ -80,7 +80,8 @@ async def upload_csv(table: str, file: UploadFile = File(...)):
     - Empty numeric fields → 0
     - Empty text fields → NULL (stored as 'NUL' sentinel gets converted)
     - Transactions: auto-create missing employees (designation=Labor, status=Active)
-    - Escort programs: if escort employee not found by mobile, keep escort_mobile, set escort_employee_id=NULL
+    - Escort programs: SKIP row if escort_mobile not found in employees (returned in failures list)
+    - Escort programs: auto-derive status from end_date (date→Complete, blank/0→Running)
     """
     if table not in _IMPORTABLE_TABLES:
         raise HTTPException(400, f"Table '{table}' is not importable")
@@ -114,6 +115,7 @@ async def upload_csv(table: str, file: UploadFile = File(...)):
     inserted = 0
     skipped = 0
     errors = []
+    failures = []  # rows skipped due to business rules (not DB errors)
     auto_created_employees = []
 
     for row_num, raw_row in enumerate(reader, start=2):  # row 1 is header
@@ -131,7 +133,15 @@ async def upload_csv(table: str, file: UploadFile = File(...)):
 
             # Smart handling for escort programs
             if table == "wbom_escort_programs":
-                cleaned = _handle_escort_employee(cleaned)
+                cleaned, fail_reason = _handle_escort_employee(cleaned)
+                if fail_reason:
+                    # Collect the original row data for failure report
+                    failures.append({
+                        "row": row_num,
+                        "reason": fail_reason,
+                        "data": {k: v for k, v in raw_row.items() if v and v.strip()},
+                    })
+                    continue
 
             insert_row(table, cleaned)
             inserted += 1
@@ -154,6 +164,7 @@ async def upload_csv(table: str, file: UploadFile = File(...)):
             "inserted": inserted,
             "skipped": skipped,
             "errors": len(errors),
+            "failures": len(failures),
             "auto_created_employees": len(auto_created_employees),
         },
     )
@@ -165,6 +176,8 @@ async def upload_csv(table: str, file: UploadFile = File(...)):
         "skipped": skipped,
         "errors": errors[:20],  # return max 20 error details
         "total_errors": len(errors),
+        "failures": failures[:50],  # rows skipped by business rules
+        "total_failures": len(failures),
         "auto_created_employees": auto_created_employees,
     }
 
@@ -304,26 +317,38 @@ def _handle_transaction_employee(cleaned: dict) -> tuple[dict, Optional[dict]]:
     }
 
 
-def _handle_escort_employee(cleaned: dict) -> dict:
-    """For escort program imports: resolve escort_mobile to escort_employee_id."""
+def _handle_escort_employee(cleaned: dict) -> tuple[dict | None, str | None]:
+    """For escort program CSV imports:
+    - Resolve escort_mobile to escort_employee_id
+    - SKIP row if escort_mobile doesn't match any employee
+    - Auto-derive status from end_date (date→Complete, blank/0→Running)
+    Returns (cleaned_row, failure_reason). If failure_reason is set, row is skipped.
+    """
     escort_mobile = cleaned.get("escort_mobile")
-    if not escort_mobile:
-        return cleaned
 
-    escort_mobile = str(escort_mobile).strip()
-    if not escort_mobile or escort_mobile == "0":
-        cleaned.pop("escort_mobile", None)
-        return cleaned
+    # If escort_mobile is provided and non-empty, it MUST match an employee
+    if escort_mobile:
+        escort_mobile = str(escort_mobile).strip()
+        if escort_mobile and escort_mobile != "0":
+            found = execute_query(
+                "SELECT employee_id FROM wbom_employees WHERE employee_mobile = %s LIMIT 1",
+                (escort_mobile,),
+            )
+            if found:
+                cleaned["escort_employee_id"] = found[0]["employee_id"]
+            else:
+                return None, f"escort_mobile '{escort_mobile}' not found in employees"
+        else:
+            cleaned.pop("escort_mobile", None)
+    # If escort_mobile is empty/absent, no FK to set (both stay NULL)
 
-    # Try to find employee by mobile
-    found = execute_query(
-        "SELECT employee_id FROM wbom_employees WHERE employee_mobile = %s LIMIT 1",
-        (escort_mobile,),
-    )
-    if found:
-        cleaned["escort_employee_id"] = found[0]["employee_id"]
+    # Auto-derive status from end_date
+    end_date = cleaned.get("end_date")
+    if end_date and str(end_date).strip() not in ("", "0", "None"):
+        cleaned["status"] = "Complete"
     else:
-        # Keep escort_mobile as-is, set escort_employee_id to NULL
-        cleaned["escort_employee_id"] = None
+        cleaned["status"] = "Running"
+        # Remove end_date if it was 0 or empty so we don't insert bad value
+        cleaned.pop("end_date", None)
 
-    return cleaned
+    return cleaned, None

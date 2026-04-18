@@ -1952,10 +1952,13 @@ function CsvImportCard({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'err
     try {
       const res = await wbomService.uploadCsv(selectedTable, file);
       setResult(res);
-      if (res.total_errors === 0) {
+      if (res.total_errors === 0 && res.total_failures === 0) {
         showMsg(`Imported ${res.inserted} rows into ${selectedTable}`);
       } else {
-        showMsg(`Imported ${res.inserted} rows, ${res.total_errors} errors`, 'error');
+        const parts = [`Imported ${res.inserted} rows`];
+        if (res.total_failures > 0) parts.push(`${res.total_failures} failed (business rules)`);
+        if (res.total_errors > 0) parts.push(`${res.total_errors} errors`);
+        showMsg(parts.join(', '), 'error');
       }
     } catch {
       showMsg('CSV upload failed', 'error');
@@ -2061,6 +2064,11 @@ function CsvImportCard({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'err
               {result.skipped > 0 && (
                 <Badge variant="outline" className="text-sm px-3 py-1">Skipped: {result.skipped}</Badge>
               )}
+              {result.total_failures > 0 && (
+                <Badge variant="destructive" className="text-sm px-3 py-1">
+                  <AlertTriangle className="h-3.5 w-3.5 mr-1" /> Failed: {result.total_failures}
+                </Badge>
+              )}
               {result.total_errors > 0 && (
                 <Badge variant="destructive" className="text-sm px-3 py-1">
                   <AlertTriangle className="h-3.5 w-3.5 mr-1" /> Errors: {result.total_errors}
@@ -2075,6 +2083,25 @@ function CsvImportCard({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'err
                   {result.auto_created_employees.map(e => (
                     <div key={e.employee_id} className="text-xs text-muted-foreground">
                       #{e.employee_id} &mdash; {e.employee_mobile} ({e.employee_name})
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {result.failures.length > 0 && (
+              <div className="rounded-md border p-3 bg-orange-500/5 max-h-64 overflow-y-auto">
+                <div className="text-sm font-medium mb-1">Failed Rows &mdash; Not Imported ({result.total_failures})</div>
+                <div className="space-y-2">
+                  {result.failures.map((f, i) => (
+                    <div key={i} className="text-xs border-b border-orange-200/20 pb-1 last:border-0">
+                      <span className="font-medium text-orange-600">Row {f.row}:</span>{' '}
+                      <span className="text-muted-foreground">{f.reason}</span>
+                      {Object.keys(f.data).length > 0 && (
+                        <div className="mt-0.5 text-[10px] text-muted-foreground/70 font-mono">
+                          {Object.entries(f.data).map(([k, v]) => `${k}=${v}`).join(', ')}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

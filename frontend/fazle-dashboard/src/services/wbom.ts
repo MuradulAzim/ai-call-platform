@@ -218,6 +218,8 @@ export interface CsvImportResult {
   skipped: number;
   errors: { row: number; error: string }[];
   total_errors: number;
+  failures: { row: number; reason: string; data: Record<string, string> }[];
+  total_failures: number;
   auto_created_employees: { employee_id: number; employee_mobile: string; employee_name: string }[];
 }
 
