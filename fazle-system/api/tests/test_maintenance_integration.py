@@ -70,7 +70,7 @@ class TestTableDiscovery:
     def test_list_tables_contains_expected_tables(self):
         resp = client.get(f"{MAINTENANCE_BASE}/tables")
         table_names = {t["table_name"] for t in resp.json()["tables"]}
-        expected = {"fazle_admin_agents", "fazle_contacts", "fazle_users", "fazle_user_rules"}
+        expected = {"fazle_admin_agents", "wbom_contacts", "fazle_users", "fazle_user_rules"}
         assert expected.issubset(table_names), f"Missing: {expected - table_names}"
 
     def test_list_tables_excludes_blocked(self):

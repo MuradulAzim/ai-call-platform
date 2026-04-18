@@ -116,38 +116,8 @@ def ensure_tables():
                     UNIQUE(platform)
                 );
 
-                CREATE TABLE IF NOT EXISTS fazle_social_contacts (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    name VARCHAR(200) NOT NULL,
-                    platform VARCHAR(20) NOT NULL,
-                    identifier VARCHAR(200) NOT NULL,
-                    phone_number VARCHAR(50) DEFAULT '',
-                    profile_link TEXT DEFAULT '',
-                    metadata JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE(platform, identifier)
-                );
-                CREATE INDEX IF NOT EXISTS idx_social_contacts_platform
-                    ON fazle_social_contacts (platform);
-
-                CREATE TABLE IF NOT EXISTS fazle_social_messages (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    platform VARCHAR(20) NOT NULL,
-                    direction VARCHAR(10) NOT NULL,
-                    sender_id VARCHAR(200) DEFAULT '',
-                    contact_id UUID REFERENCES fazle_social_contacts(id) ON DELETE SET NULL,
-                    contact_identifier VARCHAR(200),
-                    message_text TEXT NOT NULL,
-                    ai_response TEXT DEFAULT '',
-                    content TEXT NOT NULL DEFAULT '',
-                    metadata JSONB DEFAULT '{}',
-                    status VARCHAR(20) DEFAULT 'sent',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_social_messages_platform
-                    ON fazle_social_messages (platform);
-                CREATE INDEX IF NOT EXISTS idx_social_messages_created
-                    ON fazle_social_messages (created_at DESC);
+                -- NOTE: fazle_social_contacts and fazle_social_messages removed
+                -- (consolidated into wbom_contacts and wbom_whatsapp_messages via migration 016)
 
                 CREATE TABLE IF NOT EXISTS fazle_social_scheduled (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -185,34 +155,8 @@ def ensure_tables():
                 CREATE INDEX IF NOT EXISTS idx_social_posts_platform
                     ON fazle_social_posts (platform, created_at DESC);
 
-                -- Contact book system
-                CREATE TABLE IF NOT EXISTS fazle_contacts (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    phone VARCHAR(50) NOT NULL,
-                    name VARCHAR(200) DEFAULT '',
-                    relation VARCHAR(100) DEFAULT 'unknown',
-                    notes TEXT DEFAULT '',
-                    company VARCHAR(300) DEFAULT '',
-                    personality_hint VARCHAR(200) DEFAULT '',
-                    platform VARCHAR(20) DEFAULT 'whatsapp',
-                    interaction_count INT DEFAULT 0,
-                    interest_level VARCHAR(20) DEFAULT 'unknown',
-                    last_seen TIMESTAMPTZ DEFAULT NOW(),
-                    last_updated TIMESTAMPTZ DEFAULT NOW(),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE(phone, platform)
-                );
-                CREATE INDEX IF NOT EXISTS idx_contacts_phone
-                    ON fazle_contacts (phone);
-
-                -- Migration: add columns if missing (idempotent)
-                DO $$ BEGIN
-                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS company VARCHAR(300) DEFAULT '';
-                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS personality_hint VARCHAR(200) DEFAULT '';
-                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS last_updated TIMESTAMPTZ DEFAULT NOW();
-                    ALTER TABLE fazle_contacts ADD COLUMN IF NOT EXISTS interest_level VARCHAR(20) DEFAULT 'unknown';
-                EXCEPTION WHEN OTHERS THEN NULL;
-                END $$;
+                -- NOTE: fazle_contacts removed
+                -- (consolidated into wbom_contacts via migration 016)
 
                 -- Chat reply reuse system (Steps 11, 12, 18, 19)
                 CREATE TABLE IF NOT EXISTS fazle_chat_replies (
@@ -299,22 +243,22 @@ def ensure_tables():
 def upsert_contact(db_conn_fn, phone: str, name: str = "", platform: str = "whatsapp",
                    relation: str = "unknown", notes: str = "",
                    company: str = "", personality_hint: str = "") -> None:
-    """Create or update a contact in the contact book."""
+    """Create or update a contact in the contact book (wbom_contacts)."""
     norm_phone = phone.lstrip("+").replace(" ", "").strip()
     with db_conn_fn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO fazle_contacts (phone, name, relation, platform, notes, company, personality_hint, interaction_count, last_seen, last_updated)
+                """INSERT INTO wbom_contacts (whatsapp_number, display_name, relation, platform, notes, company_name, personality_hint, interaction_count, last_seen, updated_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, 1, NOW(), NOW())
-                   ON CONFLICT (phone, platform) DO UPDATE SET
-                     name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name ELSE fazle_contacts.name END,
-                     relation = CASE WHEN EXCLUDED.relation != 'unknown' THEN EXCLUDED.relation ELSE fazle_contacts.relation END,
-                     notes = CASE WHEN EXCLUDED.notes != '' THEN EXCLUDED.notes ELSE fazle_contacts.notes END,
-                     company = CASE WHEN EXCLUDED.company != '' THEN EXCLUDED.company ELSE fazle_contacts.company END,
-                     personality_hint = CASE WHEN EXCLUDED.personality_hint != '' THEN EXCLUDED.personality_hint ELSE fazle_contacts.personality_hint END,
-                     interaction_count = fazle_contacts.interaction_count + 1,
+                   ON CONFLICT (whatsapp_number, platform) DO UPDATE SET
+                     display_name = CASE WHEN EXCLUDED.display_name != '' THEN EXCLUDED.display_name ELSE wbom_contacts.display_name END,
+                     relation = CASE WHEN EXCLUDED.relation != 'unknown' THEN EXCLUDED.relation ELSE wbom_contacts.relation END,
+                     notes = CASE WHEN EXCLUDED.notes != '' THEN EXCLUDED.notes ELSE wbom_contacts.notes END,
+                     company_name = CASE WHEN EXCLUDED.company_name != '' THEN EXCLUDED.company_name ELSE wbom_contacts.company_name END,
+                     personality_hint = CASE WHEN EXCLUDED.personality_hint != '' THEN EXCLUDED.personality_hint ELSE wbom_contacts.personality_hint END,
+                     interaction_count = wbom_contacts.interaction_count + 1,
                      last_seen = NOW(),
-                     last_updated = NOW()""",
+                     updated_at = NOW()""",
                 (norm_phone, name, relation, platform, notes, company, personality_hint),
             )
         conn.commit()
@@ -347,10 +291,11 @@ def get_contact(db_conn_fn, phone: str, platform: str = "whatsapp") -> dict | No
     with db_conn_fn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """SELECT phone, name, relation, notes, company, personality_hint,
-                          interaction_count, interest_level, last_seen, last_updated
-                   FROM fazle_contacts
-                   WHERE phone = %s AND platform = %s""",
+                """SELECT whatsapp_number AS phone, display_name AS name, relation, notes,
+                          company_name AS company, personality_hint,
+                          interaction_count, interest_level, last_seen, updated_at AS last_updated
+                   FROM wbom_contacts
+                   WHERE whatsapp_number = %s AND platform = %s""",
                 (norm_phone, platform),
             )
             row = cur.fetchone()
@@ -387,15 +332,16 @@ def list_all_contacts(db_conn_fn, platform: str | None = None, search: str = "",
                 where_parts.append("platform = %s")
                 params.append(platform)
             if search:
-                where_parts.append("(name ILIKE %s OR phone ILIKE %s OR relation ILIKE %s OR company ILIKE %s)")
+                where_parts.append("(display_name ILIKE %s OR whatsapp_number ILIKE %s OR relation ILIKE %s OR company_name ILIKE %s)")
                 like = f"%{search}%"
                 params.extend([like, like, like, like])
             where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
             params.extend([limit, offset])
             cur.execute(
-                f"""SELECT id, phone, name, relation, notes, company, personality_hint,
-                           platform, interaction_count, interest_level, last_seen, last_updated
-                    FROM fazle_contacts {where_clause}
+                f"""SELECT contact_id AS id, whatsapp_number AS phone, display_name AS name,
+                           relation, notes, company_name AS company, personality_hint,
+                           platform, interaction_count, interest_level, last_seen, updated_at AS last_updated
+                    FROM wbom_contacts {where_clause}
                     ORDER BY last_seen DESC NULLS LAST
                     LIMIT %s OFFSET %s""",
                 params,
@@ -409,12 +355,15 @@ def update_contact(db_conn_fn, contact_id: str, updates: dict) -> bool:
     fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
     if not fields:
         return False
-    set_clause = ", ".join(f"{k} = %s" for k in fields)
-    values = list(fields.values()) + [contact_id]
+    # Map legacy column names to WBOM names
+    col_map = {"name": "display_name", "company": "company_name"}
+    mapped = {col_map.get(k, k): v for k, v in fields.items()}
+    set_clause = ", ".join(f"{k} = %s" for k in mapped)
+    values = list(mapped.values()) + [contact_id]
     with db_conn_fn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"UPDATE fazle_contacts SET {set_clause}, last_updated = NOW() WHERE id = %s",
+                f"UPDATE wbom_contacts SET {set_clause}, updated_at = NOW() WHERE contact_id = %s::int",
                 values,
             )
         conn.commit()
@@ -425,7 +374,7 @@ def delete_contact(db_conn_fn, contact_id: str) -> bool:
     """Delete a contact by ID."""
     with db_conn_fn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM fazle_contacts WHERE id = %s", (contact_id,))
+            cur.execute("DELETE FROM wbom_contacts WHERE contact_id = %s::int", (contact_id,))
             deleted = cur.rowcount > 0
         conn.commit()
     return deleted
@@ -437,7 +386,7 @@ def update_contact_interest(db_conn_fn, phone: str, platform: str, interest: str
     with db_conn_fn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE fazle_contacts SET interest_level = %s, last_updated = NOW() WHERE phone = %s AND platform = %s",
+                "UPDATE wbom_contacts SET interest_level = %s, updated_at = NOW() WHERE whatsapp_number = %s AND platform = %s",
                 (interest, norm_phone, platform),
             )
         conn.commit()
@@ -884,7 +833,7 @@ async def integration_status():
                 )
                 row = cur.fetchone()
                 cur.execute(
-                    "SELECT MAX(created_at) as last_message FROM fazle_social_messages WHERE platform = %s",
+                    "SELECT MAX(received_at) as last_message FROM wbom_whatsapp_messages WHERE platform = %s",
                     (p,),
                 )
                 last_msg = cur.fetchone()
@@ -1012,10 +961,10 @@ async def whatsapp_send(body: dict):
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO fazle_social_messages
-                   (platform, direction, contact_identifier, message_text, content, metadata, status)
-                   VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s, 'queued')""",
-                (to, message, message, psycopg2.extras.Json(body.get("metadata", {}))),
+                """INSERT INTO wbom_whatsapp_messages
+                   (platform, direction, contact_identifier, message_body, metadata_json, status)
+                   VALUES ('whatsapp', 'outgoing', %s, %s, %s, 'queued')""",
+                (to, message, psycopg2.extras.Json(body.get("metadata", {}))),
             )
         conn.commit()
 
@@ -1085,10 +1034,11 @@ async def whatsapp_messages(limit: int = 50):
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """SELECT id, direction, contact_identifier, content, message_text, ai_response, status, created_at
-                   FROM fazle_social_messages
+                """SELECT message_id AS id, direction, contact_identifier, message_body AS content,
+                          message_body AS message_text, ai_response, status, received_at AS created_at
+                   FROM wbom_whatsapp_messages
                    WHERE platform = 'whatsapp'
-                   ORDER BY created_at DESC LIMIT %s""",
+                   ORDER BY received_at DESC LIMIT %s""",
                 (limit,),
             )
             messages = [dict(r) for r in cur.fetchall()]
@@ -1255,11 +1205,11 @@ async def list_contacts(platform: Optional[str] = None):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             if platform:
                 cur.execute(
-                    "SELECT * FROM fazle_social_contacts WHERE platform = %s ORDER BY name",
+                    "SELECT contact_id AS id, display_name AS name, platform, whatsapp_number AS identifier FROM wbom_contacts WHERE platform = %s ORDER BY display_name",
                     (platform,),
                 )
             else:
-                cur.execute("SELECT * FROM fazle_social_contacts ORDER BY name")
+                cur.execute("SELECT contact_id AS id, display_name AS name, platform, whatsapp_number AS identifier FROM wbom_contacts ORDER BY display_name")
             contacts = [dict(r) for r in cur.fetchall()]
             for c in contacts:
                 c["id"] = str(c["id"])
@@ -1281,14 +1231,12 @@ async def add_contact(body: dict):
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """INSERT INTO fazle_social_contacts
-                   (name, platform, identifier, phone_number, profile_link, metadata)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (platform, identifier) DO UPDATE SET name = EXCLUDED.name
-                   RETURNING id, name, platform, identifier""",
-                (name, platform, identifier,
-                 body.get("phone_number", ""), body.get("profile_link", ""),
-                 psycopg2.extras.Json(body.get("metadata", {}))),
+                """INSERT INTO wbom_contacts
+                   (display_name, platform, whatsapp_number, notes)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (whatsapp_number, platform) DO UPDATE SET display_name = EXCLUDED.display_name
+                   RETURNING contact_id AS id, display_name AS name, platform, whatsapp_number AS identifier""",
+                (name, platform, identifier, psycopg2.extras.Json(body.get("metadata", {}))),
             )
             conn.commit()
             contact = dict(cur.fetchone())
@@ -1306,7 +1254,7 @@ async def contact_lookup(phone: str, platform: str = "whatsapp"):
     return {"contact": contact}
 
 
-# ── Contact Book (fazle_contacts) — full management ───────
+# ── Contact Book (wbom_contacts) — full management ────────
 
 @app.get("/contacts/book")
 async def contacts_book_list(
@@ -1331,7 +1279,14 @@ async def contacts_book_get(contact_id: str):
     """Get a single contact by ID."""
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM fazle_contacts WHERE id = %s", (contact_id,))
+            cur.execute(
+                """SELECT contact_id AS id, whatsapp_number AS phone, display_name AS name,
+                          relation, notes, company_name AS company, personality_hint,
+                          platform, interaction_count, interest_level, last_seen, updated_at AS last_updated,
+                          created_at
+                   FROM wbom_contacts WHERE contact_id = %s::int""",
+                (contact_id,),
+            )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Contact not found")
@@ -1447,10 +1402,10 @@ async def social_stats():
     try:
         with _get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT COUNT(*) as total FROM fazle_social_contacts")
+                cur.execute("SELECT COUNT(*) as total FROM wbom_contacts")
                 total_contacts = cur.fetchone()["total"]
 
-                cur.execute("SELECT COUNT(*) as total FROM fazle_social_messages WHERE platform = 'whatsapp'")
+                cur.execute("SELECT COUNT(*) as total FROM wbom_whatsapp_messages WHERE platform = 'whatsapp'")
                 whatsapp_messages = cur.fetchone()["total"]
 
                 cur.execute("SELECT COUNT(*) as total FROM fazle_social_posts WHERE platform = 'facebook'")

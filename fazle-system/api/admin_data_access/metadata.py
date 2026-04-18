@@ -176,51 +176,34 @@ _register(TableMeta(
 # ─────────────────────────────────────────────────────────────
 
 _register(TableMeta(
-    table_name="fazle_contacts",
+    table_name="wbom_contacts",
     display_name="Contacts",
     group="contacts",
     access_mode=AccessMode.READ_WRITE,
+    primary_key="contact_id",
+    pk_type="serial",
     delete_policy=DeletePolicy.HARD_DELETE,
     audit_event_prefix="maintenance_contacts",
-    order_by="last_updated DESC",
-    description="Known contacts across platforms",
+    order_by="updated_at DESC",
+    description="Known contacts across platforms (consolidated WBOM)",
     columns=[
-        _id(),
-        _col("phone", "Phone", required=True, max_length=50, searchable=True),
-        _col("name", "Name", max_length=200, searchable=True),
+        _col("contact_id", "ID", "integer", immutable=True),
+        _col("whatsapp_number", "Phone", required=True, max_length=50, searchable=True),
+        _col("display_name", "Name", max_length=200, searchable=True),
         _col("relation", "Relation", max_length=100, default="unknown"),
         _col("notes", "Notes"),
-        _col("company", "Company", max_length=300, searchable=True),
+        _col("company_name", "Company", max_length=300, searchable=True),
         _col("personality_hint", "Personality Hint", max_length=200),
         _col("platform", "Platform", "enum", enum_values=["whatsapp", "facebook", "manual"], default="whatsapp"),
         _col("interaction_count", "Interactions", "integer"),
         _col("interest_level", "Interest", "enum", enum_values=["unknown", "low", "medium", "high"], default="unknown"),
         _col("last_seen", "Last Seen", "timestamp"),
-        _col("last_updated", "Last Updated", "timestamp"),
+        _col("updated_at", "Last Updated", "timestamp"),
         _ts("created_at", "Created"),
     ],
 ))
 
-_register(TableMeta(
-    table_name="fazle_social_contacts",
-    display_name="Social Contacts",
-    group="contacts",
-    access_mode=AccessMode.READ_WRITE,
-    delete_policy=DeletePolicy.HARD_DELETE,
-    audit_event_prefix="maintenance_social_contacts",
-    order_by="created_at DESC",
-    description="Social platform contact profiles",
-    columns=[
-        _id(),
-        _col("name", "Name", required=True, max_length=200, searchable=True),
-        _col("platform", "Platform", "enum", enum_values=["whatsapp", "facebook"], required=True),
-        _col("identifier", "Identifier", required=True, max_length=200, searchable=True),
-        _col("phone_number", "Phone", max_length=50),
-        _col("profile_link", "Profile Link"),
-        _col("metadata", "Metadata", "json"),
-        _ts("created_at", "Created"),
-    ],
-))
+# fazle_social_contacts removed — merged into wbom_contacts
 
 _register(TableMeta(
     table_name="fazle_leads",
@@ -460,7 +443,7 @@ BLOCKED_TABLES = frozenset([
     "fazle_social_integrations",       # contains app_secret, access_token
     "fazle_conversations",
     "fazle_messages",
-    "fazle_social_messages",
+    "wbom_whatsapp_messages",
     "fazle_owner_audio_profiles",
     "fazle_conversation_summaries",
     "fazle_multimodal_learning",

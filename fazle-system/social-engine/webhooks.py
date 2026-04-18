@@ -309,18 +309,18 @@ def _handle_owner_feedback(text: str, db_conn_fn, platform: str = "whatsapp") ->
         with db_conn_fn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """SELECT content FROM fazle_social_messages
+                    """SELECT message_body AS content FROM wbom_whatsapp_messages
                        WHERE platform = %s AND direction = 'outgoing'
-                       ORDER BY created_at DESC LIMIT 1""",
+                       ORDER BY received_at DESC LIMIT 1""",
                     (platform,),
                 )
                 row = cur.fetchone()
                 if row:
                     last_ai_reply = row["content"]
                 cur.execute(
-                    """SELECT content FROM fazle_social_messages
+                    """SELECT message_body AS content FROM wbom_whatsapp_messages
                        WHERE platform = %s AND direction = 'incoming'
-                       ORDER BY created_at DESC LIMIT 2""",
+                       ORDER BY received_at DESC LIMIT 2""",
                     (platform,),
                 )
                 rows = cur.fetchall()
@@ -415,10 +415,10 @@ async def _get_last_customer_message(db_conn_fn, platform: str, owner_phone: str
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 norm_owner = owner_phone.lstrip("+").strip()
                 cur.execute(
-                    """SELECT contact_identifier, content FROM fazle_social_messages
+                    """SELECT contact_identifier, message_body AS content FROM wbom_whatsapp_messages
                        WHERE platform = %s AND direction = 'incoming'
                          AND contact_identifier != %s
-                       ORDER BY created_at DESC LIMIT 1""",
+                       ORDER BY received_at DESC LIMIT 1""",
                     (platform, norm_owner),
                 )
                 return cur.fetchone()
@@ -503,11 +503,11 @@ async def _exec_read_messages(command: dict, db_conn_fn, owner_sender_id: str) -
         with db_conn_fn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """SELECT contact_identifier, content, created_at, direction
-                       FROM fazle_social_messages
+                    """SELECT contact_identifier, message_body AS content, received_at AS created_at, direction
+                       FROM wbom_whatsapp_messages
                        WHERE platform = 'whatsapp'
                          AND contact_identifier != %s
-                       ORDER BY created_at DESC LIMIT %s""",
+                       ORDER BY received_at DESC LIMIT %s""",
                     (norm_owner, count),
                 )
                 rows = cur.fetchall()
@@ -585,8 +585,8 @@ async def _exec_send_to(
         with db_conn_fn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO fazle_social_messages
-                       (platform, direction, contact_identifier, content, metadata, status)
+                    """INSERT INTO wbom_whatsapp_messages
+                       (platform, direction, contact_identifier, message_body, metadata_json, status)
                        VALUES ('whatsapp', 'outgoing', %s, %s, %s, 'sent')""",
                     (target_phone, generated,
                      psycopg2.extras.Json({
@@ -681,8 +681,8 @@ async def handle_whatsapp_webhook(
         with db_conn_fn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO fazle_social_messages
-                       (platform, direction, contact_identifier, content, metadata, status)
+                    """INSERT INTO wbom_whatsapp_messages
+                       (platform, direction, contact_identifier, message_body, metadata_json, status)
                        VALUES ('whatsapp', 'incoming', %s, %s, %s, 'received')""",
                     (msg["sender_id"], db_content,
                      psycopg2.extras.Json({
@@ -693,9 +693,9 @@ async def handle_whatsapp_webhook(
                 )
                 # Upsert contact
                 cur.execute(
-                    """INSERT INTO fazle_social_contacts (name, platform, identifier, metadata)
+                    """INSERT INTO wbom_contacts (display_name, platform, whatsapp_number, notes)
                        VALUES (%s, 'whatsapp', %s, '{}')
-                       ON CONFLICT (platform, identifier) DO UPDATE SET name = EXCLUDED.name""",
+                       ON CONFLICT (whatsapp_number, platform) DO UPDATE SET display_name = EXCLUDED.display_name""",
                     (msg["sender_name"] or msg["sender_id"], msg["sender_id"]),
                 )
             conn.commit()
@@ -844,8 +844,8 @@ async def handle_whatsapp_webhook(
                     with db_conn_fn() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
-                                """INSERT INTO fazle_social_messages
-                                   (platform, direction, contact_identifier, content, metadata, status)
+                                """INSERT INTO wbom_whatsapp_messages
+                                   (platform, direction, contact_identifier, message_body, metadata_json, status)
                                    VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s)""",
                                 (msg["sender_id"], multimodal_reply,
                                  psycopg2.extras.Json({"is_owner_reply": True, "media_type": msg_type}),
@@ -880,8 +880,8 @@ async def handle_whatsapp_webhook(
                         with db_conn_fn() as conn:
                             with conn.cursor() as cur:
                                 cur.execute(
-                                    """INSERT INTO fazle_social_messages
-                                       (platform, direction, contact_identifier, content, metadata, status)
+                                    """INSERT INTO wbom_whatsapp_messages
+                                       (platform, direction, contact_identifier, message_body, metadata_json, status)
                                        VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s)""",
                                     (msg["sender_id"], multimodal_reply,
                                      psycopg2.extras.Json({
@@ -898,8 +898,8 @@ async def handle_whatsapp_webhook(
                         with db_conn_fn() as conn:
                             with conn.cursor() as cur:
                                 cur.execute(
-                                    """INSERT INTO fazle_social_messages
-                                       (platform, direction, contact_identifier, content, metadata, status)
+                                    """INSERT INTO wbom_whatsapp_messages
+                                       (platform, direction, contact_identifier, message_body, metadata_json, status)
                                        VALUES ('whatsapp', 'outgoing', %s, %s, %s, 'draft')""",
                                     (msg["sender_id"], multimodal_reply,
                                      psycopg2.extras.Json({
@@ -968,10 +968,10 @@ async def handle_whatsapp_webhook(
                     with db_conn_fn() as conn:
                         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                             cur.execute(
-                                """SELECT id, contact_identifier, content, metadata FROM fazle_social_messages
+                                """SELECT message_id AS id, contact_identifier, message_body AS content, metadata_json AS metadata FROM wbom_whatsapp_messages
                                    WHERE platform = 'whatsapp' AND direction = 'outgoing'
-                                     AND status = 'draft' AND metadata->>'awaiting_approval' = 'true'
-                                   ORDER BY created_at DESC LIMIT 1"""
+                                     AND status = 'draft' AND metadata_json->>'awaiting_approval' = 'true'
+                                   ORDER BY received_at DESC LIMIT 1"""
                             )
                             draft = cur.fetchone()
                     if draft:
@@ -988,7 +988,7 @@ async def handle_whatsapp_webhook(
                             with db_conn_fn() as conn:
                                 with conn.cursor() as cur:
                                     cur.execute(
-                                        "UPDATE fazle_social_messages SET status = %s WHERE id = %s",
+                                        "UPDATE wbom_whatsapp_messages SET status = %s WHERE message_id = %s",
                                         ("sent" if result.get("sent") else "failed", draft["id"]),
                                     )
                                 conn.commit()
@@ -1057,8 +1057,8 @@ async def handle_whatsapp_webhook(
                     with db_conn_fn() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
-                                """INSERT INTO fazle_social_messages
-                                   (platform, direction, contact_identifier, content, metadata, status)
+                                """INSERT INTO wbom_whatsapp_messages
+                                   (platform, direction, contact_identifier, message_body, metadata_json, status)
                                    VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s)""",
                                 (msg["sender_id"], owner_reply,
                                  psycopg2.extras.Json({"is_owner_reply": True}),
@@ -1166,8 +1166,8 @@ async def handle_whatsapp_webhook(
                 with db_conn_fn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            """INSERT INTO fazle_social_messages
-                               (platform, direction, contact_identifier, content, metadata, status)
+                            """INSERT INTO wbom_whatsapp_messages
+                               (platform, direction, contact_identifier, message_body, metadata_json, status)
                                VALUES ('whatsapp', 'outgoing', %s, %s, %s, %s)""",
                             (msg["sender_id"], ai_reply,
                              psycopg2.extras.Json({
@@ -1186,8 +1186,8 @@ async def handle_whatsapp_webhook(
                 with db_conn_fn() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            """INSERT INTO fazle_social_messages
-                               (platform, direction, contact_identifier, content, metadata, status)
+                            """INSERT INTO wbom_whatsapp_messages
+                               (platform, direction, contact_identifier, message_body, metadata_json, status)
                                VALUES ('whatsapp', 'outgoing', %s, %s, %s, 'draft')""",
                             (msg["sender_id"], ai_reply,
                              psycopg2.extras.Json({
@@ -1275,8 +1275,8 @@ async def handle_facebook_webhook(
             with db_conn_fn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """INSERT INTO fazle_social_messages
-                           (platform, direction, contact_identifier, content, metadata, status)
+                        """INSERT INTO wbom_whatsapp_messages
+                           (platform, direction, contact_identifier, message_body, metadata_json, status)
                            VALUES ('facebook', 'incoming', %s, %s, %s, 'received')""",
                         (event["sender_id"], event["message"],
                          psycopg2.extras.Json({"sender_name": event["sender_name"], "post_id": event["post_id"]})),
@@ -1305,8 +1305,8 @@ async def handle_facebook_webhook(
                         with db_conn_fn() as conn:
                             with conn.cursor() as cur:
                                 cur.execute(
-                                    """INSERT INTO fazle_social_messages
-                                       (platform, direction, contact_identifier, content, status)
+                                    """INSERT INTO wbom_whatsapp_messages
+                                       (platform, direction, contact_identifier, message_body, status)
                                        VALUES ('facebook', 'outgoing', %s, %s, %s)""",
                                     (event["sender_id"], ai_reply, "sent" if result.get("sent") else "failed"),
                                 )

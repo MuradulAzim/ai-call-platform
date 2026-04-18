@@ -139,6 +139,19 @@ def ensure_wbom_tables():
     except Exception as e:
         logger.warning("Migration 015 failed (may already be applied): %s", e)
 
+    # 016: Full DB consolidation (merge legacy tables into WBOM)
+    try:
+        import pathlib
+        _mig_016 = pathlib.Path(__file__).parent / "migrations" / "016_db_consolidation.sql"
+        if _mig_016.exists():
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(_mig_016.read_text())
+                conn.commit()
+            logger.info("Applied migration 016_db_consolidation")
+    except Exception as e:
+        logger.warning("Migration 016 failed (may already be applied): %s", e)
+
 
 # ── Audit helper ─────────────────────────────────────────────
 

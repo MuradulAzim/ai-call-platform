@@ -31,21 +31,21 @@ def who_messaged(
     """List recent incoming messages with sender info."""
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     sql = """
-        SELECT sm.id, sm.platform, sm.direction, sm.contact_identifier,
-               sm.content, sm.metadata, sm.status,
-               sm.created_at::text,
-               sc.name AS sender_name, sm.contact_identifier AS phone_number
-        FROM fazle_social_messages sm
-        LEFT JOIN fazle_social_contacts sc
-            ON sc.identifier = sm.contact_identifier AND sc.platform = sm.platform
-        WHERE sm.direction = 'incoming'
-          AND sm.created_at >= %s
+        SELECT wm.message_id AS id, wm.platform, wm.direction, wm.contact_identifier,
+               wm.message_body AS content, wm.metadata_json AS metadata, wm.status,
+               wm.received_at::text AS created_at,
+               wc.display_name AS sender_name, wm.contact_identifier AS phone_number
+        FROM wbom_whatsapp_messages wm
+        LEFT JOIN wbom_contacts wc
+            ON wc.whatsapp_number = wm.contact_identifier AND wc.platform = wm.platform
+        WHERE wm.direction = 'incoming'
+          AND wm.received_at >= %s
     """
     params: list = [cutoff]
     if platform:
-        sql += " AND sm.platform = %s"
+        sql += " AND wm.platform = %s"
         params.append(platform)
-    sql += " ORDER BY sm.created_at DESC LIMIT %s"
+    sql += " ORDER BY wm.received_at DESC LIMIT %s"
     params.append(limit)
 
     try:
@@ -79,17 +79,17 @@ def unique_senders(
     """Count unique senders in the last N hours."""
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     sql = """
-        SELECT sm.platform, sm.contact_identifier,
-               sc.name AS sender_name, sm.contact_identifier AS phone_number,
+        SELECT wm.platform, wm.contact_identifier,
+               wc.display_name AS sender_name, wm.contact_identifier AS phone_number,
                COUNT(*) AS message_count,
-               MAX(sm.created_at)::text AS last_message_at
-        FROM fazle_social_messages sm
-        LEFT JOIN fazle_social_contacts sc
-            ON sc.identifier = sm.contact_identifier AND sc.platform = sm.platform
-        WHERE sm.direction = 'incoming'
-          AND sm.created_at >= %s
-        GROUP BY sm.platform, sm.contact_identifier, sc.name
-        ORDER BY MAX(sm.created_at) DESC
+               MAX(wm.received_at)::text AS last_message_at
+        FROM wbom_whatsapp_messages wm
+        LEFT JOIN wbom_contacts wc
+            ON wc.whatsapp_number = wm.contact_identifier AND wc.platform = wm.platform
+        WHERE wm.direction = 'incoming'
+          AND wm.received_at >= %s
+        GROUP BY wm.platform, wm.contact_identifier, wc.display_name
+        ORDER BY MAX(wm.received_at) DESC
     """
     try:
         with _get_conn() as conn:
@@ -172,10 +172,11 @@ def list_contacts(
 ):
     """List contacts from the contact book with optional filters."""
     sql = """
-        SELECT id, phone, name, relation, notes, company,
+        SELECT contact_id AS id, whatsapp_number AS phone, display_name AS name,
+               relation, notes, company_name AS company,
                personality_hint, platform, interaction_count,
                interest_level, last_seen::text, created_at::text
-        FROM fazle_contacts WHERE 1=1
+        FROM wbom_contacts WHERE 1=1
     """
     params: list = []
     if relation:
@@ -230,8 +231,8 @@ def daily_report(
                 try:
                     cur.execute("""
                         SELECT direction, COUNT(*) AS count
-                        FROM fazle_social_messages
-                        WHERE created_at >= %s AND created_at < %s
+                        FROM wbom_whatsapp_messages
+                        WHERE received_at >= %s AND received_at < %s
                         GROUP BY direction
                     """, (day_start, day_end))
                     msg_rows = cur.fetchall()
@@ -247,9 +248,9 @@ def daily_report(
                 try:
                     cur.execute("""
                         SELECT COUNT(DISTINCT contact_identifier) AS unique_senders
-                        FROM fazle_social_messages
+                        FROM wbom_whatsapp_messages
                         WHERE direction = 'incoming'
-                          AND created_at >= %s AND created_at < %s
+                          AND received_at >= %s AND received_at < %s
                     """, (day_start, day_end))
                     report["unique_senders"] = cur.fetchone()["unique_senders"]
                 except psycopg2.errors.UndefinedTable:
@@ -277,7 +278,7 @@ def daily_report(
                 try:
                     cur.execute("""
                         SELECT COUNT(*) AS new_contacts
-                        FROM fazle_contacts
+                        FROM wbom_contacts
                         WHERE created_at >= %s AND created_at < %s
                     """, (day_start, day_end))
                     report["new_contacts"] = cur.fetchone()["new_contacts"]
