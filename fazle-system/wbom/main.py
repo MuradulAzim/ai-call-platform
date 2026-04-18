@@ -34,6 +34,7 @@ from routes.clients import router as clients_router
 from routes.audit import router as audit_router
 from routes.schema import router as schema_router
 from routes.master_routes import router as master_router
+from routes.csv_import import router as csv_import_router
 
 # ---- logging ------------------------------------------------
 from structured_log import setup_structured_logging
@@ -134,6 +135,7 @@ app.include_router(clients_router, prefix="/api/wbom")
 app.include_router(audit_router, prefix="/api/wbom")
 app.include_router(schema_router, prefix="/api/wbom")
 app.include_router(master_router, prefix="/api/wbom")
+app.include_router(csv_import_router, prefix="/api/wbom")
 
 
 # ---- health --------------------------------------------------

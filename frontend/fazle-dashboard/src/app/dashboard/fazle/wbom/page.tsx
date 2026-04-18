@@ -24,6 +24,9 @@ import {
   type AdminCommandResult,
   type SearchSuggestion,
   type FullSearchResult,
+  type CsvImportTable,
+  type CsvImportColumn,
+  type CsvImportResult,
 } from '@/services/wbom';
 import {
   Search,
@@ -54,6 +57,9 @@ import {
   ClipboardList,
   DollarSign,
   MessageSquare,
+  Upload,
+  FileSpreadsheet,
+  AlertTriangle,
 } from 'lucide-react';
 
 // â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1902,7 +1908,195 @@ function AdminTab({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'error') 
           </div>
         </CardContent>
       </Card>
+
+      {/* CSV Import */}
+      <CsvImportCard showMsg={showMsg} />
     </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// CSV IMPORT CARD
+// ═══════════════════════════════════════════════════════════════
+function CsvImportCard({ showMsg }: { showMsg: (t: string, tp?: 'success' | 'error') => void }) {
+  const [tables, setTables] = React.useState<CsvImportTable[]>([]);
+  const [selectedTable, setSelectedTable] = React.useState('');
+  const [columns, setColumns] = React.useState<CsvImportColumn[]>([]);
+  const [columnsLoading, setColumnsLoading] = React.useState(false);
+  const [file, setFile] = React.useState<File | null>(null);
+  const [uploading, setUploading] = React.useState(false);
+  const [result, setResult] = React.useState<CsvImportResult | null>(null);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+
+  // Load tables on mount
+  React.useEffect(() => {
+    wbomService.getImportableTables().then(res => setTables(res.tables)).catch(() => {});
+  }, []);
+
+  // Load columns when table changes
+  React.useEffect(() => {
+    if (!selectedTable) { setColumns([]); return; }
+    setColumnsLoading(true);
+    setResult(null);
+    wbomService.getTableColumns(selectedTable)
+      .then(res => setColumns(res.columns))
+      .catch(() => showMsg('Failed to load columns', 'error'))
+      .finally(() => setColumnsLoading(false));
+  }, [selectedTable]);
+
+  const handleUpload = async () => {
+    if (!selectedTable || !file) return;
+    setUploading(true);
+    setResult(null);
+    try {
+      const res = await wbomService.uploadCsv(selectedTable, file);
+      setResult(res);
+      if (res.total_errors === 0) {
+        showMsg(`Imported ${res.inserted} rows into ${selectedTable}`);
+      } else {
+        showMsg(`Imported ${res.inserted} rows, ${res.total_errors} errors`, 'error');
+      }
+    } catch {
+      showMsg('CSV upload failed', 'error');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const resetForm = () => {
+    setFile(null);
+    setResult(null);
+    if (fileRef.current) fileRef.current.value = '';
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <FileSpreadsheet className="h-5 w-5" /> CSV Import
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Table selection */}
+        <div className="space-y-2">
+          <Label>Select Table</Label>
+          <select
+            className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+            value={selectedTable}
+            onChange={e => { setSelectedTable(e.target.value); resetForm(); }}
+          >
+            <option value="">-- Choose a table --</option>
+            {tables.map(t => (
+              <option key={t.table} value={t.table}>{t.label} ({t.table})</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Column info */}
+        {selectedTable && columns.length > 0 && (
+          <div className="space-y-2">
+            <Label className="text-sm text-muted-foreground">Expected CSV Columns</Label>
+            <div className="rounded-md border overflow-hidden max-h-64 overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b bg-muted/50">
+                    <th className="px-3 py-1.5 text-left font-medium">Column</th>
+                    <th className="px-3 py-1.5 text-left font-medium">Type</th>
+                    <th className="px-3 py-1.5 text-left font-medium">Nullable</th>
+                    <th className="px-3 py-1.5 text-left font-medium">Auto</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {columns.map(c => (
+                    <tr key={c.column} className={`border-b last:border-0 ${c.skip ? 'opacity-40' : ''}`}>
+                      <td className="px-3 py-1.5 font-mono">{c.column}</td>
+                      <td className="px-3 py-1.5 text-muted-foreground">{c.type}</td>
+                      <td className="px-3 py-1.5">{c.nullable ? 'Yes' : 'No'}</td>
+                      <td className="px-3 py-1.5">{c.skip ? <Badge variant="secondary" className="text-[10px]">skip</Badge> : ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Columns marked &ldquo;skip&rdquo; (PK, timestamps) are auto-generated. Empty numbers &rarr; 0, empty text &rarr; NULL.
+            </p>
+          </div>
+        )}
+
+        {columnsLoading && (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading columns...
+          </div>
+        )}
+
+        {/* File upload */}
+        {selectedTable && (
+          <div className="space-y-2">
+            <Label>CSV File</Label>
+            <div className="flex gap-2">
+              <Input
+                ref={fileRef}
+                type="file"
+                accept=".csv"
+                className="flex-1"
+                onChange={e => setFile(e.target.files?.[0] || null)}
+              />
+              <Button onClick={handleUpload} disabled={!file || uploading}>
+                {uploading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Upload className="h-4 w-4 mr-2" />}
+                Upload
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Results */}
+        {result && (
+          <div className="space-y-3">
+            <div className="flex gap-3 flex-wrap">
+              <Badge variant="secondary" className="text-sm px-3 py-1">
+                <CheckCircle2 className="h-3.5 w-3.5 mr-1" /> Inserted: {result.inserted}
+              </Badge>
+              {result.skipped > 0 && (
+                <Badge variant="outline" className="text-sm px-3 py-1">Skipped: {result.skipped}</Badge>
+              )}
+              {result.total_errors > 0 && (
+                <Badge variant="destructive" className="text-sm px-3 py-1">
+                  <AlertTriangle className="h-3.5 w-3.5 mr-1" /> Errors: {result.total_errors}
+                </Badge>
+              )}
+            </div>
+
+            {result.auto_created_employees.length > 0 && (
+              <div className="rounded-md border p-3 bg-blue-500/5">
+                <div className="text-sm font-medium mb-1">Auto-created Employees ({result.auto_created_employees.length})</div>
+                <div className="space-y-1">
+                  {result.auto_created_employees.map(e => (
+                    <div key={e.employee_id} className="text-xs text-muted-foreground">
+                      #{e.employee_id} &mdash; {e.employee_mobile} ({e.employee_name})
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {result.errors.length > 0 && (
+              <div className="rounded-md border p-3 bg-red-500/5 max-h-48 overflow-y-auto">
+                <div className="text-sm font-medium mb-1">Errors</div>
+                <div className="space-y-1">
+                  {result.errors.map((e, i) => (
+                    <div key={i} className="text-xs text-muted-foreground">
+                      Row {e.row}: {e.error}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

@@ -1,4 +1,4 @@
-import { apiGet, apiPost, apiPut, apiDelete } from './api';
+import { apiGet, apiPost, apiPut, apiDelete, apiUpload } from './api';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -192,6 +192,34 @@ export interface FuzzySearchResult {
 
 // The WBOM API base path (proxied through Next.js rewrite → nginx → WBOM:9900)
 const W = '/wbom';
+
+// ── CSV Import types ─────────────────────────────────────────
+
+export interface CsvImportTable {
+  table: string;
+  pk: string;
+  label: string;
+}
+
+export interface CsvImportColumn {
+  column: string;
+  type: string;
+  nullable: boolean;
+  has_default: boolean;
+  max_length: number | null;
+  is_pk: boolean;
+  skip: boolean;
+}
+
+export interface CsvImportResult {
+  table: string;
+  filename: string;
+  inserted: number;
+  skipped: number;
+  errors: { row: number; error: string }[];
+  total_errors: number;
+  auto_created_employees: { employee_id: number; employee_mobile: string; employee_name: string }[];
+}
 
 // ── Master Contact types ─────────────────────────────────────
 
@@ -437,4 +465,12 @@ export const wbomService = {
   // ── Unified Search ──
   unifiedSearch: (query: string, limit = 20) =>
     apiGet<UnifiedSearchResult>(`${W}/master/search?q=${encodeURIComponent(query)}&limit=${limit}`),
+
+  // ── CSV Import ──
+  getImportableTables: () =>
+    apiGet<{ tables: CsvImportTable[] }>(`${W}/csv-import/tables`),
+  getTableColumns: (table: string) =>
+    apiGet<{ table: string; columns: CsvImportColumn[] }>(`${W}/csv-import/tables/${table}/columns`),
+  uploadCsv: (table: string, file: File) =>
+    apiUpload<CsvImportResult>(`${W}/csv-import/tables/${table}/upload`, file),
 };
