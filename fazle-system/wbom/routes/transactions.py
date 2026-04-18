@@ -8,8 +8,6 @@ from datetime import date
 
 from database import insert_row, insert_row_dedup, get_row, delete_row, list_rows, execute_query, audit_log
 from models import TransactionCreate, TransactionResponse
-from response import api_response, api_single
-from openapi_models import TransactionListResponse, SingleEnvelope
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -35,7 +33,7 @@ def create_transaction(data: TransactionCreate):
               entity_type="transaction", entity_id=row.get("transaction_id"),
               payload={"amount": str(data.amount), "type": data.transaction_type,
                        "employee_id": data.employee_id, "source": data.source})
-    return api_single(row, entity="transactions")
+    return row
 
 
 @router.get("/count")
@@ -101,7 +99,7 @@ def transactions_by_employee(employee_id: int, limit: int = Query(50, le=200)):
         "WHERE t.employee_id = %s ORDER BY t.transaction_date DESC, t.transaction_time DESC LIMIT %s",
         (employee_id, limit),
     )
-    return api_response(rows, entity="transactions")
+    return rows
 
 
 @router.get("/{transaction_id}")
@@ -109,7 +107,7 @@ def get_transaction(transaction_id: int):
     row = get_row("wbom_cash_transactions", "transaction_id", transaction_id)
     if not row:
         raise HTTPException(404, "Transaction not found")
-    return api_single(row, entity="transactions")
+    return row
 
 
 @router.put("/{transaction_id}")
@@ -146,7 +144,7 @@ def remove_transaction(transaction_id: int):
     return {"deleted": True}
 
 
-@router.get("", response_model=TransactionListResponse)
+@router.get("")
 def list_transactions(
     transaction_type: Optional[str] = None,
     payment_method: Optional[str] = None,
@@ -194,4 +192,4 @@ def list_transactions(
         tuple(count_params),
     )
     total = total_rows[0]["total"] if total_rows else len(rows)
-    return api_response(rows, entity="transactions", total=total)
+    return rows

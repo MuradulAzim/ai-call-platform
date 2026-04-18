@@ -7,8 +7,6 @@ from typing import Optional
 
 from database import insert_row, get_row, update_row, delete_row, list_rows, search_rows, execute_query, count_rows
 from models import EmployeeCreate, EmployeeUpdate, EmployeeResponse
-from response import api_response, api_single
-from openapi_models import EmployeeListResponse, SingleEnvelope
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -16,7 +14,7 @@ router = APIRouter(prefix="/employees", tags=["employees"])
 @router.post("", status_code=201)
 def create_employee(data: EmployeeCreate):
     row = insert_row("wbom_employees", data.model_dump(exclude_none=True))
-    return api_single(row, entity="employees")
+    return row
 
 
 @router.get("/count")
@@ -52,7 +50,7 @@ def search_employees(query: str, limit: int = Query(20, le=100)):
         if row["employee_id"] not in seen:
             seen.add(row["employee_id"])
             results.append(row)
-    return api_response(results[:limit], entity="employees")
+    return results[:limit]
 
 
 @router.get("/by-mobile/{mobile}")
@@ -60,7 +58,7 @@ def get_by_mobile(mobile: str):
     rows = search_rows("wbom_employees", "employee_mobile", mobile, 1)
     if not rows:
         raise HTTPException(404, "Employee not found")
-    return api_single(rows[0], entity="employees")
+    return rows[0]
 
 
 @router.get("/{employee_id}")
@@ -68,7 +66,7 @@ def get_employee(employee_id: int):
     row = get_row("wbom_employees", "employee_id", employee_id)
     if not row:
         raise HTTPException(404, "Employee not found")
-    return api_single(row, entity="employees")
+    return row
 
 
 @router.get("/{employee_id}/detail")
@@ -104,7 +102,7 @@ def update_employee(employee_id: int, data: EmployeeUpdate):
     row = update_row("wbom_employees", "employee_id", employee_id, fields)
     if not row:
         raise HTTPException(404, "Employee not found")
-    return api_single(row, entity="employees")
+    return row
 
 
 @router.delete("/{employee_id}")
@@ -114,7 +112,7 @@ def remove_employee(employee_id: int):
     return {"deleted": True}
 
 
-@router.get("", response_model=EmployeeListResponse)
+@router.get("")
 def list_employees(
     status: Optional[str] = None,
     designation: Optional[str] = None,
@@ -136,8 +134,7 @@ def list_employees(
         sql = f"SELECT * FROM wbom_employees {where} ORDER BY employee_name LIMIT %s OFFSET %s"
         params.extend([limit, offset])
         rows = execute_query(sql, tuple(params))
-        total = count_rows("wbom_employees")
-        return api_response(rows, entity="employees", total=total)
+        return rows
 
     filters = {}
     if status:
@@ -145,5 +142,4 @@ def list_employees(
     if designation:
         filters["designation"] = designation
     rows = list_rows("wbom_employees", filters, "employee_name", limit, offset)
-    total = count_rows("wbom_employees", filters if filters else None)
-    return api_response(rows, entity="employees", total=total)
+    return rows
