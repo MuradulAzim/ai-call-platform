@@ -199,8 +199,8 @@ As of 2026-04-11, the platform runs **Ollama-first** with automatic OpenAI fallb
              │  └────┬────┘       │      Ollama│→OpenAI  │
              │       │       ┌────▼───┐  ┌─────▼──────┐ │
              │  ┌────▼────┐  │Trainer │  │  Queue     │ │
-             │  │ Tasks   │  │ :8600  │  │  :8810     │ │
-             │  │ :8400   │  └────────┘  └────┬───────┘ │
+             │  │ Tasks*  │  │ :8600  │  │  :8810     │ │
+             │  │ :8100   │  └────────┘  └────┬───────┘ │
              │  └─────────┘                   │         │
              │                          ┌─────▼───────┐ │
              │  ┌──────────┐ ┌────────┐ │  Workers    │ │
@@ -284,7 +284,7 @@ All Fazle services — core intelligence, Phase-5 autonomous services, and suppo
 | fazle-api | 8100 | API Gateway — routing, JWT auth, rate limiting, Phase-5 proxy |
 | fazle-brain | 8200 | Multi-agent reasoning — 9+ agents, Ollama-first via gateway |
 | fazle-memory | 8300 | Vector memory — Qdrant semantic search, OpenAI embeddings |
-| fazle-task-engine | 8400 | Scheduler — reminders, recurring tasks (APScheduler) |
+| fazle-tasks (merged in API) | 8100 | Scheduler/task endpoints now hosted by fazle-api |
 | fazle-web-intelligence | 8500 | Web search & scraping (Serper API, BeautifulSoup) |
 | fazle-trainer | 8600 | ML training — preference extraction, fine-tuning |
 | fazle-voice | 8700 | _(DISABLED)_ Voice processing — LiveKit STT/TTS, accent modulation |
@@ -407,7 +407,7 @@ Layer 5  Extended Services
            ├── Workflow Engine (:9700) — multi-step automation
            ├── Guardrail Engine (:9600) — content safety
            ├── Learning Engine (:8900) — conversation analysis
-           ├── Tasks (:8400), Web Intelligence (:8500), Trainer (:8600)
+           ├── Tasks (merged in API :8100), Web Intelligence (:8500), Trainer (:8600)
            └── Queue (:8810) + Workers ×2 (:8820)
            │
 Layer 6  Autonomous AI

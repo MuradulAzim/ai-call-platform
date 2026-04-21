@@ -3,7 +3,7 @@
 # Orchestrates AI reasoning, memory retrieval, tool selection,
 # and instruction generation for Dograh voice platform
 # ============================================================
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -14,9 +14,16 @@ import json
 import logging
 import uuid
 import asyncio
-from typing import Optional
+from typing import Optional, Any
 import os
 from datetime import datetime
+import hashlib
+import time
+from collections import defaultdict
+from enum import Enum
+
+import psycopg2
+import redis
 from memory_manager import conversation_get, conversation_set
 from context_builder import build_knowledge_context, build_smart_context, detect_intents, normalize_text, KNOWLEDGE_FALLBACK_BN, get_cached_context, set_cached_context
 from prompt_router import build_route_prompt, get_route_flags
@@ -92,16 +99,25 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o"
     ollama_model: str = "llama3.1"
     memory_url: str = "http://fazle-memory:8300"
-    tools_url: str = "http://fazle-web-intelligence:8500"
-    task_url: str = "http://fazle-task-engine:8400"
-    llm_gateway_url: str = "http://fazle-llm-gateway:8800"
+    tools_url: str = "http://fazle-tool-engine:9200"
+    task_url: str = "http://fazle-api:8100"
+    llm_gateway_url: str = "http://fazle-brain:8200"
+    llm_cache_redis_url: str = "redis://redis:6379/3"
     learning_engine_url: str = "http://fazle-learning-engine:8900"
     autonomy_engine_url: str = "http://fazle-autonomy-engine:9100"
     tool_engine_url: str = "http://fazle-tool-engine:9200"
-    knowledge_graph_url: str = "http://fazle-knowledge-graph:9300"
-    autonomous_runner_url: str = "http://fazle-autonomous-runner:9400"
+    knowledge_graph_url: str = "http://fazle-brain:8200"
+    autonomous_runner_url: str = "http://fazle-autonomy-engine:9100"
     self_learning_url: str = "http://fazle-self-learning:9500"
     use_llm_gateway: bool = False
+    fallback_provider: str = "openai"
+    fallback_model: str = "gpt-4o"
+    ollama_timeout: int = 30
+    cache_ttl: int = 300
+    llm_rate_limit_rpm: int = 60
+    ollama_simple_model: str = "qwen2.5:0.5b"
+    ollama_complex_model: str = "qwen2.5:1.5b"
+    ollama_num_ctx: int = 2048
     # Voice fast mode: bypass gateway, use Ollama, reduce top_k, skip batching
     voice_fast_mode: bool = False
     voice_ollama_model: str = "qwen2.5:0.5b"
@@ -124,6 +140,216 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+_llm_cache_redis: Optional[redis.Redis] = None
+_llm_rate_window: dict[str, list[float]] = {}
+_DB_INIT_DONE = False
+
+
+def _get_llm_cache_redis() -> redis.Redis:
+    global _llm_cache_redis
+    if _llm_cache_redis is None:
+        _llm_cache_redis = redis.Redis.from_url(settings.llm_cache_redis_url, decode_responses=True)
+    return _llm_cache_redis
+
+
+def _cache_key(messages: list[dict], model: str, response_format: Optional[str]) -> str:
+    payload = json.dumps({"m": messages, "model": model, "fmt": response_format}, sort_keys=True)
+    return f"brain_llm_cache:{hashlib.sha256(payload.encode()).hexdigest()}"
+
+
+def _check_rate_limit(caller: str) -> bool:
+    if settings.llm_rate_limit_rpm <= 0:
+        return True
+    now = time.time()
+    window_start = now - 60
+    items = _llm_rate_window.get(caller, [])
+    items = [t for t in items if t > window_start]
+    if len(items) >= settings.llm_rate_limit_rpm:
+        _llm_rate_window[caller] = items
+        return False
+    items.append(now)
+    _llm_rate_window[caller] = items
+    return True
+
+
+def _get_db_conn():
+    dsn = os.getenv("FAZLE_DATABASE_URL", "")
+    if not dsn:
+        return None
+    return psycopg2.connect(dsn)
+
+
+def _ensure_log_table():
+    global _DB_INIT_DONE
+    if _DB_INIT_DONE:
+        return
+    try:
+        conn = _get_db_conn()
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS llm_conversation_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    caller VARCHAR(100),
+                    user_id VARCHAR(200),
+                    provider VARCHAR(20) NOT NULL,
+                    model VARCHAR(100) NOT NULL,
+                    messages JSONB NOT NULL,
+                    reply TEXT NOT NULL,
+                    usage_data JSONB,
+                    latency_ms REAL,
+                    is_fallback BOOLEAN DEFAULT FALSE,
+                    request_type VARCHAR(30) DEFAULT 'user_chat'
+                );
+                """
+            )
+        conn.commit()
+        conn.close()
+        _DB_INIT_DONE = True
+    except Exception as e:
+        logger.debug(f"LLM log table init skipped: {e}")
+
+
+def _log_to_db(caller: str, user_id: str, provider: str, model: str,
+               messages: list[dict], reply: str, usage: dict,
+               latency_ms: float, is_fallback: bool,
+               request_type: str = "user_chat"):
+    try:
+        conn = _get_db_conn()
+        if not conn:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO llm_conversation_log
+                (caller, user_id, provider, model, messages, reply, usage_data,
+                 latency_ms, is_fallback, request_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    caller,
+                    user_id,
+                    provider,
+                    model,
+                    json.dumps(messages),
+                    reply,
+                    json.dumps(usage),
+                    latency_ms,
+                    is_fallback,
+                    request_type,
+                ),
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+async def _call_openai(messages: list[dict], model: str, temperature: float,
+                       response_format: Optional[str], max_tokens: Optional[int] = None) -> dict:
+    body: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if response_format == "json":
+        body["response_format"] = {"type": "json_object"}
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        usage = data.get("usage", {})
+        return {
+            "content": data["choices"][0]["message"]["content"],
+            "model": data.get("model", model),
+            "provider": "openai",
+            "usage": {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
+        }
+
+
+def _pick_ollama_model(messages: list[dict], model_override: Optional[str]) -> str:
+    if model_override:
+        return model_override
+    user_text = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            user_text = str(msg.get("content", ""))
+            break
+    complexity = _classify_query_complexity(user_text)
+    if complexity == "simple":
+        return settings.ollama_simple_model
+    return settings.ollama_complex_model
+
+
+async def _call_ollama(messages: list[dict], model: str, temperature: float,
+                       max_tokens: Optional[int] = None) -> dict:
+    options = {
+        "temperature": temperature,
+        "num_ctx": settings.ollama_num_ctx,
+    }
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    body: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": options,
+    }
+
+    async with httpx.AsyncClient(timeout=float(settings.ollama_timeout)) as client:
+        resp = await client.post(f"{settings.ollama_url}/api/chat", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "content": data.get("message", {}).get("content", ""),
+            "model": data.get("model", model),
+            "provider": "ollama",
+            "usage": {
+                "prompt_tokens": data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count", 0),
+                "total_tokens": data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
+            },
+        }
+
+
+async def _stream_ollama(messages: list[dict], model: str, temperature: float,
+                         max_tokens: Optional[int] = None):
+    options = {
+        "temperature": temperature,
+        "num_ctx": settings.ollama_num_ctx,
+    }
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    body = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": options,
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream("POST", f"{settings.ollama_url}/api/chat", json=body) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line and line.strip():
+                    yield line
 
 app = FastAPI(title="Fazle Brain — Reasoning Engine", version="2.0.0")
 
@@ -152,6 +378,7 @@ confusion_handler: ConfusionHandler | None = None
 @app.on_event("startup")
 async def init_agents():
     global agent_manager, teaching_pipeline, knowledge_lifecycle, owner_policy, confusion_handler
+    _init_tree_structure()
     agent_manager = AgentManager(
         ollama_url=settings.ollama_url,
         voice_fast_model=settings.voice_fast_model,
@@ -220,6 +447,31 @@ async def init_agents():
         asyncio.ensure_future(_intelligence_loop())
     except Exception as e:
         logger.warning(f"Production module init failed (non-fatal): {e}")
+
+    # Ensure local LLM log table exists and warm both Ollama models for low TTFB.
+    try:
+        _ensure_log_table()
+    except Exception as e:
+        logger.debug(f"LLM log table startup skip: {e}")
+
+    async def _warm_model(model_name: str):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(
+                    f"{settings.ollama_url}/api/chat",
+                    json={
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": "warmup"}],
+                        "stream": False,
+                        "options": {"num_ctx": settings.ollama_num_ctx, "num_predict": 1, "temperature": 0.0},
+                    },
+                )
+                logger.info(f"Ollama model pre-warmed: {model_name}")
+        except Exception as e:
+            logger.warning(f"Ollama prewarm failed for {model_name}: {e}")
+
+    asyncio.create_task(_warm_model(settings.ollama_simple_model))
+    asyncio.create_task(_warm_model(settings.ollama_complex_model))
 
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
@@ -340,35 +592,97 @@ def _humanize_reply(reply: str) -> str:
 # Request types that must bypass LLM cache (financial / WBOM data)
 _NOCACHE_REQUEST_TYPES = frozenset(["wbom", "wbom_query", "financial", "payment", "billing"])
 
-async def query_gateway(messages: list[dict], model: str = None, max_tokens: int = None,
+async def query_gateway(messages: list[dict], model: Optional[str] = None, max_tokens: Optional[int] = None,
                         caller: str = "fazle-brain", request_type: str = "user_chat",
                         cache: bool = True) -> dict:
-    """Call LLM Gateway — the ONLY LLM entry point. Gateway handles provider routing and fallback."""
-    # Auto-disable cache for financial/WBOM request types
+    """Local LLM engine (merged from llm-gateway) with cache + fallback + logging."""
+    if not _check_rate_limit(caller):
+        raise HTTPException(status_code=429, detail="LLM caller rate limit exceeded")
+
     use_cache = cache and request_type not in _NOCACHE_REQUEST_TYPES
-    payload = {
-        "messages": messages,
-        "response_format": "json",
-        "caller": caller,
-        "temperature": 0.7,
-        "request_type": request_type,
-        "cache": use_cache,
-    }
-    if model:
-        payload["model"] = model
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    async with httpx.AsyncClient(timeout=_LLM_TIMEOUT_GATEWAY) as client:
-        resp = await client.post(
-            f"{settings.llm_gateway_url}/generate",
-            json=payload,
-        )
-        resp.raise_for_status()
-        content = resp.json()["content"]
+    provider = settings.llm_provider
+    effective_model = model
+    if provider == "ollama":
+        effective_model = _pick_ollama_model(messages, model)
+    elif not effective_model:
+        effective_model = settings.llm_model
+
+    cache_key = _cache_key(messages, effective_model, "json")
+    if use_cache and settings.cache_ttl > 0:
         try:
-            return json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            return {"reply": content.strip(), "memory_updates": [], "actions": []}
+            cached = _get_llm_cache_redis().get(cache_key)
+            if cached:
+                content = json.loads(cached).get("content", "")
+                try:
+                    return json.loads(content)
+                except Exception:
+                    return {"reply": content.strip(), "memory_updates": [], "actions": []}
+        except Exception:
+            pass
+
+    start = time.monotonic()
+    result = None
+    is_fallback = False
+    try:
+        if provider == "ollama":
+            result = await _call_ollama(messages, effective_model, 0.7, max_tokens=max_tokens)
+        elif provider == "openai":
+            result = await _call_openai(messages, effective_model, 0.7, "json", max_tokens=max_tokens)
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+    except Exception as primary_err:
+        allow_fallback = (
+            request_type == "user_chat"
+            and settings.fallback_provider
+            and settings.fallback_provider != provider
+        )
+        if not allow_fallback:
+            raise HTTPException(status_code=502, detail=f"Primary LLM failed: {primary_err}") from primary_err
+
+        is_fallback = True
+        if settings.fallback_provider == "openai":
+            result = await _call_openai(messages, settings.fallback_model, 0.7, "json", max_tokens=max_tokens)
+        else:
+            result = await _call_ollama(messages, settings.fallback_model, 0.7, max_tokens=max_tokens)
+
+    if not result:
+        raise HTTPException(status_code=502, detail="LLM returned empty response")
+
+    latency_ms = round((time.monotonic() - start) * 1000, 1)
+    content = result.get("content", "")
+
+    if use_cache and settings.cache_ttl > 0:
+        try:
+            _get_llm_cache_redis().set(
+                cache_key,
+                json.dumps({
+                    "content": content,
+                    "model": result.get("model", effective_model),
+                    "provider": result.get("provider", provider),
+                    "latency_ms": latency_ms,
+                }),
+                ex=settings.cache_ttl,
+            )
+        except Exception:
+            pass
+
+    _log_to_db(
+        caller=caller,
+        user_id=caller,
+        provider=result.get("provider", provider),
+        model=result.get("model", effective_model),
+        messages=messages,
+        reply=content,
+        usage=result.get("usage", {}),
+        latency_ms=latency_ms,
+        is_fallback=is_fallback,
+        request_type=request_type,
+    )
+
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return {"reply": content.strip(), "memory_updates": [], "actions": []}
 
 
 async def query_llm(messages: list[dict], request_type: str = "user_chat") -> dict:
@@ -376,55 +690,85 @@ async def query_llm(messages: list[dict], request_type: str = "user_chat") -> di
     return await query_gateway(messages, request_type=request_type)
 
 
-async def stream_llm_gateway(messages: list[dict], max_tokens: int = None,
+async def stream_llm_gateway(messages: list[dict], max_tokens: Optional[int] = None,
                               caller: str = "fazle-brain-stream", request_type: str = "user_chat",
                               cache: bool = True):
-    """Stream from LLM Gateway SSE endpoint, yields text chunks.
-    Handles both OpenAI-style and Ollama-style SSE from the gateway."""
+    """Stream directly from provider (gateway merged into brain)."""
     use_cache = cache and request_type not in _NOCACHE_REQUEST_TYPES
-    payload = {
-        "messages": messages,
-        "caller": caller,
-        "temperature": 0.7,
-        "stream": True,
-        "request_type": request_type,
-        "cache": use_cache,
-    }
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+    _ = use_cache
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream(
-                "POST",
-                f"{settings.llm_gateway_url}/generate",
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        chunk_str = line[6:].strip()
-                        if chunk_str == "[DONE]":
-                            yield json.dumps({"content": "", "done": True}) + "\n"
-                            break
-                        try:
-                            chunk_data = json.loads(chunk_str)
-                            # Handle Ollama-style: {"content": "...", "done": ...}
-                            if "content" in chunk_data and "done" in chunk_data:
-                                yield json.dumps({"content": chunk_data["content"], "done": chunk_data["done"]}) + "\n"
-                                if chunk_data["done"]:
-                                    break
-                            # Handle OpenAI-style: {"choices": [{"delta": {"content": "..."}}]}
-                            elif "choices" in chunk_data:
-                                delta = chunk_data["choices"][0].get("delta", {})
-                                text = delta.get("content", "")
-                                yield json.dumps({"content": text, "done": False}) + "\n"
-                            else:
-                                yield json.dumps({"content": chunk_str, "done": False}) + "\n"
-                        except (json.JSONDecodeError, IndexError, KeyError):
-                            yield json.dumps({"content": chunk_str, "done": False}) + "\n"
+        provider = settings.llm_provider
+        model = _pick_ollama_model(messages, None) if provider == "ollama" else settings.llm_model
+        if provider == "openai":
+            # Keep compatibility: emit chunked lines even without SSE relay.
+            full = await _call_openai(messages, model, 0.7, None, max_tokens=max_tokens)
+            text = full.get("content", "")
+            if text:
+                yield json.dumps({"content": text, "done": False}) + "\n"
+            yield json.dumps({"content": "", "done": True}) + "\n"
+            return
+
+        async for line in _stream_ollama(messages, model, 0.7, max_tokens=max_tokens):
+            try:
+                data = json.loads(line)
+                text = data.get("message", {}).get("content", "")
+                done = data.get("done", False)
+                yield json.dumps({"content": text, "done": done}) + "\n"
+                if done:
+                    break
+            except Exception:
+                continue
     except Exception as e:
         logger.error(f"Gateway stream failed: {e}")
         yield json.dumps({"content": "", "done": True, "error": str(e)}) + "\n"
+
+
+class BrainGenerateRequest(BaseModel):
+    messages: list[dict] = Field(..., description="Chat messages array")
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = None
+    response_format: Optional[str] = None
+    caller: str = "unknown"
+    user_id: Optional[str] = None
+    stream: bool = False
+    cache: bool = True
+    request_type: str = "user_chat"
+
+
+@app.post("/generate")
+async def brain_generate(request: BrainGenerateRequest):
+    """Compatibility endpoint replacing the old llm-gateway /generate API."""
+    if request.stream:
+        gen = stream_llm_gateway(
+            request.messages,
+            max_tokens=request.max_tokens,
+            caller=request.caller,
+            request_type=request.request_type,
+            cache=request.cache,
+        )
+        return StreamingResponse(gen, media_type="text/event-stream")
+
+    reply = await query_gateway(
+        request.messages,
+        model=request.model,
+        max_tokens=request.max_tokens,
+        caller=request.caller,
+        request_type=request.request_type,
+        cache=request.cache,
+    )
+    content = reply.get("reply") if isinstance(reply, dict) else str(reply)
+    if isinstance(reply, dict) and {"reply", "memory_updates", "actions"}.issubset(set(reply.keys())):
+        content = json.dumps(reply, ensure_ascii=False)
+    return {
+        "content": content or "",
+        "provider": settings.llm_provider,
+        "model": request.model or settings.ollama_complex_model,
+        "usage": {},
+        "cached": False,
+        "latency_ms": 0.0,
+    }
 
 
 # ── Human Presence Engine ────────────────────────────────────
@@ -886,21 +1230,15 @@ async def chat_voice(request: VoiceChatRequest):
         {"role": "user", "content": request.message},
     ]
 
-    # Voice LLM path — all calls through gateway
+    # Voice LLM path — local engine (gateway merged into brain)
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{settings.llm_gateway_url}/generate",
-                json={
-                    "messages": messages,
-                    "caller": "fazle-brain-voice",
-                    "temperature": 0.7,
-                    "max_tokens": 80,
-                    "request_type": "user_chat",
-                },
-            )
-            resp.raise_for_status()
-            reply = resp.json().get("content", "").strip()
+        result = await query_gateway(
+            messages=messages,
+            max_tokens=80,
+            caller="fazle-brain-voice",
+            request_type="user_chat",
+        )
+        reply = result.get("reply", "").strip() if isinstance(result, dict) else str(result).strip()
     except Exception as e:
         logger.error(f"Voice LLM failed: {e}")
         reply = "দুঃখিত, একটু সমস্যা হচ্ছে। আবার বলবেন?"
@@ -952,21 +1290,16 @@ async def _governor_score_response(message: str, reply: str, relationship: str, 
             f"quality: relevance, correctness, helpfulness of the reply."
         )
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{settings.llm_gateway_url}/generate",
-                json={
-                    "messages": [
-                        {"role": "system", "content": "You are a response quality evaluator. Return ONLY valid JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.1,
-                    "caller": "fazle-governor",
-                    "request_type": "system",
-                },
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("content", resp.json().get("response", "{}"))
+        result = await query_gateway(
+            messages=[
+                {"role": "system", "content": "You are a response quality evaluator. Return ONLY valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            caller="fazle-governor",
+            request_type="system",
+            cache=False,
+        )
+        raw = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
 
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
@@ -3068,69 +3401,62 @@ async def _extract_owner_profile_from_message(message: str, reply: str) -> None:
         except Exception:
             pass
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{settings.llm_gateway_url}/generate",
-                json={
-                    "messages": [{
-                        "role": "user",
-                        "content": (
-                            f"Analyze this message from the owner (Azim). Extract any personal identity information.\n"
-                            f"Message: {message}\n\n"
-                            f"If the message contains personal info (name, preferences, business info, family details, "
-                            f"habits, likes/dislikes, occupation, location, etc.), return JSON:\n"
-                            f'{{"found": true, "fields": {{"field_name": "value", ...}}}}\n'
-                            f"Valid field names: full_name, personality, communication_style, business_info, family, "
-                            f"preferences, ideology, location, occupation, hobbies, language, religion, education, "
-                            f"daily_routine, goals, dislikes, food, music, tech_stack\n"
-                            f"If no personal info found, return: {{\"found\": false}}"
-                        ),
-                    }],
-                    "response_format": "json",
-                    "caller": "fazle-brain-profile-extract",
-                    "temperature": 0.1,
-                    "request_type": "owner_analysis",
-                },
-            )
-            resp.raise_for_status()
-            result = json.loads(resp.json()["content"])
-            if result.get("found") and result.get("fields"):
-                fields = result["fields"]
-                # Governor STEP 2: Validate new knowledge against existing profile
-                current = azim_profile_all()
-                validated_fields = {}
-                for field, value in fields.items():
-                    is_valid = await _governor_validate_learning_check(str(value), field)
-                    if is_valid:
-                        existing = current.get(field, "")
-                        if existing and len(str(value)) < len(existing) // 2:
-                            value = f"{existing}; {value}"
-                        validated_fields[field] = value
-                    else:
-                        governor_drift_alert(f"Learning blocked: field={field}, value={str(value)[:100]}")
-                        logger.info(f"Governor blocked profile update for field: {field}")
-                for field, value in validated_fields.items():
-                    azim_profile_set(field, str(value))
-                # Persist to PostgreSQL via /knowledge/store
-                if validated_fields:
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as pg_client:
-                            for field, value in validated_fields.items():
-                                category = _field_to_category(field)
-                                await pg_client.post(
-                                    f"{settings.memory_url}/knowledge/store",
-                                    json={
-                                        "category": category,
-                                        "subcategory": field,
-                                        "key": field,
-                                        "value": str(value),
-                                        "language": "auto",
-                                        "source": "profile_extraction",
-                                    },
-                                )
-                    except Exception as e:
-                        logger.warning(f"Profile PostgreSQL backup failed: {e}")
-                    logger.info(f"Auto-extracted owner profile fields: {list(validated_fields.keys())}")
+        result = await query_gateway(
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Analyze this message from the owner (Azim). Extract any personal identity information.\n"
+                    f"Message: {message}\n\n"
+                    f"If the message contains personal info (name, preferences, business info, family details, "
+                    f"habits, likes/dislikes, occupation, location, etc.), return JSON:\n"
+                    f'{{"found": true, "fields": {{"field_name": "value", ...}}}}\n'
+                    f"Valid field names: full_name, personality, communication_style, business_info, family, "
+                    f"preferences, ideology, location, occupation, hobbies, language, religion, education, "
+                    f"daily_routine, goals, dislikes, food, music, tech_stack\n"
+                    f"If no personal info found, return: {{\"found\": false}}"
+                ),
+            }],
+            caller="fazle-brain-profile-extract",
+            request_type="owner_analysis",
+            cache=False,
+        )
+        if result.get("found") and result.get("fields"):
+            fields = result["fields"]
+            # Governor STEP 2: Validate new knowledge against existing profile
+            current = azim_profile_all()
+            validated_fields = {}
+            for field, value in fields.items():
+                is_valid = await _governor_validate_learning_check(str(value), field)
+                if is_valid:
+                    existing = current.get(field, "")
+                    if existing and len(str(value)) < len(existing) // 2:
+                        value = f"{existing}; {value}"
+                    validated_fields[field] = value
+                else:
+                    governor_drift_alert(f"Learning blocked: field={field}, value={str(value)[:100]}")
+                    logger.info(f"Governor blocked profile update for field: {field}")
+            for field, value in validated_fields.items():
+                azim_profile_set(field, str(value))
+            # Persist to PostgreSQL via /knowledge/store
+            if validated_fields:
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as pg_client:
+                        for field, value in validated_fields.items():
+                            category = _field_to_category(field)
+                            await pg_client.post(
+                                f"{settings.memory_url}/knowledge/store",
+                                json={
+                                    "category": category,
+                                    "subcategory": field,
+                                    "key": field,
+                                    "value": str(value),
+                                    "language": "auto",
+                                    "source": "profile_extraction",
+                                },
+                            )
+                except Exception as e:
+                    logger.warning(f"Profile PostgreSQL backup failed: {e}")
+                logger.info(f"Auto-extracted owner profile fields: {list(validated_fields.keys())}")
     except Exception as e:
         logger.debug(f"Profile extraction skipped: {e}")
 
@@ -3142,6 +3468,282 @@ class AutonomyRequest(BaseModel):
     context: Optional[str] = None
     auto_execute: bool = False
     user_id: Optional[str] = None
+
+
+class KGNodeType(str, Enum):
+    person = "person"
+    project = "project"
+    company = "company"
+    conversation = "conversation"
+    task = "task"
+    topic = "topic"
+    location = "location"
+    concept = "concept"
+
+
+class KGRelationshipType(str, Enum):
+    works_with = "works_with"
+    belongs_to = "belongs_to"
+    discussed_in = "discussed_in"
+    related_to = "related_to"
+    created_by = "created_by"
+    depends_on = "depends_on"
+    mentions = "mentions"
+    located_in = "located_in"
+    manages = "manages"
+    friend_of = "friend_of"
+
+
+class GraphNode(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    node_type: KGNodeType
+    properties: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: Optional[str] = None
+    mention_count: int = 1
+
+
+class GraphRelationship(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4())[:12])
+    source_id: str
+    target_id: str
+    relationship_type: KGRelationshipType
+    properties: dict[str, Any] = Field(default_factory=dict)
+    weight: float = 1.0
+    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class AddNodeRequest(BaseModel):
+    name: str
+    node_type: KGNodeType
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class AddRelationshipRequest(BaseModel):
+    source_id: str
+    target_id: str
+    relationship_type: KGRelationshipType
+    properties: dict[str, Any] = Field(default_factory=dict)
+    weight: float = 1.0
+
+
+class UpdateFromConversationRequest(BaseModel):
+    conversation_id: str
+    text: str
+    user_id: Optional[str] = None
+
+
+class GraphQueryRequest(BaseModel):
+    query: str
+    node_types: Optional[list[KGNodeType]] = None
+    max_depth: int = 2
+    limit: int = 20
+
+
+class AddBranchRequest(BaseModel):
+    path: str = Field(..., description="New branch path e.g. 'azim/hobbies/fishing'")
+    description: str = ""
+
+
+_kg_nodes: dict[str, GraphNode] = {}
+_kg_relationships: list[GraphRelationship] = []
+_kg_adjacency: dict[str, list[int]] = defaultdict(list)
+_kg_name_index: dict[str, str] = {}
+
+_DEFAULT_TREE: dict[str, dict] = {
+    "azim": {
+        "family": {
+            "wife": {},
+            "children": {"son": {}, "daughter": {}},
+            "parents": {},
+            "siblings": {},
+        },
+        "business": {
+            "al-aqsa-security": {
+                "services": {},
+                "pricing": {},
+                "employees": {},
+                "clients": {},
+                "operations": {},
+            },
+            "logistics": {},
+        },
+        "social": {
+            "friends": {},
+            "contacts": {},
+            "networks": {},
+        },
+        "hobbies": {},
+        "ideology": {},
+        "dreams": {},
+        "knowledge": {
+            "technical": {},
+            "general": {},
+            "religious": {},
+        },
+        "daily": {
+            "schedule": {},
+            "habits": {},
+            "health": {},
+        },
+    },
+}
+_tree_structure: dict = {}
+
+
+def _kg_add_node(name: str, node_type: KGNodeType, properties: Optional[dict] = None) -> GraphNode:
+    key = name.lower().strip()
+    if key in _kg_name_index:
+        existing = _kg_nodes[_kg_name_index[key]]
+        existing.mention_count += 1
+        existing.updated_at = datetime.utcnow().isoformat()
+        if properties:
+            existing.properties.update(properties)
+        return existing
+
+    node = GraphNode(name=name, node_type=node_type, properties=properties or {})
+    _kg_nodes[node.id] = node
+    _kg_name_index[key] = node.id
+    return node
+
+
+def _kg_add_relationship(
+    source_id: str,
+    target_id: str,
+    rel_type: KGRelationshipType,
+    properties: Optional[dict] = None,
+    weight: float = 1.0,
+) -> GraphRelationship:
+    if source_id not in _kg_nodes:
+        raise HTTPException(status_code=404, detail=f"Source node {source_id} not found")
+    if target_id not in _kg_nodes:
+        raise HTTPException(status_code=404, detail=f"Target node {target_id} not found")
+
+    for idx in _kg_adjacency[source_id]:
+        rel = _kg_relationships[idx]
+        if rel.target_id == target_id and rel.relationship_type == rel_type:
+            rel.weight += 0.1
+            return rel
+
+    rel = GraphRelationship(
+        source_id=source_id,
+        target_id=target_id,
+        relationship_type=rel_type,
+        properties=properties or {},
+        weight=weight,
+    )
+    idx = len(_kg_relationships)
+    _kg_relationships.append(rel)
+    _kg_adjacency[source_id].append(idx)
+    _kg_adjacency[target_id].append(idx)
+    return rel
+
+
+def _kg_get_neighbors(node_id: str, max_depth: int = 1) -> dict:
+    if node_id not in _kg_nodes:
+        return {"nodes": [], "relationships": []}
+
+    visited = {node_id}
+    result_nodes = [_kg_nodes[node_id]]
+    result_rels = []
+    frontier = [node_id]
+
+    for _ in range(max_depth):
+        next_frontier = []
+        for nid in frontier:
+            for idx in _kg_adjacency.get(nid, []):
+                rel = _kg_relationships[idx]
+                result_rels.append(rel)
+                neighbor_id = rel.target_id if rel.source_id == nid else rel.source_id
+                if neighbor_id not in visited:
+                    visited.add(neighbor_id)
+                    if neighbor_id in _kg_nodes:
+                        result_nodes.append(_kg_nodes[neighbor_id])
+                        next_frontier.append(neighbor_id)
+        frontier = next_frontier
+
+    return {"nodes": result_nodes, "relationships": result_rels}
+
+
+def _kg_search_nodes(query: str, node_types: Optional[list[KGNodeType]] = None, limit: int = 20) -> list[GraphNode]:
+    query_lower = query.lower()
+    results = []
+    for node in _kg_nodes.values():
+        if node_types and node.node_type not in node_types:
+            continue
+        name_match = query_lower in node.name.lower()
+        prop_match = any(query_lower in str(v).lower() for v in node.properties.values())
+        if name_match or prop_match:
+            results.append(node)
+    results.sort(key=lambda n: n.mention_count, reverse=True)
+    return results[:limit]
+
+
+def _flatten_tree(tree: dict, prefix: str = "") -> list[str]:
+    paths = []
+    for key, subtree in tree.items():
+        path = f"{prefix}/{key}" if prefix else key
+        paths.append(path)
+        if subtree:
+            paths.extend(_flatten_tree(subtree, path))
+    return paths
+
+
+def _add_branch_to_tree(tree: dict, path: str) -> bool:
+    parts = [p.strip() for p in path.strip("/").split("/") if p.strip()]
+    node = tree
+    added = False
+    for part in parts:
+        if part not in node:
+            node[part] = {}
+            added = True
+        node = node[part]
+    return added
+
+
+def _get_subtree(tree: dict, path: str) -> Optional[dict]:
+    parts = [p.strip() for p in path.strip("/").split("/") if p.strip()]
+    node = tree
+    for part in parts:
+        if part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _init_tree_structure():
+    global _tree_structure
+    import copy
+    _tree_structure = copy.deepcopy(_DEFAULT_TREE)
+
+
+async def _kg_extract_entities(text: str) -> dict:
+    prompt = f"""Extract entities and relationships from this text.
+
+Text: {text[:3000]}
+
+Return a JSON object with:
+- entities: array of {{name, type, properties}}
+- relationships: array of {{source, target, type}}
+
+Return ONLY valid JSON."""
+    try:
+        result = await query_gateway(
+            [
+                {"role": "system", "content": "You are an entity extraction engine. Return only JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            caller="fazle-kg-extract",
+            request_type="system",
+            cache=False,
+        )
+        if isinstance(result, dict):
+            return result
+        return {}
+    except Exception as e:
+        logger.error(f"KG entity extraction failed: {e}")
+        return {}
 
 
 @app.post("/autonomy/plan")
@@ -3175,20 +3777,130 @@ async def autonomy_plans(limit: int = 20):
             raise HTTPException(status_code=502, detail="Autonomy engine unreachable")
 
 
+@app.post("/graph/node")
+async def create_graph_node(req: AddNodeRequest):
+    return _kg_add_node(req.name, req.node_type, req.properties)
+
+
+@app.post("/graph/relationship")
+async def create_graph_relationship(req: AddRelationshipRequest):
+    return _kg_add_relationship(req.source_id, req.target_id, req.relationship_type, req.properties, req.weight)
+
+
+@app.post("/graph/query")
+async def query_graph(req: GraphQueryRequest):
+    nodes = _kg_search_nodes(req.query, req.node_types, req.limit)
+    all_rels = []
+    node_ids = {n.id for n in nodes}
+    for node in nodes:
+        for idx in _kg_adjacency.get(node.id, []):
+            rel = _kg_relationships[idx]
+            if rel not in all_rels:
+                all_rels.append(rel)
+                other_id = rel.target_id if rel.source_id == node.id else rel.source_id
+                if other_id not in node_ids and other_id in _kg_nodes:
+                    nodes.append(_kg_nodes[other_id])
+                    node_ids.add(other_id)
+    return {"nodes": nodes[:req.limit], "relationships": all_rels, "total_nodes": len(nodes)}
+
+
+@app.get("/graph/context/{node_id}")
+async def graph_context(node_id: str, depth: int = Query(default=2, le=5)):
+    return _kg_get_neighbors(node_id, max_depth=depth)
+
+
+@app.get("/graph/nodes")
+async def list_graph_nodes(
+    node_type: Optional[KGNodeType] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = 0,
+):
+    nodes = list(_kg_nodes.values())
+    if node_type:
+        nodes = [n for n in nodes if n.node_type == node_type]
+    nodes.sort(key=lambda n: n.mention_count, reverse=True)
+    return {"nodes": nodes[offset:offset + limit], "total": len(nodes)}
+
+
+@app.get("/graph/stats")
+async def graph_stats():
+    type_counts = defaultdict(int)
+    for node in _kg_nodes.values():
+        type_counts[node.node_type] += 1
+
+    rel_type_counts = defaultdict(int)
+    for rel in _kg_relationships:
+        rel_type_counts[rel.relationship_type] += 1
+
+    return {
+        "total_nodes": len(_kg_nodes),
+        "total_relationships": len(_kg_relationships),
+        "node_types": dict(type_counts),
+        "relationship_types": dict(rel_type_counts),
+        "top_entities": sorted(
+            [
+                {"name": n.name, "type": n.node_type, "mentions": n.mention_count}
+                for n in _kg_nodes.values()
+            ],
+            key=lambda x: x["mentions"],
+            reverse=True,
+        )[:10],
+    }
+
+
+@app.post("/graph/update")
+async def graph_update(req: UpdateFromConversationRequest):
+    extracted = await _kg_extract_entities(req.text)
+
+    added_nodes = []
+    added_rels = []
+    conv_node = _kg_add_node(
+        f"conversation_{req.conversation_id[:8]}",
+        KGNodeType.conversation,
+        {"conversation_id": req.conversation_id, "user_id": req.user_id},
+    )
+    added_nodes.append(conv_node)
+
+    entities = extracted.get("entities", []) if isinstance(extracted, dict) else []
+    entity_map = {}
+    for ent in entities:
+        name = ent.get("name", "")
+        if not name:
+            continue
+        try:
+            node_type = KGNodeType(ent.get("type", "concept"))
+        except ValueError:
+            node_type = KGNodeType.concept
+        node = _kg_add_node(name, node_type, ent.get("properties", {}))
+        added_nodes.append(node)
+        entity_map[name.lower()] = node.id
+        added_rels.append(_kg_add_relationship(node.id, conv_node.id, KGRelationshipType.discussed_in))
+
+    relationships = extracted.get("relationships", []) if isinstance(extracted, dict) else []
+    for r in relationships:
+        src_name = r.get("source", "").lower()
+        tgt_name = r.get("target", "").lower()
+        if src_name in entity_map and tgt_name in entity_map:
+            try:
+                rel_type = KGRelationshipType(r.get("type", "related_to"))
+            except ValueError:
+                rel_type = KGRelationshipType.related_to
+            added_rels.append(_kg_add_relationship(entity_map[src_name], entity_map[tgt_name], rel_type))
+
+    return {
+        "added_nodes": len(added_nodes),
+        "added_relationships": len(added_rels),
+        "total_nodes": len(_kg_nodes),
+        "total_relationships": len(_kg_relationships),
+    }
+
+
 @app.post("/knowledge-graph/update")
 async def kg_update(conversation_id: str, text: str, user_id: Optional[str] = None):
     """Update knowledge graph from conversation."""
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            resp = await client.post(
-                f"{settings.knowledge_graph_url}/graph/update",
-                json={"conversation_id": conversation_id, "text": text, "user_id": user_id},
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Knowledge graph update error: {e}")
-            return {"error": "Knowledge graph update failed"}
+    return await graph_update(
+        UpdateFromConversationRequest(conversation_id=conversation_id, text=text, user_id=user_id)
+    )
 
 
 # ── Contact Management API ──────────────────────────────────────
@@ -3305,14 +4017,7 @@ async def get_contact(phone: str, platform: str = "whatsapp"):
 @app.get("/knowledge-graph/stats")
 async def kg_stats():
     """Get knowledge graph statistics."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.knowledge_graph_url}/graph/stats")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Knowledge graph stats error: {e}")
-            raise HTTPException(status_code=502, detail="Knowledge graph unreachable")
+    return await graph_stats()
 
 
 # ── Tree Memory Proxy Endpoints ─────────────────────────────
@@ -3387,30 +4092,46 @@ async def tree_branch_proxy(path: str, limit: int = 50):
 
 @app.get("/tree/structure")
 async def tree_structure_proxy():
-    """Get tree structure (proxied to knowledge graph)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(f"{settings.knowledge_graph_url}/tree/structure")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Tree structure error: {e}")
-            return {"error": "Tree structure failed", "detail": str(e)}
+    """Get local tree structure."""
+    paths = _flatten_tree(_tree_structure)
+    return {
+        "tree": _tree_structure,
+        "paths": paths,
+        "total_branches": len(paths),
+    }
 
 
 @app.post("/tree/add-branch")
 async def tree_add_branch_proxy(request: dict):
-    """Add a new tree branch (proxied to knowledge graph)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.post(
-                f"{settings.knowledge_graph_url}/tree/add-branch", json=request,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Tree add-branch error: {e}")
-            return {"error": "Tree add-branch failed", "detail": str(e)}
+    """Add a new local tree branch and map it into graph nodes."""
+    path = str(request.get("path", "")).strip("/").lower()
+    description = str(request.get("description", ""))
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    added = _add_branch_to_tree(_tree_structure, path)
+    all_paths = _flatten_tree(_tree_structure)
+
+    parts = path.split("/")
+    node = _kg_add_node(
+        f"tree:{path}",
+        KGNodeType.concept,
+        {"tree_path": path, "description": description, "is_tree_branch": True},
+    )
+
+    if len(parts) > 1:
+        parent_path = "/".join(parts[:-1])
+        parent_key = f"tree:{parent_path}".lower().strip()
+        if parent_key in _kg_name_index:
+            parent_id = _kg_name_index[parent_key]
+            _kg_add_relationship(node.id, parent_id, KGRelationshipType.belongs_to)
+
+    return {
+        "status": "added" if added else "exists",
+        "path": path,
+        "total_branches": len(all_paths),
+        "node_id": node.id,
+    }
 
 
 @app.post("/self-learning/analyze")

@@ -26,9 +26,10 @@ services:
       FAZLE_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
       FAZLE_BRAIN_URL: "http://fazle-brain:8200"
       FAZLE_MEMORY_URL: "http://fazle-memory:8300"
-      FAZLE_TASK_URL: "http://fazle-task-engine:8400"
-      FAZLE_TOOLS_URL: "http://fazle-web-intelligence:8500"
-      FAZLE_TRAINER_URL: "http://fazle-trainer:8600"
+      FAZLE_TASK_URL: "http://fazle-api:8100"
+      FAZLE_TOOLS_URL: "http://fazle-tool-engine:9200"
+      # Deprecated service URLs removed with container cleanup.
+      FAZLE_TRAINER_URL: ""
       # LiveKit (disabled � voice profile only)
       FAZLE_LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-}"
       FAZLE_LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-}"
@@ -37,10 +38,10 @@ services:
       # Phase-5 Autonomous AI services
       FAZLE_AUTONOMY_ENGINE_URL: "http://fazle-autonomy-engine:9100"
       FAZLE_TOOL_ENGINE_URL: "http://fazle-tool-engine:9200"
-      FAZLE_KNOWLEDGE_GRAPH_URL: "http://fazle-knowledge-graph:9300"
-      FAZLE_AUTONOMOUS_RUNNER_URL: "http://fazle-autonomous-runner:9400"
-      FAZLE_SELF_LEARNING_URL: "http://fazle-self-learning:9500"
-      FAZLE_GUARDRAIL_URL: "http://fazle-guardrail-engine:9600"
+      FAZLE_KNOWLEDGE_GRAPH_URL: "http://fazle-brain:8200"
+      FAZLE_AUTONOMOUS_RUNNER_URL: "http://fazle-autonomy-engine:9100"
+      FAZLE_SELF_LEARNING_URL: ""
+      FAZLE_GUARDRAIL_URL: ""
       FAZLE_WORKFLOW_ENGINE_URL: "http://fazle-workflow-engine:9700"
       FAZLE_SOCIAL_ENGINE_URL: "http://fazle-social-engine:9800"
       FAZLE_WBOM_URL: "http://fazle-wbom:9900"
@@ -86,7 +87,8 @@ services:
       - ai-network
       - db-network
 
-  # ── Fazle Brain — Core Reasoning Engine ────────────────────
+  # ── Fazle Brain — Core Reasoning + LLM Engine ───────────────
+  # Merged: LLM Gateway routing, caching, fallback, logging
   fazle-brain:
     build: ../fazle-system/brain
     container_name: fazle-brain
@@ -103,18 +105,26 @@ services:
       LLM_MODEL: "${FAZLE_LLM_MODEL:-qwen2.5:1.5b}"
       OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
       MEMORY_URL: "http://fazle-memory:8300"
-      TOOLS_URL: "http://fazle-web-intelligence:8500"
-      TASK_URL: "http://fazle-task-engine:8400"
+      TOOLS_URL: "http://fazle-tool-engine:9200"
+      TASK_URL: "http://fazle-api:8100"
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/1"
-      LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
+      # LLM Engine settings (merged from llm-gateway)
+      LLM_CACHE_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/3"
+      FALLBACK_PROVIDER: "${FAZLE_FALLBACK_PROVIDER:-openai}"
+      FALLBACK_MODEL: "${FAZLE_FALLBACK_MODEL:-gpt-4o}"
+      OLLAMA_TIMEOUT: "${FAZLE_OLLAMA_TIMEOUT:-30}"
+      CACHE_TTL: "${FAZLE_CACHE_TTL:-300}"
+      LLM_RATE_LIMIT_RPM: "${FAZLE_RATE_LIMIT_RPM:-60}"
+      # Two-tier model routing: simple → 0.5b, complex → 1.5b
+      OLLAMA_SIMPLE_MODEL: "${FAZLE_OLLAMA_SIMPLE_MODEL:-qwen2.5:0.5b}"
+      OLLAMA_COMPLEX_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
+      OLLAMA_NUM_CTX: "${FAZLE_OLLAMA_NUM_CTX:-2048}"
       LEARNING_ENGINE_URL: "http://fazle-learning-engine:8900"
-      USE_LLM_GATEWAY: "true"
       # Phase-5 Autonomous AI services
       AUTONOMY_ENGINE_URL: "http://fazle-autonomy-engine:9100"
       TOOL_ENGINE_URL: "http://fazle-tool-engine:9200"
-      KNOWLEDGE_GRAPH_URL: "http://fazle-knowledge-graph:9300"
-      AUTONOMOUS_RUNNER_URL: "http://fazle-autonomous-runner:9400"
-      SELF_LEARNING_URL: "http://fazle-self-learning:9500"
+      KNOWLEDGE_GRAPH_URL: "http://fazle-brain:8200"
+      AUTONOMOUS_RUNNER_URL: "http://fazle-autonomy-engine:9100"
       # Voice fast mode & agent system
       VOICE_FAST_MODE: "${FAZLE_VOICE_FAST_MODE:-true}"
       VOICE_OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
@@ -201,123 +211,17 @@ services:
       - db-network
       - app-network
 
-  # ── Fazle Task Engine — Scheduling & Automation ────────────
-  fazle-task-engine:
-    build: ../fazle-system/tasks
-    container_name: fazle-task-engine
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      FAZLE_BRAIN_URL: "http://fazle-brain:8200"
-      FAZLE_MEMORY_URL: "http://fazle-memory:8300"
-      FAZLE_DOGRAH_API_URL: "http://dograh-api:8000"
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 512M
-        reservations:
-          memory: 128M
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8400/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    networks:
-      - ai-network
-      - app-network
-      - db-network
+  # ── MERGED: Task Engine now handled by fazle-api
+  # Keeps all task CRUD + trigger logic in API and removes separate scheduler container.
+  # fazle-task-engine: MERGED INTO API 2026-04-21
 
-  # ── Fazle Web Intelligence — Search & Extraction ──────────
-  fazle-web-intelligence:
-    build: ../fazle-system/tools
-    container_name: fazle-web-intelligence
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      SERPER_API_KEY: "${SERPER_API_KEY:-}"
-      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
-      SEARCH_PROVIDER: "${FAZLE_SEARCH_PROVIDER:-serper}"
-      MEMORY_URL: "http://fazle-memory:8300"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 512M
-        reservations:
-          memory: 128M
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8500/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    networks:
-      - ai-network
-      - app-network
+  # ── MERGED: Web Intelligence now handled by fazle-tool-engine
+  # Saves 512MB RAM + 0.5 CPU by removing separate search/scraping container.
+  # fazle-web-intelligence: MERGED INTO TOOL-ENGINE 2026-04-21
 
-  # ── Fazle Trainer — Learning & Preference Extraction ──────
-  fazle-trainer:
-    build: ../fazle-system/trainer
-    container_name: fazle-trainer
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      OLLAMA_URL: "http://ollama:11434"
-      LLM_PROVIDER: "${FAZLE_LLM_PROVIDER:-ollama}"
-      LLM_MODEL: "${FAZLE_LLM_MODEL:-qwen2.5:1.5b}"
-      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
-      MEMORY_URL: "http://fazle-memory:8300"
-      REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/2"
-      LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
-      USE_LLM_GATEWAY: "true"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-        reservations:
-          memory: 128M
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8600/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    networks:
-      - ai-network
-      - app-network
-      - db-network
+  # ── REMOVED: Trainer (overlaps with learning-engine, no unique callers)
+  # Saves 512MB RAM + 1 CPU. Learning-engine handles preference extraction.
+  # fazle-trainer: REMOVED 2026-04-21
 
   # ── Fazle Voice Agent — LiveKit-based STT/TTS ─────────────
   fazle-voice:
@@ -410,54 +314,10 @@ services:
     networks:
       - app-network
 
-  # ── Fazle LLM Gateway — Centralized LLM Routing ───────────
-  fazle-llm-gateway:
-    build: ../fazle-system/llm-gateway
-    container_name: fazle-llm-gateway
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      OLLAMA_URL: "http://ollama:11434"
-      LLM_PROVIDER: "${FAZLE_LLM_PROVIDER:-ollama}"
-      LLM_MODEL: "${FAZLE_LLM_MODEL:-qwen2.5:1.5b}"
-      OLLAMA_MODEL: "${FAZLE_OLLAMA_MODEL:-qwen2.5:1.5b}"
-      REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/3"
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
-      FALLBACK_PROVIDER: "${FAZLE_FALLBACK_PROVIDER:-openai}"
-      FALLBACK_MODEL: "${FAZLE_FALLBACK_MODEL:-gpt-4o}"
-      OLLAMA_TIMEOUT: "${FAZLE_OLLAMA_TIMEOUT:-30}"
-      CACHE_TTL: "${FAZLE_CACHE_TTL:-300}"
-      RATE_LIMIT_RPM: "${FAZLE_RATE_LIMIT_RPM:-60}"
-      RATE_LIMIT_PER_USER_RPS: "${FAZLE_RATE_LIMIT_PER_USER_RPS:-10}"
-      BATCH_WINDOW_MS: "${FAZLE_BATCH_WINDOW_MS:-75}"
-      BATCH_MAX_SIZE: "${FAZLE_BATCH_MAX_SIZE:-4}"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1G
-        reservations:
-          memory: 256M
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8800/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    networks:
-      - ai-network
-      - app-network
-      - db-network
+  # ── MERGED: LLM Gateway logic now lives inside fazle-brain/llm_engine.py
+  # Saves 1GB RAM + 1 CPU + ~50-200ms per LLM call (no HTTP hop).
+  # Brain handles Ollama/OpenAI routing, caching, fallback, and logging directly.
+  # fazle-llm-gateway: MERGED INTO BRAIN 2026-04-21
 
   # ── Fazle Learning Engine — Self-Improvement System ───────
   fazle-learning-engine:
@@ -473,7 +333,7 @@ services:
       DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/4"
       MEMORY_URL: "http://fazle-memory:8300"
-      LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
+      LLM_GATEWAY_URL: "http://fazle-brain:8200"
       TRAINER_URL: "http://fazle-trainer:8600"
       MIN_CONFIDENCE: "0.6"
     logging:
@@ -489,7 +349,7 @@ services:
         reservations:
           memory: 128M
     depends_on:
-      fazle-llm-gateway:
+      fazle-brain:
         condition: service_healthy
       fazle-memory:
         condition: service_healthy
@@ -532,7 +392,7 @@ services:
         reservations:
           memory: 128M
     depends_on:
-      fazle-llm-gateway:
+      fazle-brain:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8810/health').read()\""]
@@ -558,7 +418,7 @@ services:
       REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/5"
       STREAM_NAME: "llm_requests"
       CONSUMER_GROUP: "llm_workers"
-      LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
+      LLM_GATEWAY_URL: "http://fazle-brain:8200"
       QUEUE_URL: "http://fazle-queue:8810"
       BATCH_SIZE: "5"
       BLOCK_MS: "2000"
@@ -581,7 +441,7 @@ services:
     depends_on:
       fazle-queue:
         condition: service_healthy
-      fazle-llm-gateway:
+      fazle-brain:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8820/health').read()\""]
@@ -607,12 +467,12 @@ services:
     volumes:
       - ../fazle-system:/source:rw
     environment:
-      AUTONOMY_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
+      AUTONOMY_LLM_GATEWAY_URL: "http://fazle-brain:8200"
       AUTONOMY_BRAIN_URL: "http://fazle-brain:8200"
       AUTONOMY_MEMORY_URL: "http://fazle-memory:8300"
-      AUTONOMY_TOOLS_URL: "http://fazle-web-intelligence:8500"
+      AUTONOMY_TOOLS_URL: "http://fazle-tool-engine:9200"
       AUTONOMY_TOOL_ENGINE_URL: "http://fazle-tool-engine:9200"
-      AUTONOMY_KNOWLEDGE_GRAPH_URL: "http://fazle-knowledge-graph:9300"
+      AUTONOMY_KNOWLEDGE_GRAPH_URL: "http://fazle-brain:8200"
       AUTONOMY_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/6"
       AUTONOMY_BRAIN_REDIS_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD not set}@redis:6379/1"
       AUTONOMY_MONITOR_ENABLED: "true"
@@ -631,7 +491,7 @@ services:
         reservations:
           memory: 128M
     depends_on:
-      fazle-llm-gateway:
+      fazle-brain:
         condition: service_healthy
       fazle-memory:
         condition: service_healthy
@@ -657,8 +517,11 @@ services:
     tmpfs:
       - /tmp
     environment:
-      TOOL_ENGINE_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
+      TOOL_ENGINE_LLM_GATEWAY_URL: "http://fazle-brain:8200"
       TOOL_ENGINE_MEMORY_URL: "http://fazle-memory:8300"
+      TOOL_ENGINE_SERPER_API_KEY: "${SERPER_API_KEY:-}"
+      TOOL_ENGINE_TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      TOOL_ENGINE_SEARCH_PROVIDER: "${FAZLE_SEARCH_PROVIDER:-serper}"
     logging:
       driver: "json-file"
       options:
@@ -672,7 +535,9 @@ services:
         reservations:
           memory: 128M
     depends_on:
-      fazle-llm-gateway:
+      fazle-brain:
+        condition: service_healthy
+      fazle-memory:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9200/health').read()\""]
@@ -684,157 +549,21 @@ services:
       - ai-network
       - app-network
 
-  # ── Phase-5: Knowledge Graph — Entity & Relationship Store ──
-  fazle-knowledge-graph:
-    build: ../fazle-system/knowledge-graph
-    container_name: fazle-knowledge-graph
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      KNOWLEDGE_GRAPH_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
-      KNOWLEDGE_GRAPH_MEMORY_URL: "http://fazle-memory:8300"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 512M
-        reservations:
-          memory: 128M
-    depends_on:
-      fazle-llm-gateway:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9300/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    networks:
-      - ai-network
-      - app-network
+  # ── MERGED: Knowledge Graph now handled by fazle-brain
+  # Saves 512MB RAM + 0.5 CPU by removing separate graph container.
+  # fazle-knowledge-graph: MERGED INTO BRAIN 2026-04-21
 
-  # ── Phase-5: Autonomous Task Runner — Background Task Loops ──
-  fazle-autonomous-runner:
-    build: ../fazle-system/autonomous-runner
-    container_name: fazle-autonomous-runner
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      AUTO_RUNNER_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
-      AUTO_RUNNER_BRAIN_URL: "http://fazle-brain:8200"
-      AUTO_RUNNER_MEMORY_URL: "http://fazle-memory:8300"
-      AUTO_RUNNER_TOOLS_URL: "http://fazle-web-intelligence:8500"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 512M
-        reservations:
-          memory: 128M
-    depends_on:
-      fazle-llm-gateway:
-        condition: service_healthy
-      fazle-brain:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9400/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    networks:
-      - ai-network
-      - app-network
+  # ── MERGED: Autonomous Task Runner now handled by fazle-autonomy-engine
+  # Saves 512MB RAM + 0.5 CPU by removing separate runner container.
+  # fazle-autonomous-runner: MERGED INTO AUTONOMY-ENGINE 2026-04-21
 
-  # ── Phase-5: Self-Learning Engine — Pattern & Insight Extraction ──
-  fazle-self-learning:
-    build: ../fazle-system/self-learning
-    container_name: fazle-self-learning
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      SELF_LEARNING_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
-      SELF_LEARNING_MEMORY_URL: "http://fazle-memory:8300"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 512M
-        reservations:
-          memory: 128M
-    depends_on:
-      fazle-llm-gateway:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9500/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    networks:
-      - ai-network
-      - app-network
+  # ── REMOVED: Self-Learning Engine (dead service — no persistence, no callers)
+  # Saves 512MB RAM + 0.5 CPU. Functionality covered by learning-engine.
+  # fazle-self-learning: REMOVED 2026-04-21
 
-  # ── Fazle Guardrail Engine — AI Safety ─────────────────────
-  fazle-guardrail-engine:
-    build: ../fazle-system/guardrail-engine
-    container_name: fazle-guardrail-engine
-    restart: unless-stopped
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      FAZLE_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-        reservations:
-          memory: 64M
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9600/health').read()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    networks:
-      - ai-network
-      - db-network
+  # ── REMOVED: Guardrail Engine (dead service — policies never loaded, no integration)
+  # Saves 256MB RAM + 0.5 CPU. Safety handled by brain/safety.py.
+  # fazle-guardrail-engine: REMOVED 2026-04-21
 
   # ── Fazle Workflow Engine — Multi-step AI Workflows ────────
   fazle-workflow-engine:
@@ -848,7 +577,7 @@ services:
       - /tmp
     environment:
       WORKFLOW_DATABASE_URL: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}@postgres:5432/${POSTGRES_DB:-postgres}"
-      WORKFLOW_LLM_GATEWAY_URL: "http://fazle-llm-gateway:8800"
+      WORKFLOW_LLM_GATEWAY_URL: "http://fazle-brain:8200"
       WORKFLOW_BRAIN_URL: "http://fazle-brain:8200"
       WORKFLOW_TOOL_ENGINE_URL: "http://fazle-tool-engine:9200"
     logging:
@@ -864,7 +593,7 @@ services:
         reservations:
           memory: 128M
     depends_on:
-      fazle-llm-gateway:
+      fazle-brain:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9700/health').read()\""]
@@ -976,32 +705,9 @@ services:
       - app-network
       - db-network
 
-  # ── OpenTelemetry Collector — Distributed Tracing ──────────
-  fazle-otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.96.0
-    container_name: fazle-otel-collector
-    restart: unless-stopped
-    command: ["--config", "/etc/otel/config.yaml"]
-    volumes:
-      - ../configs/otel/otel-collector-config.yaml:/etc/otel/config.yaml:ro
-    ports:
-      - "4317:4317"
-      - "4318:4318"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-        reservations:
-          memory: 64M
-    networks:
-      - ai-network
-      - app-network
+  # ── REMOVED: OpenTelemetry Collector (redundant with Prometheus + Loki stack)
+  # Saves 256MB RAM + 0.5 CPU. Prometheus already handles metrics.
+  # fazle-otel-collector: REMOVED 2026-04-21
 
 networks:
   app-network:

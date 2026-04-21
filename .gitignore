@@ -11,6 +11,7 @@ New VPS Password.txt
 *.secure
 contacts.csv
 as on*
+whatsapp-mcp-instructions.txt
 
 # Local validation workspace
 local-validation/

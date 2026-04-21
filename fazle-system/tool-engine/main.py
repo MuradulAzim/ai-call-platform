@@ -13,18 +13,27 @@ import json
 import logging
 import uuid
 import asyncio
+import ipaddress
+import os
+import re
+import socket
 from typing import Optional, Any
 from datetime import datetime
 from enum import Enum
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fazle-tool-engine")
 
 
 class Settings(BaseSettings):
-    tools_url: str = "http://fazle-web-intelligence:8500"
+    tools_url: str = "http://fazle-tool-engine:9200"
     memory_url: str = "http://fazle-memory:8300"
-    llm_gateway_url: str = "http://fazle-llm-gateway:8800"
+    llm_gateway_url: str = "http://fazle-brain:8200"
+    serper_api_key: str = ""
+    tavily_api_key: str = ""
+    search_provider: str = "serper"
     redis_url: str = "redis://redis:6379/7"
     max_execution_time: int = 30
     sandbox_enabled: bool = True
@@ -44,9 +53,11 @@ settings = Settings()
 app = FastAPI(title="Fazle Tool Execution Engine", version="1.0.0")
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://fazle.iamazim.com,https://iamazim.com").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://fazle.iamazim.com", "https://iamazim.com"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -104,6 +115,21 @@ class ToolPermissions(BaseModel):
     code_sandbox: bool = False
     db_query: bool = False
     file_access: bool = False
+
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+
+class ScrapeRequest(BaseModel):
+    url: str
+    extract_text: bool = True
+
+
+class SummarizeRequest(BaseModel):
+    url: Optional[str] = None
+    text: Optional[str] = None
 
 
 # ── Built-in tools registry ─────────────────────────────────
@@ -171,13 +197,134 @@ async def _exec_web_search(params: dict) -> Any:
     query = params.get("query", params.get("description", ""))
     if not query:
         return {"error": "No query provided"}
+    results = await _search_web(query, params.get("max_results", 5))
+    return {"query": query, "results": results, "count": len(results)}
+
+
+async def _search_serper(query: str, max_results: int) -> list[dict]:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
-            f"{settings.tools_url}/search",
-            json={"query": query, "max_results": params.get("max_results", 5)},
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": settings.serper_api_key,
+                "Content-Type": "application/json",
+            },
+            json={"q": query, "num": max_results},
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+
+    results = []
+    for item in data.get("organic", [])[:max_results]:
+        results.append(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            }
+        )
+    return results
+
+
+async def _search_tavily(query: str, max_results: int) -> list[dict]:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": settings.tavily_api_key,
+                "query": query,
+                "max_results": max_results,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = []
+    for item in data.get("results", [])[:max_results]:
+        results.append(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", ""),
+            }
+        )
+    return results
+
+
+async def _search_web(query: str, max_results: int) -> list[dict]:
+    if settings.search_provider == "tavily" and settings.tavily_api_key:
+        return await _search_tavily(query, max_results)
+    if settings.serper_api_key:
+        return await _search_serper(query, max_results)
+    raise HTTPException(status_code=503, detail="No search API configured")
+
+
+def _is_private_ip(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return True
+
+        if hostname in {"localhost", "0.0.0.0", "[::1]", "[::]"}:
+            return True
+        if hostname.endswith(".internal") or hostname.endswith(".local"):
+            return True
+
+        try:
+            addr_infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            return True
+
+        if not addr_infos:
+            return True
+
+        for addr_info in addr_infos:
+            raw_ip = addr_info[4][0]
+            try:
+                ip = ipaddress.ip_address(raw_ip)
+            except ValueError:
+                return True
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                return True
+        return False
+    except Exception:
+        return True
+
+
+async def _scrape_url(request: ScrapeRequest) -> dict:
+    if not re.match(r"^https?://", request.url):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+
+    if _is_private_ip(request.url):
+        raise HTTPException(status_code=400, detail="URL resolves to internal/private IP range")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            resp = await client.get(
+                request.url,
+                headers={"User-Agent": "Fazle-AI/1.0 (Personal Assistant)"},
+            )
+            resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
+
+    if request.extract_text:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+
+        text = soup.get_text(separator="\n", strip=True)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        title = soup.title.string if soup.title else ""
+        return {
+            "url": request.url,
+            "title": title,
+            "text": text[:10000],
+            "length": len(text),
+        }
+
+    return {"url": request.url, "html": resp.text[:50000]}
 
 
 async def _exec_http_request(params: dict) -> Any:
@@ -309,7 +456,56 @@ async def startup():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "tool-engine", "tools_count": len(_tools)}
+    return {
+        "status": "healthy",
+        "service": "fazle-web-intelligence+tool-engine",
+        "tools_count": len(_tools),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/search")
+async def search(request: SearchRequest):
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    results = await _search_web(request.query, request.max_results)
+    return {"query": request.query, "results": results, "count": len(results)}
+
+
+@app.post("/scrape")
+async def scrape(request: ScrapeRequest):
+    return await _scrape_url(request)
+
+
+@app.post("/summarize")
+async def summarize(request: SummarizeRequest):
+    content = request.text or ""
+
+    if request.url:
+        scrape_result = await _scrape_url(ScrapeRequest(url=request.url))
+        content = scrape_result.get("text", "")
+
+    if not content:
+        raise HTTPException(status_code=400, detail="No content to summarize")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            await client.post(
+                f"{settings.memory_url}/ingest",
+                json={
+                    "text": content[:5000],
+                    "source": request.url or "direct_input",
+                    "title": f"Web content from {request.url}" if request.url else "Direct text",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store in knowledge base: {e}")
+
+    return {
+        "content": content[:5000],
+        "source": request.url or "direct_input",
+        "stored_in_knowledge": True,
+    }
 
 
 @app.post("/tools/execute", response_model=ExecuteToolResponse)

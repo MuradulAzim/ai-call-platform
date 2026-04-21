@@ -132,9 +132,8 @@ async def container_restart(request: ContainerRestartRequest, admin: dict = Depe
     otherwise returns instructions."""
     # Allowlist of containers that can be restarted
     allowed = {
-        "fazle-api", "fazle-brain", "fazle-memory", "fazle-task-engine",
-        "fazle-tool-engine", "fazle-autonomy-engine", "fazle-knowledge-graph",
-        "fazle-autonomous-runner", "fazle-self-learning", "fazle-guardrail-engine",
+        "fazle-api", "fazle-brain", "fazle-memory",
+        "fazle-tool-engine", "fazle-autonomy-engine",
         "fazle-workflow-engine", "fazle-social-engine",
     }
     if request.container_name not in allowed:
@@ -157,12 +156,12 @@ async def ai_pause(admin: dict = Depends(require_admin)):
     settings = _get_settings()
     results = {}
     async with httpx.AsyncClient(timeout=15.0) as client:
-        # Pause autonomous runner
+        # Pause autonomous tasks (now hosted by autonomy-engine)
         try:
             r = await client.post(f"{settings.autonomous_runner_url}/tasks/autonomous/pause-all")
-            results["autonomous_runner"] = "paused" if r.status_code == 200 else "failed"
+            results["autonomous_tasks"] = "paused" if r.status_code == 200 else "failed"
         except Exception:
-            results["autonomous_runner"] = "unreachable"
+            results["autonomous_tasks"] = "unreachable"
 
         # Pause workflows
         try:
@@ -184,9 +183,9 @@ async def ai_resume(admin: dict = Depends(require_admin)):
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             r = await client.post(f"{settings.autonomous_runner_url}/tasks/autonomous/resume-all")
-            results["autonomous_runner"] = "resumed" if r.status_code == 200 else "failed"
+            results["autonomous_tasks"] = "resumed" if r.status_code == 200 else "failed"
         except Exception:
-            results["autonomous_runner"] = "unreachable"
+            results["autonomous_tasks"] = "unreachable"
 
         try:
             r = await client.post(f"{settings.workflow_engine_url}/workflows/resume-all")

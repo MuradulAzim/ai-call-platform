@@ -3,7 +3,7 @@
 # Goal decomposition, proactive monitoring, opportunity detection,
 # self-improvement, suggestion generation, and learning loop
 # ============================================================
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
@@ -14,7 +14,7 @@ import logging
 import uuid
 import asyncio
 import redis
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime, timedelta
 from enum import Enum
 from contextlib import asynccontextmanager
@@ -26,10 +26,10 @@ logger = logging.getLogger("fazle-autonomy-engine")
 class Settings(BaseSettings):
     brain_url: str = "http://fazle-brain:8200"
     memory_url: str = "http://fazle-memory:8300"
-    tools_url: str = "http://fazle-web-intelligence:8500"
-    task_url: str = "http://fazle-task-engine:8400"
+    tools_url: str = "http://fazle-tool-engine:9200"
+    task_url: str = "http://fazle-api:8100"
     tool_engine_url: str = "http://fazle-tool-engine:9200"
-    knowledge_graph_url: str = "http://fazle-knowledge-graph:9300"
+    knowledge_graph_url: str = "http://fazle-brain:8200"
     llm_gateway_url: str = "http://fazle-llm-gateway:8800"
     learning_engine_url: str = "http://fazle-learning-engine:8900"
     redis_url: str = "redis://:UuhN4ehSgOTbeDlLltEnJ8R2tYQa8F@redis:6379/6"
@@ -158,8 +158,67 @@ class PlanResponse(BaseModel):
     message: str
 
 
+class TaskType(str, Enum):
+    research = "research"
+    monitor = "monitor"
+    reminder = "reminder"
+    digest = "digest"
+    learning = "learning"
+    custom = "custom"
+
+
+class TaskStatus(str, Enum):
+    active = "active"
+    paused = "paused"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class AutonomousTask(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    task_type: TaskType
+    description: str
+    trigger: str = "manual"
+    interval_minutes: Optional[int] = None
+    status: TaskStatus = TaskStatus.active
+    last_run: Optional[str] = None
+    next_run: Optional[str] = None
+    run_count: int = 0
+    last_result: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: Optional[str] = None
+    user_id: Optional[str] = None
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateTaskRequest(BaseModel):
+    name: str
+    task_type: TaskType
+    description: str
+    trigger: str = "manual"
+    interval_minutes: Optional[int] = None
+    auto_start: bool = True
+    user_id: Optional[str] = None
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskRunResult(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[str] = None
+    error: Optional[str] = None
+    duration_ms: int = 0
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
 # ── In-memory plan store ─────────────────────────────────────
 _plans: dict[str, AutonomyPlan] = {}
+_tasks: dict[str, AutonomousTask] = {}
+_run_history: list[TaskRunResult] = []
+_background_handles: dict[str, asyncio.Task] = {}
 
 # ── Autonomous Decision Engine — Data Models ────────────────
 
@@ -1391,6 +1450,143 @@ async def query_llm(prompt: str, system: str = "") -> str:
             raise HTTPException(status_code=502, detail="LLM gateway unreachable")
 
 
+async def _run_research_task(task: AutonomousTask) -> str:
+    query = task.config.get("query", task.description)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{settings.tools_url}/search",
+            json={"query": query, "max_results": 5},
+        )
+        if resp.status_code != 200:
+            return f"Search failed: {resp.status_code}"
+        summary = await query_llm(
+            prompt=f"Summarize these search results for the query '{query}':\n\n{resp.text[:3000]}",
+            system="Provide a concise research summary.",
+        )
+        await client.post(
+            f"{settings.memory_url}/store",
+            json={"content": f"Auto-research: {query}\n{summary}", "type": "autonomous_research"},
+        )
+        return summary
+
+
+async def _run_monitor_task(task: AutonomousTask) -> str:
+    topic = task.config.get("topic", task.description)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{settings.tools_url}/search",
+            json={"query": f"{topic} latest news today", "max_results": 3},
+        )
+        if resp.status_code == 200:
+            return f"Monitor check complete: {resp.text[:1000]}"
+        return f"Monitor check failed: {resp.status_code}"
+
+
+async def _run_digest_task(task: AutonomousTask) -> str:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{settings.memory_url}/search",
+            json={"query": "recent activities today", "top_k": 10},
+        )
+        memories = resp.text[:3000] if resp.status_code == 200 else "No memories found"
+        return await query_llm(
+            prompt=f"Create a brief daily digest from these recent memories:\n\n{memories}",
+            system="You are Fazle's digest generator. Create a concise daily summary.",
+        )
+
+
+async def _run_learning_task(task: AutonomousTask) -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{settings.memory_url}/search",
+            json={"query": "conversation pattern preference", "top_k": 10},
+        )
+        context = resp.text[:2000] if resp.status_code == 200 else ""
+        insight = await query_llm(
+            prompt=f"Analyze these conversation patterns and identify learning opportunities:\n\n{context}",
+            system="You are Fazle's self-improvement engine. Identify patterns and improvements.",
+        )
+        await client.post(
+            f"{settings.memory_url}/store",
+            json={"content": f"Self-learning insight: {insight}", "type": "self_learning"},
+        )
+        return insight
+
+
+async def _run_custom_task(task: AutonomousTask) -> str:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{settings.brain_url}/autonomy/plan",
+            json={"goal": task.description, "auto_execute": True, "context": json.dumps(task.config)},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return f"Autonomy plan created: {data.get('message', 'ok')}"
+        return f"Custom task failed: {resp.status_code}"
+
+
+_task_executors = {
+    TaskType.research: _run_research_task,
+    TaskType.monitor: _run_monitor_task,
+    TaskType.digest: _run_digest_task,
+    TaskType.learning: _run_learning_task,
+    TaskType.custom: _run_custom_task,
+    TaskType.reminder: _run_digest_task,
+}
+
+
+async def execute_autonomous_task(task: AutonomousTask) -> TaskRunResult:
+    start = datetime.utcnow()
+    executor = _task_executors.get(task.task_type, _run_custom_task)
+    try:
+        result = await asyncio.wait_for(executor(task), timeout=300)
+        elapsed = int((datetime.utcnow() - start).total_seconds() * 1000)
+        task.last_run = datetime.utcnow().isoformat()
+        task.last_result = result[:2000] if result else None
+        task.last_error = None
+        task.run_count += 1
+        task.updated_at = datetime.utcnow().isoformat()
+        run_result = TaskRunResult(task_id=task.id, status="success", result=result[:2000], duration_ms=elapsed)
+        _run_history.append(run_result)
+        return run_result
+    except asyncio.TimeoutError:
+        elapsed = int((datetime.utcnow() - start).total_seconds() * 1000)
+        task.last_error = "Task timed out"
+        task.updated_at = datetime.utcnow().isoformat()
+        run_result = TaskRunResult(task_id=task.id, status="timeout", error="Task timed out", duration_ms=elapsed)
+        _run_history.append(run_result)
+        return run_result
+    except Exception as e:
+        elapsed = int((datetime.utcnow() - start).total_seconds() * 1000)
+        task.last_error = str(e)[:500]
+        task.updated_at = datetime.utcnow().isoformat()
+        run_result = TaskRunResult(task_id=task.id, status="error", error=str(e)[:500], duration_ms=elapsed)
+        _run_history.append(run_result)
+        return run_result
+
+
+async def _task_loop(task_id: str):
+    while True:
+        task = _tasks.get(task_id)
+        if not task or task.status != TaskStatus.active:
+            break
+        await execute_autonomous_task(task)
+        interval = task.interval_minutes or 60
+        await asyncio.sleep(interval * 60)
+
+
+def _start_background(task: AutonomousTask):
+    if task.id in _background_handles:
+        _background_handles[task.id].cancel()
+    _background_handles[task.id] = asyncio.create_task(_task_loop(task.id))
+
+
+def _stop_background(task_id: str):
+    handle = _background_handles.pop(task_id, None)
+    if handle:
+        handle.cancel()
+
+
 async def retrieve_context(goal: str) -> str:
     """Pull relevant memories for planning context."""
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1619,6 +1815,130 @@ async def execute_plan(plan_id: str, step_ids: Optional[list[str]] = None):
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "autonomy-engine", "plans_count": len(_plans)}
+
+
+@app.post("/tasks/autonomous")
+async def create_autonomous_task(req: CreateTaskRequest):
+    task = AutonomousTask(
+        name=req.name,
+        task_type=req.task_type,
+        description=req.description,
+        trigger=req.trigger,
+        interval_minutes=req.interval_minutes,
+        user_id=req.user_id,
+        config=req.config,
+    )
+    _tasks[task.id] = task
+    if req.auto_start and req.trigger == "interval" and req.interval_minutes:
+        _start_background(task)
+    if req.auto_start and req.trigger in ("once", "manual"):
+        result = await execute_autonomous_task(task)
+        if req.trigger == "once":
+            task.status = TaskStatus.completed
+        return {"task": task, "initial_result": result}
+    return {"task": task, "message": "Task created"}
+
+
+@app.get("/tasks/autonomous/history")
+async def autonomous_task_history(task_id: Optional[str] = None, limit: int = 50):
+    history = _run_history
+    if task_id:
+        history = [r for r in history if r.task_id == task_id]
+    return {"history": history[-limit:], "total": len(history)}
+
+
+@app.post("/tasks/autonomous/{task_id}/run")
+async def run_autonomous_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    result = await execute_autonomous_task(task)
+    return {"task_id": task_id, "result": result}
+
+
+@app.get("/tasks/autonomous/{task_id}")
+async def get_autonomous_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.get("/tasks/autonomous")
+async def list_autonomous_tasks(
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    limit: int = Query(default=50, le=200),
+):
+    tasks = list(_tasks.values())
+    status_filter = status
+    if status_filter == "running":
+        status_filter = TaskStatus.active.value
+    if status_filter:
+        tasks = [t for t in tasks if t.status == status_filter]
+    if task_type:
+        tasks = [t for t in tasks if t.task_type == task_type]
+    tasks.sort(key=lambda t: t.created_at, reverse=True)
+    return {"tasks": tasks[:limit], "total": len(tasks)}
+
+
+@app.post("/tasks/autonomous/{task_id}/pause")
+async def pause_autonomous_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task.status = TaskStatus.paused
+    task.updated_at = datetime.utcnow().isoformat()
+    _stop_background(task_id)
+    return {"message": "Task paused", "task_id": task_id}
+
+
+@app.post("/tasks/autonomous/{task_id}/resume")
+async def resume_autonomous_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task.status = TaskStatus.active
+    task.updated_at = datetime.utcnow().isoformat()
+    if task.trigger == "interval" and task.interval_minutes:
+        _start_background(task)
+    return {"message": "Task resumed", "task_id": task_id}
+
+
+@app.delete("/tasks/autonomous/{task_id}")
+async def cancel_autonomous_task(task_id: str):
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _stop_background(task_id)
+    task.status = TaskStatus.cancelled
+    del _tasks[task_id]
+    return {"message": "Task cancelled", "task_id": task_id}
+
+
+@app.post("/tasks/autonomous/pause-all")
+async def pause_all_autonomous_tasks():
+    paused = 0
+    for task_id, task in list(_tasks.items()):
+        if task.status == TaskStatus.active:
+            task.status = TaskStatus.paused
+            task.updated_at = datetime.utcnow().isoformat()
+            _stop_background(task_id)
+            paused += 1
+    return {"message": "All active autonomous tasks paused", "paused": paused}
+
+
+@app.post("/tasks/autonomous/resume-all")
+async def resume_all_autonomous_tasks():
+    resumed = 0
+    for task in _tasks.values():
+        if task.status == TaskStatus.paused:
+            task.status = TaskStatus.active
+            task.updated_at = datetime.utcnow().isoformat()
+            if task.trigger == "interval" and task.interval_minutes:
+                _start_background(task)
+            resumed += 1
+    return {"message": "Paused autonomous tasks resumed", "resumed": resumed}
 
 
 @app.post("/autonomy/plan", response_model=PlanResponse)

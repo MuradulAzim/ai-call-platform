@@ -181,7 +181,7 @@ dismiss_count INTEGER — owner dismissals
 | fazle-api | 8100 | API gateway |
 | fazle-brain | 8200 | **Core reasoning (this service)** |
 | fazle-memory | 8300 | Vector memory |
-| fazle-task-engine | 8400 | Scheduling & automation |
+| fazle-tasks (via fazle-api) | 8100 | Scheduling & automation |
 | fazle-web-intelligence | 8500 | Search & web extraction |
 | fazle-trainer | 8600 | Learning & preference |
 | fazle-voice | WS | LiveKit STT/TTS |

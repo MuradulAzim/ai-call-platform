@@ -35,9 +35,9 @@ capabilities while keeping Dograh as the voice interface layer.
 │  │   └── Qdrant (:6333) ← vector database           │       │
 │  └──────────────────────────────────────────────────┘       │
 │                                                             │
-│  Layer 4: Autonomous Tasks                                  │
+│  Layer 4: Task Capabilities                                 │
 │  ┌──────────────────────────────────────────────────┐       │
-│  │ Task Engine (:8400)  ← scheduling & automation   │       │
+│  │ Tasks via API (:8100) ← scheduling & automation  │       │
 │  │ Web Intelligence (:8500) ← search & scraping     │       │
 │  └──────────────────────────────────────────────────┘       │
 │                                                             │
@@ -56,7 +56,7 @@ capabilities while keeping Dograh as the voice interface layer.
 | Fazle API            | fazle-api             | 8100  | API gateway                 |
 | Fazle Brain          | fazle-brain           | 8200  | Reasoning engine            |
 | Fazle Memory         | fazle-memory          | 8300  | Vector memory system        |
-| Fazle Task Engine    | fazle-task-engine     | 8400  | Scheduling & automation     |
+| Fazle Tasks (Merged) | fazle-api             | 8100  | Scheduling & automation     |
 | Fazle Web Intel      | fazle-web-intelligence| 8500  | Internet search & scraping  |
 | Fazle Trainer        | fazle-trainer         | 8600  | Learning & extraction       |
 | Fazle UI             | fazle-ui              | 3020  | Dashboard (Next.js)         |

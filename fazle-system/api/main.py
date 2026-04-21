@@ -84,14 +84,14 @@ class Settings(BaseSettings):
     api_key: str = ""
     brain_url: str = "http://fazle-brain:8200"
     memory_url: str = "http://fazle-memory:8300"
-    task_url: str = "http://fazle-task-engine:8400"
-    tools_url: str = "http://fazle-web-intelligence:8500"
+    task_url: str = "http://fazle-api:8100"
+    tools_url: str = "http://fazle-tool-engine:9200"
     trainer_url: str = "http://fazle-trainer:8600"
     learning_engine_url: str = "http://fazle-learning-engine:8900"
     autonomy_engine_url: str = "http://fazle-autonomy-engine:9100"
     tool_engine_url: str = "http://fazle-tool-engine:9200"
-    knowledge_graph_url: str = "http://fazle-knowledge-graph:9300"
-    autonomous_runner_url: str = "http://fazle-autonomous-runner:9400"
+    knowledge_graph_url: str = "http://fazle-brain:8200"
+    autonomous_runner_url: str = "http://fazle-autonomy-engine:9100"
     self_learning_url: str = "http://fazle-self-learning:9500"
     guardrail_url: str = "http://fazle-guardrail-engine:9600"
     workflow_engine_url: str = "http://fazle-workflow-engine:9700"
@@ -311,6 +311,93 @@ def _get_voice_clone(user_id: str) -> Optional[str]:
         conn.close()
 
 
+def ensure_task_engine_tables():
+    """Create local task/trigger tables for merged task engine behavior."""
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    if not db_url:
+        return
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fazle_tasks (
+                    id VARCHAR(36) PRIMARY KEY,
+                    title VARCHAR(500) NOT NULL,
+                    description TEXT DEFAULT '',
+                    task_type VARCHAR(50) NOT NULL DEFAULT 'reminder',
+                    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+                    scheduled_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    payload JSONB DEFAULT '{}'::jsonb,
+                    recurrence VARCHAR(200) DEFAULT NULL,
+                    last_run TIMESTAMPTZ DEFAULT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fazle_event_triggers (
+                    id VARCHAR(36) PRIMARY KEY,
+                    event_type VARCHAR(100) NOT NULL,
+                    condition JSONB DEFAULT '{}'::jsonb,
+                    action_task_id VARCHAR(36) REFERENCES fazle_tasks(id) ON DELETE CASCADE,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("ALTER TABLE fazle_tasks ADD COLUMN IF NOT EXISTS recurrence VARCHAR(200)")
+            cur.execute("ALTER TABLE fazle_tasks ADD COLUMN IF NOT EXISTS last_run TIMESTAMPTZ")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _task_row_to_dict(row) -> dict:
+    return {
+        "id": str(row[0]),
+        "title": row[1],
+        "description": row[2] or "",
+        "task_type": row[3],
+        "status": row[4],
+        "scheduled_at": row[5].isoformat() if row[5] else None,
+        "created_at": row[6].isoformat() if row[6] else "",
+        "payload": row[7] if isinstance(row[7], dict) else (row[7] or {}),
+        "recurrence": row[8],
+        "last_run": row[9].isoformat() if row[9] else None,
+    }
+
+
+TASK_TYPES = {"reminder", "call", "summary", "instruction", "custom", "monitor", "learning_update", "follow_up", "recurring", "scheduled", "one-time"}
+
+
+class TaskEngineCreateRequest(BaseModel):
+    title: str
+    description: str = ""
+    scheduled_at: Optional[str] = None
+    task_type: str = "reminder"
+    payload: dict = Field(default_factory=dict)
+    recurrence: Optional[str] = None
+
+
+class TaskEngineUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+
+class EventTriggerCreate(BaseModel):
+    event_type: str
+    condition: dict = Field(default_factory=dict)
+    action_task_id: str
+
+
+class EventTriggerResponse(BaseModel):
+    id: str
+    event_type: str
+    condition: dict
+    action_task_id: str
+    enabled: bool
+    created_at: str
+
+
 @app.on_event("startup")
 def startup():
     try:
@@ -325,6 +412,7 @@ def startup():
         ensure_leads_table()
         ensure_governance_tables()
         ensure_user_rules_tables()
+        ensure_task_engine_tables()
         seed_knowledge_data()
         logger.info("Database tables ensured on startup")
     except Exception as e:
@@ -1083,31 +1171,252 @@ async def upload_file(
 
 
 # ── Task proxy ──────────────────────────────────────────────
-@app.post("/fazle/tasks", dependencies=[Depends(verify_auth)])
-async def create_task(request: TaskCreateRequest):
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.post(
-                f"{settings.task_url}/tasks",
-                json=request.model_dump(),
+@app.post("/tasks")
+async def create_task_engine(request: TaskEngineCreateRequest):
+    if request.task_type not in TASK_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid task type. Must be one of: {sorted(TASK_TYPES)}")
+
+    task_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fazle_tasks (id, title, description, task_type, status, scheduled_at, created_at, payload, recurrence)
+                VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    task_id,
+                    request.title,
+                    request.description,
+                    request.task_type,
+                    request.scheduled_at,
+                    now,
+                    json.dumps(request.payload),
+                    request.recurrence,
+                ),
             )
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Task service error: {e}")
-            return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "id": task_id,
+        "title": request.title,
+        "description": request.description,
+        "task_type": request.task_type,
+        "status": "pending",
+        "scheduled_at": request.scheduled_at,
+        "created_at": now,
+        "payload": request.payload,
+        "recurrence": request.recurrence,
+        "last_run": None,
+    }
+
+
+@app.get("/tasks")
+async def list_task_engine_tasks(status: Optional[str] = None, task_type: Optional[str] = None):
+    query = "SELECT id, title, description, task_type, status, scheduled_at, created_at, payload, recurrence, last_run FROM fazle_tasks WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status = %s"
+        params.append(status)
+    if task_type:
+        query += " AND task_type = %s"
+        params.append(task_type)
+    query += " ORDER BY created_at DESC"
+
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    tasks = [_task_row_to_dict(r) for r in rows]
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+@app.get("/tasks/{task_id}")
+async def get_task_engine_task(task_id: str):
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, description, task_type, status, scheduled_at, created_at, payload, recurrence, last_run FROM fazle_tasks WHERE id = %s",
+                (task_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_row_to_dict(row)
+
+
+@app.patch("/tasks/{task_id}")
+async def update_task_engine_task(task_id: str, request: TaskEngineUpdateRequest):
+    sets = []
+    params = []
+    if request.status:
+        sets.append("status = %s")
+        params.append(request.status)
+    if request.title:
+        sets.append("title = %s")
+        params.append(request.title)
+    if request.description:
+        sets.append("description = %s")
+        params.append(request.description)
+
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE fazle_tasks SET {', '.join(sets)} WHERE id = %s RETURNING id, title, description, task_type, status, scheduled_at, created_at, payload, recurrence, last_run",
+                tuple(params + [task_id]),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_row_to_dict(row)
+
+
+@app.delete("/tasks/{task_id}")
+async def delete_task_engine_task(task_id: str):
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM fazle_tasks WHERE id = %s RETURNING id", (task_id,))
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"status": "deleted", "id": task_id}
+
+
+@app.post("/triggers", response_model=EventTriggerResponse)
+async def create_event_trigger(request: EventTriggerCreate):
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM fazle_tasks WHERE id = %s", (request.action_task_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Action task not found")
+
+            trigger_id = str(uuid.uuid4())
+            now = datetime.utcnow().isoformat()
+            cur.execute(
+                """
+                INSERT INTO fazle_event_triggers (id, event_type, condition, action_task_id, enabled, created_at)
+                VALUES (%s, %s, %s::jsonb, %s, TRUE, %s)
+                """,
+                (trigger_id, request.event_type, json.dumps(request.condition), request.action_task_id, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return EventTriggerResponse(
+        id=trigger_id,
+        event_type=request.event_type,
+        condition=request.condition,
+        action_task_id=request.action_task_id,
+        enabled=True,
+        created_at=now,
+    )
+
+
+@app.get("/triggers")
+async def list_event_triggers(event_type: Optional[str] = None):
+    query = "SELECT id, event_type, condition, action_task_id, enabled, created_at FROM fazle_event_triggers WHERE 1=1"
+    params = []
+    if event_type:
+        query += " AND event_type = %s"
+        params.append(event_type)
+    query += " ORDER BY created_at DESC"
+
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    triggers = []
+    for r in rows:
+        triggers.append({
+            "id": str(r[0]),
+            "event_type": r[1],
+            "condition": r[2] if isinstance(r[2], dict) else (r[2] or {}),
+            "action_task_id": str(r[3]),
+            "enabled": bool(r[4]),
+            "created_at": r[5].isoformat() if r[5] else "",
+        })
+    return {"triggers": triggers, "count": len(triggers)}
+
+
+@app.delete("/triggers/{trigger_id}")
+async def delete_event_trigger(trigger_id: str):
+    db_url = os.getenv("FAZLE_DATABASE_URL", "")
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM fazle_event_triggers WHERE id = %s RETURNING id", (trigger_id,))
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    return {"status": "deleted", "id": trigger_id}
+
+
+@app.post("/fazle/tasks", dependencies=[Depends(verify_auth)])
+async def create_fazle_task(request: TaskCreateRequest):
+    try:
+        local_request = TaskEngineCreateRequest(
+            title=request.title,
+            description=request.description,
+            scheduled_at=request.scheduled_at,
+            task_type=request.task_type,
+            payload=request.payload,
+            recurrence=None,
+        )
+        return await create_task_engine(local_request)
+    except Exception as e:
+        logger.error(f"Task service error: {e}")
+        return {"status": "fallback", "reply": "দুঃখিত, একটু সমস্যা হচ্ছে। আবার চেষ্টা করুন।"}
 
 
 @app.get("/fazle/tasks", dependencies=[Depends(verify_auth)])
-async def list_tasks():
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.get(f"{settings.task_url}/tasks")
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Task service error: {e}")
-            return {"tasks": [], "status": "fallback"}
+async def list_fazle_tasks():
+    try:
+        return await list_task_engine_tasks()
+    except Exception as e:
+        logger.error(f"Task service error: {e}")
+        return {"tasks": [], "status": "fallback"}
 
 
 # ── Web intelligence proxy ──────────────────────────────────
