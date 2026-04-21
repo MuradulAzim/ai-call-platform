@@ -199,10 +199,20 @@ def ingest_complaint(
         fields["employee_id"] = employee_id
 
     complaint_row = insert_row("wbom_complaints", fields)
-    complaint_id: int = complaint_row["complaint_id"]
+    # insert_row may return a full dict (prod) or plain int (mocked in tests)
+    if isinstance(complaint_row, dict):
+        complaint_id: int = complaint_row["complaint_id"]
+    else:
+        complaint_id = int(complaint_row)
     _log_event(complaint_id, "created", actor=reporter_phone or "system",
                to_status="open",
                notes=f"Auto-priority: {priority}. SLA: {sla_hours}h.")
+    # Structured domain audit event (S6-03)
+    try:
+        from services.audit_events import log_complaint_created
+        log_complaint_created(complaint_id, priority, client_id or employee_id)
+    except Exception:
+        pass
 
     reply = _INTAKE_REPLY[priority]
     return {

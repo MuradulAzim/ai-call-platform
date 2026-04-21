@@ -436,6 +436,17 @@ def transition_run(
         payload={"from": current, "to": new_status},
     )
     logger.info("Payroll run %d: %s → %s (actor=%s)", run_id, current, new_status, actor)
+    # Structured domain audit events (S6-03)
+    try:
+        from services.audit_events import log_payroll_approved, log_payroll_paid
+        if action == "approve":
+            total = float(updated.get("total_net_pay") or 0)
+            log_payroll_approved(run_id, actor, total)
+        elif action == "pay":
+            count = int(updated.get("employee_count") or 0)
+            log_payroll_paid(run_id, actor, count)
+    except Exception:
+        pass  # never let logging break the caller
     return updated or {}
 
 

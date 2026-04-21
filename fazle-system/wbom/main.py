@@ -2,11 +2,14 @@
 # WBOM — WhatsApp Business Operations Manager
 # FastAPI service entry-point  |  Port 9900
 # ============================================================
-import logging, os, uuid
+import logging, os, uuid, json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -47,7 +50,7 @@ setup_structured_logging("wbom")
 log = logging.getLogger("wbom")
 
 # ── Paths that skip internal auth (health checks) ────────────
-_PUBLIC_PATHS = frozenset(["/health", "/", "/metrics"])
+_PUBLIC_PATHS = frozenset(["/health", "/ready", "/version", "/", "/metrics"])
 
 
 class InternalAuthMiddleware(BaseHTTPMiddleware):
@@ -84,7 +87,7 @@ async def lifespan(app: FastAPI):
 # ---- app ----------------------------------------------------
 app = FastAPI(
     title="WBOM — WhatsApp Business Operations Manager",
-    version="1.0.0",
+    version="1.6.0",
     description="Full CRUD API for employees, transactions, clients, job applications, audit logs, and payments. "
                 "All list endpoints return a standard envelope: {success, data, meta, schema, version}.",
     docs_url="/docs",
@@ -119,6 +122,75 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 
+# ── Global exception handlers (S6-02) ────────────────────────
+
+def _req_id(request: Request) -> str:
+    return getattr(request.state, "request_id", str(uuid.uuid4()))
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    log.warning(
+        "HTTP %s on %s %s — %s",
+        exc.status_code, request.method, request.url.path, exc.detail,
+        extra={"request_id": _req_id(request), "action": "http_error"},
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": str(exc.detail),
+            "request_id": _req_id(request),
+        },
+        headers={"X-Request-ID": _req_id(request)},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    messages = "; ".join(
+        f"{'.'.join(str(l) for l in e['loc'])}: {e['msg']}"
+        for e in errors[:5]
+    )
+    log.warning(
+        "Validation error on %s %s — %s",
+        request.method, request.url.path, messages,
+        extra={"request_id": _req_id(request), "action": "validation_error"},
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "Validation failed",
+            "detail": messages,
+            "request_id": _req_id(request),
+        },
+        headers={"X-Request-ID": _req_id(request)},
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    error_id = str(uuid.uuid4())
+    log.exception(
+        "Unhandled exception [error_id=%s] on %s %s",
+        error_id, request.method, request.url.path,
+        extra={"request_id": _req_id(request), "action": "unhandled_exception"},
+    )
+    # Never expose stack traces to clients in production
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "error_id": error_id,
+            "request_id": _req_id(request),
+        },
+        headers={"X-Request-ID": _req_id(request)},
+    )
+
+
 # ---- mount routers ------------------------------------------
 app.include_router(contacts_router, prefix="/api/wbom")
 app.include_router(employees_router, prefix="/api/wbom")
@@ -149,14 +221,75 @@ app.include_router(complaints_router, prefix="/api/wbom")
 
 
 # ---- health --------------------------------------------------
+_WBOM_VERSION = "wbom-v1.6.0"
+_BUILD_DATE = "2026-04-21"
+
+
+def _check_db() -> tuple[bool, str]:
+    """Return (ok, message) for DB connectivity."""
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True, "connected"
+    except Exception as exc:
+        return False, str(exc)[:120]
+
+
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "wbom"}
+    """Liveness probe — always returns 200 if the process is alive.
+    DB check is non-blocking: unhealthy DB is surfaced but does not
+    make this endpoint return non-200 (so the container is not restarted
+    just because Postgres is temporarily unavailable).
+    """
+    db_ok, db_msg = _check_db()
+    from datetime import datetime, timezone
+    return {
+        "status": "ok",
+        "db": db_msg,
+        "db_ok": db_ok,
+        "version": _WBOM_VERSION,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "service": "wbom",
+    }
+
+
+@app.get("/ready")
+def ready():
+    """Readiness probe — returns 503 if DB is not reachable.
+    Used by load balancers / K8s readiness probes.
+    """
+    from datetime import datetime, timezone
+    db_ok, db_msg = _check_db()
+    status_code = 200 if db_ok else 503
+    return Response(
+        content=__import__("json").dumps({
+            "ready": db_ok,
+            "db": db_msg,
+            "version": _WBOM_VERSION,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+@app.get("/version")
+def version():
+    """Version metadata — safe for public consumption."""
+    return {
+        "version": _WBOM_VERSION,
+        "build_date": _BUILD_DATE,
+        "service": "wbom",
+        "api_prefix": "/api/wbom",
+    }
 
 
 @app.get("/")
 def root():
-    return {"service": "WBOM", "version": "1.0.0"}
+    return {"service": "WBOM", "version": _WBOM_VERSION}
 
 
 # ---- run -----------------------------------------------------
