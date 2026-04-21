@@ -6,13 +6,16 @@ import { useEffect } from "react";
 import Link from "next/link";
 
 const NAV_ITEMS = [
-  { href: "/dashboard/wbom", label: "Dashboard", icon: "📊" },
-  { href: "/dashboard/wbom/employees", label: "Employees", icon: "👥" },
-  { href: "/dashboard/wbom/transactions", label: "Transactions", icon: "💰" },
-  { href: "/dashboard/wbom/payments", label: "Payments", icon: "📤" },
-  { href: "/dashboard/wbom/clients", label: "Clients", icon: "🏢" },
-  { href: "/dashboard/wbom/applications", label: "Applications", icon: "📋" },
-  { href: "/dashboard/wbom/audit", label: "Audit Log", icon: "📜" },
+  { href: "/dashboard/wbom",               label: "Dashboard",   icon: "📊" },
+  { href: "/dashboard/wbom/employees",     label: "Employees",   icon: "👥" },
+  { href: "/dashboard/wbom/transactions",  label: "Transactions",icon: "💰" },
+  { href: "/dashboard/wbom/payments",      label: "Payments",    icon: "📤" },
+  { href: "/dashboard/wbom/clients",       label: "Clients",     icon: "🏢" },
+  { href: "/dashboard/wbom/payroll",       label: "Payroll",     icon: "💵" },
+  { href: "/dashboard/wbom/complaints",    label: "Complaints",  icon: "🚨" },
+  { href: "/dashboard/wbom/recruitment",   label: "Recruitment", icon: "🎯" },
+  { href: "/dashboard/wbom/applications",  label: "Applications",icon: "📋" },
+  { href: "/dashboard/wbom/audit",         label: "Audit Log",   icon: "📜" },
 ];
 
 function WbomSidebar({ pathname }) {

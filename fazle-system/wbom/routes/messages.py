@@ -1,11 +1,15 @@
 # ============================================================
 # WBOM — Message Processing Routes
 # WhatsApp message ingestion + classification + extraction
+# Sprint-5 S5-03: /messages/dispatch is the single inbound
+#                 entry point for all WhatsApp messages.
 # ============================================================
+import logging
+
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
-from database import insert_row, get_row, list_rows, delete_row, update_row_no_ts, search_rows
+from database import insert_row, get_row, list_rows, delete_row, update_row_no_ts, search_rows, execute_query
 from models import (
     MessageCreate, MessageProcessRequest, MessageProcessResponse,
     ValidationRequest, ValidationResponse, ValidationItem,
@@ -19,7 +23,85 @@ from models import (
 from services.message_processor import process_incoming_message
 from services.wbom_logger import handle_errors
 
+logger = logging.getLogger("wbom.messages")
+
 router = APIRouter(prefix="/messages", tags=["messages"])
+
+# ── Recruitment keyword set (Sprint-5 S5-03) ─────────────────
+_RECRUITMENT_KEYWORDS: frozenset[str] = frozenset({
+    "job", "কাজ", "চাকরি", "vacancy", "apply", "hire",
+    "recruit", "নিয়োগ", "কাজের", "চাই", "interested",
+    "work", "join", "joining",
+})
+
+
+def _is_recruitment_message(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(kw in lower for kw in _RECRUITMENT_KEYWORDS)
+
+
+def _message_already_processed(whatsapp_msg_id: str) -> bool:
+    """Return True if a message with this whatsapp_msg_id was already processed."""
+    if not whatsapp_msg_id:
+        return False
+    rows = execute_query(
+        "SELECT message_id FROM wbom_whatsapp_messages "
+        "WHERE whatsapp_msg_id = %s AND is_processed = TRUE LIMIT 1",
+        (whatsapp_msg_id,),
+    )
+    return bool(rows)
+
+
+# ── Sprint-5 S5-03: Single unified dispatcher ─────────────────
+
+@router.post("/dispatch", response_model=MessageProcessResponse)
+@handle_errors
+def dispatch_message(req: MessageProcessRequest):
+    """
+    Single inbound entry point for all WhatsApp messages (Sprint-5 S5-03).
+
+    Routing logic:
+      - If message contains recruitment keywords → recruitment.intake_message()
+      - Otherwise → message_processor.process_incoming_message()
+
+    Duplicate guard: messages with the same whatsapp_msg_id that were already
+    processed are rejected with HTTP 409 to prevent double-processing.
+    """
+    # Duplicate guard
+    if req.whatsapp_msg_id and _message_already_processed(req.whatsapp_msg_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Message {req.whatsapp_msg_id!r} already processed.",
+        )
+
+    if _is_recruitment_message(req.message_body):
+        logger.info(
+            "dispatch → recruitment.intake_message | phone=%s", req.sender_number
+        )
+        from services.recruitment import intake_message
+        result = intake_message(phone=req.sender_number, message=req.message_body)
+        # Normalise to MessageProcessResponse shape
+        return {
+            "message_id":        result.get("message_id", 0),
+            "classification":    "recruitment",
+            "confidence":        1.0,
+            "is_multi_lighter":  False,
+            "extracted_data":    {},
+            "suggested_template": None,
+            "draft_reply":       result.get("reply", ""),
+            "requires_admin_input": False,
+            "missing_fields":    [],
+            "unfilled_fields":   [],
+            "confidence_scores": {},
+        }
+
+    logger.info(
+        "dispatch → message_processor.process_incoming_message | phone=%s",
+        req.sender_number,
+    )
+    return process_incoming_message(
+        req.sender_number, req.message_body, req.whatsapp_msg_id,
+    )
 
 
 @router.post("/process", response_model=MessageProcessResponse)

@@ -1,14 +1,15 @@
 # ============================================================
 # WBOM — Report Routes
-# Phase 7 §7.1: Salary + billing reports
+# Phase 7 §7.1 / Sprint-5 S5-01: Salary + billing reports
+# Salary data now reads from wbom_payroll_runs (single truth).
 # ============================================================
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
-from database import execute_query
+from database import execute_query, get_row
 from models import SalaryReportResponse, BillingReportResponse
 from services.salary_generator import (
-    calculate_monthly_salary, get_employee_programs, get_employee_transactions,
+    get_employee_programs, get_employee_transactions,
 )
 
 from config import settings as _cfg
@@ -19,18 +20,68 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 DEFAULT_SERVICE_CHARGE = _cfg.default_service_charge
 
 
+def _salary_from_payroll_run(employee_id: int, month: int, year: int) -> dict:
+    """Fetch salary summary from wbom_payroll_runs (Sprint-5: single truth).
+
+    Falls back to wbom_salary_records only if no payroll run exists (legacy data).
+    """
+    rows = execute_query(
+        """
+        SELECT run_id, employee_id, period_year, period_month,
+               status, basic_salary, total_programs, per_program_rate,
+               program_allowance, other_allowance, total_advances,
+               total_deductions, gross_salary, net_salary, remarks,
+               created_at, updated_at
+        FROM wbom_payroll_runs
+        WHERE employee_id  = %s
+          AND period_year  = %s
+          AND period_month = %s
+        ORDER BY run_id DESC
+        LIMIT 1
+        """,
+        (employee_id, year, month),
+    )
+    if rows:
+        r = dict(rows[0])
+        return {
+            "employee_id":      r["employee_id"],
+            "month":            r["period_month"],
+            "year":             r["period_year"],
+            "basic_salary":     float(r["basic_salary"]),
+            "total_programs":   r["total_programs"],
+            "program_allowance":float(r["program_allowance"]),
+            "other_allowance":  float(r["other_allowance"]),
+            "total_advances":   float(r["total_advances"]),
+            "total_deductions": float(r["total_deductions"]),
+            "net_salary":       float(r["net_salary"]),
+            "status":           r["status"],
+            "remarks":          r["remarks"],
+            "source":           "payroll_run",
+        }
+
+    # Fallback: check legacy salary records (pre-Sprint-1 data only)
+    from services.salary_generator import calculate_monthly_salary
+    data = calculate_monthly_salary(employee_id, month, year)
+    data["source"] = "legacy_salary_records"
+    return data
+
+
 @router.get(
     "/salary/{employee_id}/{month}/{year}",
     response_model=SalaryReportResponse,
 )
 @handle_errors
 def salary_report(employee_id: int, month: int, year: int):
-    """Generate salary report for an employee."""
-    try:
-        salary_data = calculate_monthly_salary(employee_id, month, year)
-    except ValueError as e:
-        raise HTTPException(404, str(e))
+    """Generate salary report for an employee.
 
+    Sprint-5 S5-01: reads from wbom_payroll_runs (single truth).
+    Falls back to legacy wbom_salary_records only for pre-Sprint-1 data.
+    """
+    employee = get_row("wbom_employees", "employee_id", employee_id)
+    if not employee:
+        raise HTTPException(404, f"Employee {employee_id} not found")
+
+    salary_data = _salary_from_payroll_run(employee_id, month, year)
     programs = get_employee_programs(employee_id, month, year)
     transactions = get_employee_transactions(employee_id, month, year)
 

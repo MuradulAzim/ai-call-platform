@@ -122,6 +122,42 @@ def auto_tag_priority(complaint_type: str, category: str) -> str:
     return "medium"
 
 
+# ── Category auto-detection from free text ───────────────────────────────────
+
+_CLIENT_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "harassment":          ("harassment", "harass", "abuse", "abusive", "রূঢ়", "রুড", "অপমান"),
+    "misconduct":          ("misconduct", "misbehav", "misbehave", "theft", "চুরি", "অসদাচরণ"),
+    "replacement_request": ("replace", "change", "বদল", "পরিবর্তন", "new guard"),
+    "payment_dispute":     ("payment", "bill", "charge", "টাকা", "বিল", "পেমেন্ট"),
+    "service_quality":     ("quality", "late", "absent", "দেরি", "আসে নাই", "নেই", "no guard"),
+}
+
+_EMPLOYEE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "harassment":       ("harassment", "harass", "abuse", "হয়রানি"),
+    "salary_issue":     ("salary", "pay", "বেতন", "পাইনি", "দেয় নাই"),
+    "supervisor_issue": ("supervisor", "boss", "সুপারভাইজার", "অফিসার"),
+    "duty_mismatch":    ("duty", "shift", "schedule", "ডিউটি", "পোস্ট"),
+}
+
+
+def _detect_category_from_text(text: str, complaint_type: str) -> str:
+    """Best-effort category detection from free text.
+
+    Returns the best-matching category key, or 'other' if no match.
+    Used by message_processor when creating complaints from WhatsApp messages.
+    """
+    lower = (text or "").lower()
+    keywords_map = (
+        _CLIENT_CATEGORY_KEYWORDS
+        if complaint_type == "client"
+        else _EMPLOYEE_CATEGORY_KEYWORDS
+    )
+    for category, keywords in keywords_map.items():
+        if any(kw in lower for kw in keywords):
+            return category
+    return "other"
+
+
 # ── Ingest (WhatsApp entry point) ────────────────────────────────────────────
 
 def ingest_complaint(
@@ -162,7 +198,8 @@ def ingest_complaint(
     if employee_id:
         fields["employee_id"] = employee_id
 
-    complaint_id = insert_row("wbom_complaints", fields)
+    complaint_row = insert_row("wbom_complaints", fields)
+    complaint_id: int = complaint_row["complaint_id"]
     _log_event(complaint_id, "created", actor=reporter_phone or "system",
                to_status="open",
                notes=f"Auto-priority: {priority}. SLA: {sla_hours}h.")

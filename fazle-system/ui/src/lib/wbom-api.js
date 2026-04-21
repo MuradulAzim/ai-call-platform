@@ -239,3 +239,46 @@ export function formatCell(value, key) {
   }
   return String(value);
 }
+
+
+// ── useWbomFetch: fetch a single-object endpoint ─────────────
+// Useful for /dashboard/summary and similar endpoints that
+// return a JSON object rather than an array.
+// Returns { data, loading, error, reload }
+
+export function useWbomFetch(path, initialData = null) {
+  const { get } = useWbomApi();
+  const [data, setData] = useState(initialData);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const reload = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    get(path)
+      .then((json) => {
+        if (!mountedRef.current) return;
+        // Unwrap { success, data } envelope if present
+        setData(json?.success && json.data !== undefined ? json.data : json);
+      })
+      .catch((err) => {
+        if (!mountedRef.current) return;
+        setError(err.message || "Failed to load");
+        setData(initialData);
+      })
+      .finally(() => {
+        if (mountedRef.current) setLoading(false);
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [get, path]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  return { data, loading, error, reload };
+}

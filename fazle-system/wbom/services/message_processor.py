@@ -3,13 +3,14 @@
 # Classifies incoming WhatsApp messages and orchestrates
 # data extraction + template suggestion
 # Phase 3: AI Processing Logic & Algorithms
+# Sprint-5 S5-02: complaint path now routes to wbom_complaints
+#                 (single complaint truth) via services.complaints
 # ============================================================
 import logging
 import re
 from typing import Optional
 
-from database import get_conn, get_row, insert_row, update_row_no_ts, search_rows
-import psycopg2.extras
+from database import insert_row, update_row_no_ts, search_rows
 
 logger = logging.getLogger("wbom.message_processor")
 
@@ -35,6 +36,18 @@ MESSAGE_CLASSIFICATION_RULES = {
         ],
         "min_keyword_matches": 2,
         "min_pattern_matches": 2,
+    },
+    "complaint": {
+        "keywords": [
+            "complaint", "complain", "অভিযোগ", "সমস্যা", "চুরি", "theft",
+            "guard absent", "গার্ড আসে নাই", "গার্ড নাই", "রুড", "রূঢ়", "ঝামেলা",
+        ],
+        "patterns": [
+            r"(?i)(complaint|complain|অভিযোগ|সমস্যা)",
+            r"(?i)(চুরি|theft|রুড|রূঢ়|absent|আসে নাই|নেই|no\s*guard)",
+        ],
+        "min_keyword_matches": 1,
+        "min_pattern_matches": 1,
     },
     "query": {
         "keywords": ["?", "when", "where", "how", "কবে", "কখন", "কোথায়"],
@@ -128,6 +141,9 @@ def process_incoming_message(
 
     # 2. Classify message (Phase 3 algorithm)
     classification, confidence = classify_message(message_body)
+    from services.case_workflow import is_complaint_text as _is_complaint_text
+    if classification == "general" and _is_complaint_text(message_body):
+        classification, confidence = "complaint", max(confidence, 0.75)
 
     # 3. Store raw message
     msg_data = {
@@ -163,6 +179,7 @@ def process_incoming_message(
         "payment": [
             "employee_name", "amount", "payment_method", "mobile_number",
         ],
+        "complaint": [],
         "query": ["mother_vessel", "date"],
         "general": [],
     }
@@ -204,7 +221,36 @@ def process_incoming_message(
         "template_used_id": template["template_id"] if template else None,
     })
 
-    return {
+    # Sprint-5 S5-02: complaints go to wbom_complaints (single truth).
+    # wbom_cases is no longer used for complaint-type messages.
+    complaint_result = None
+    if classification == "complaint":
+        from services.case_workflow import is_complaint_text
+        from services.complaints import ingest_complaint, _detect_category_from_text
+
+        # Determine complaint_type: look up contact → if employee-linked, use 'employee'
+        complaint_type = "client"
+        if contact_id:
+            from database import get_row as _get_row
+            c = _get_row("wbom_contacts", "contact_id", contact_id)
+            if c and c.get("relation") in ("employee", "staff"):
+                complaint_type = "employee"
+
+        category = _detect_category_from_text(message_body, complaint_type)
+        complaint_result = ingest_complaint(
+            complaint_type=complaint_type,
+            category=category,
+            description=message_body,
+            reporter_phone=sender_number,
+            source="whatsapp",
+        )
+        logger.info(
+            "Complaint ingested via message_processor: complaint_id=%s priority=%s",
+            complaint_result.get("complaint_id"),
+            complaint_result.get("priority"),
+        )
+
+    result = {
         "message_id": message_id,
         "classification": classification,
         "confidence": confidence,
@@ -219,3 +265,7 @@ def process_incoming_message(
         "unfilled_fields": unfilled_fields,
         "confidence_scores": confidence_scores,
     }
+    if complaint_result:
+        result["complaint_id"] = complaint_result.get("complaint_id")
+        result["complaint_priority"] = complaint_result.get("priority")
+    return result

@@ -1,23 +1,35 @@
 # ============================================================
-# WBOM — Job Applications Routes
-# Full CRUD for recruitment pipeline
+# WBOM — Job Applications Routes  [DEPRECATED — Sprint-5 S5-04]
+#
+# This module is a historical read-only archive.
+# All new candidate management uses /api/wbom/recruitment/candidates
+# backed by wbom_candidates (migration 021 + 025).
+#
+# POST / PUT / DELETE are disabled with HTTP 410 Gone.
+# GET endpoints remain for historical access.
 # ============================================================
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
-from database import insert_row, get_row, update_row, delete_row, list_rows, audit_log, count_rows
+from database import get_row, list_rows, count_rows, audit_log
 from models import JobApplicationCreate, JobApplicationUpdate, JobApplicationResponse
+
+_GONE_DETAIL = (
+    "This endpoint is deprecated. "
+    "Use POST /api/wbom/recruitment/intake for new candidates. "
+    "Historical data is available via GET /api/wbom/job-applications."
+)
 
 router = APIRouter(prefix="/job-applications", tags=["job_applications"])
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=410)
 def create_application(data: JobApplicationCreate):
-    row = insert_row("wbom_job_applications", data.model_dump(exclude_none=True))
-    audit_log("job_application.created", actor=data.source or "system",
-              entity_type="job_application", entity_id=row.get("application_id"),
-              payload={"applicant": data.applicant_name, "position": data.position})
-    return row
+    raise HTTPException(
+        status_code=410,
+        detail=_GONE_DETAIL,
+        headers={"X-WBOM-Migrate-To": "/api/wbom/recruitment/intake"},
+    )
 
 
 @router.get("")
@@ -27,6 +39,7 @@ def list_applications(
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
 ):
+    """Read-only historical list. Write endpoints removed in Sprint-5."""
     filters = {}
     if status:
         filters["status"] = status
@@ -34,34 +47,37 @@ def list_applications(
         filters["position"] = position
     rows = list_rows("wbom_job_applications", filters=filters, limit=limit, offset=offset)
     total = count_rows("wbom_job_applications", filters if filters else None)
-    return rows
+    return {
+        "items": rows,
+        "total": total,
+        "note": "DEPRECATED — historical data only. New candidates: GET /api/wbom/recruitment/candidates",
+    }
 
 
 @router.get("/{application_id}")
 def get_application(application_id: int):
+    """Read-only historical record. Write endpoints removed in Sprint-5."""
     row = get_row("wbom_job_applications", "application_id", application_id)
     if not row:
         raise HTTPException(404, "Application not found")
-    return row
+    return dict(row) | {
+        "note": "DEPRECATED — historical data only. New candidates: GET /api/wbom/recruitment/candidates"
+    }
 
 
-@router.put("/{application_id}")
+@router.put("/{application_id}", status_code=410)
 def update_application(application_id: int, data: JobApplicationUpdate):
-    updates = data.model_dump(exclude_none=True)
-    if not updates:
-        raise HTTPException(400, "No fields to update")
-    row = update_row("wbom_job_applications", "application_id", application_id, updates)
-    if not row:
-        raise HTTPException(404, "Application not found")
-    audit_log("job_application.updated", entity_type="job_application",
-              entity_id=application_id, payload=updates)
-    return row
+    raise HTTPException(
+        status_code=410,
+        detail=_GONE_DETAIL,
+        headers={"X-WBOM-Migrate-To": "/api/wbom/recruitment/candidates"},
+    )
 
 
-@router.delete("/{application_id}")
+@router.delete("/{application_id}", status_code=410)
 def delete_application(application_id: int):
-    if not delete_row("wbom_job_applications", "application_id", application_id):
-        raise HTTPException(404, "Application not found")
-    audit_log("job_application.deleted", entity_type="job_application",
-              entity_id=application_id)
-    return {"deleted": True}
+    raise HTTPException(
+        status_code=410,
+        detail=_GONE_DETAIL,
+        headers={"X-WBOM-Migrate-To": "/api/wbom/recruitment/candidates"},
+    )
