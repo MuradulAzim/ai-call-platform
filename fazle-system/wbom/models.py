@@ -4,7 +4,7 @@
 # ============================================================
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -772,4 +772,192 @@ class AuditLogResponse(BaseModel):
     entity_type: Optional[str] = None
     entity_id: Optional[int] = None
     payload: Optional[dict] = None
+    created_at: datetime
+
+
+# ── Workflow / Case Management (Phase 2) ────────────────────
+
+class WorkflowCaseListResponse(BaseModel):
+    success: bool
+    count: int
+    total: int
+    limit: int
+    offset: int
+    items: list[dict[str, Any]] = []
+
+
+class WorkflowCaseDetailResponse(BaseModel):
+    success: bool
+    case: dict[str, Any]
+    events: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
+    event_count: int = 0
+    task_count: int = 0
+
+
+class WorkflowEscalationMonitorResponse(BaseModel):
+    success: bool
+    window_minutes: int
+    summary: dict[str, int] = {}
+    cases: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
+
+
+class WorkflowCaseStatusTransitionRequest(BaseModel):
+    new_status: str = Field(..., min_length=2)
+    changed_by: str = Field(..., min_length=1)
+    reason: str = Field(default="", max_length=500)
+
+
+class WorkflowCaseStatusTransitionResponse(BaseModel):
+    success: bool
+    case_id: int
+    old_status: str
+    new_status: str
+    message: Optional[str] = None
+    case: Optional[dict[str, Any]] = None
+
+
+class WorkflowEscalationActionRequest(BaseModel):
+    action: str = Field(..., pattern=r"^(acknowledge|escalate|snooze)$")
+    actor: str = Field(..., min_length=1)
+    note: str = Field(default="", max_length=500)
+    snooze_minutes: int = Field(default=30, ge=1, le=1440)
+
+
+class WorkflowEscalationActionResponse(BaseModel):
+    success: bool
+    case_id: int
+    action: str
+    message: str
+    current_level: Optional[int] = None
+    from_level: Optional[int] = None
+    to_level: Optional[int] = None
+    target_role: Optional[str] = None
+    target_user: Optional[str] = None
+    due_at: Optional[datetime] = None
+
+
+class WorkflowApprovalsListResponse(BaseModel):
+    success: bool
+    count: int
+    items: list[dict[str, Any]] = []
+
+
+class WorkflowTaskApprovalResponse(BaseModel):
+    success: bool
+    workflow_task_id: int
+    status: str
+    case_id: Optional[int] = None
+    message: Optional[str] = None
+
+
+class WorkflowStagingPaymentApprovalResponse(BaseModel):
+    success: bool
+    staging_id: int
+    status: str
+    message: str
+
+
+# ── Payroll Run Engine (Sprint-1 P0-01 / P0-02 / P0-03) ──────
+
+class PayrollRunCreate(BaseModel):
+    employee_id: int
+    period_year: int = Field(..., ge=2020, le=2099)
+    period_month: int = Field(..., ge=1, le=12)
+    per_program_rate: Optional[Decimal] = None   # uses config default if omitted
+    computed_by: Optional[str] = Field(default="system", max_length=80)
+    remarks: Optional[str] = None
+
+
+class PayrollRunItemResponse(BaseModel):
+    item_id: int
+    run_id: int
+    component_type: str
+    component_label: str
+    amount: Decimal
+    sign: str
+    source_table: Optional[str] = None
+    source_id: Optional[int] = None
+    notes: Optional[str] = None
+    created_at: datetime
+
+
+class PayrollRunResponse(BaseModel):
+    run_id: int
+    employee_id: int
+    period_year: int
+    period_month: int
+    status: str
+    basic_salary: Decimal
+    total_programs: int
+    per_program_rate: Decimal
+    program_allowance: Decimal
+    other_allowance: Decimal
+    total_advances: Decimal
+    total_deductions: Decimal
+    gross_salary: Decimal
+    net_salary: Decimal
+    payout_target_date: Optional[date] = None
+    payment_method: Optional[str] = None
+    payment_reference: Optional[str] = None
+    paid_at: Optional[datetime] = None
+    computed_by: Optional[str] = None
+    submitted_by: Optional[str] = None
+    approved_by: Optional[str] = None
+    locked_by: Optional[str] = None
+    paid_by: Optional[str] = None
+    correction_reason: Optional[str] = None
+    remarks: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    items: Optional[list] = None
+
+
+class PayrollComputeResponse(BaseModel):
+    """Dry-run compute result — no DB write."""
+    employee_id: int
+    employee_name: Optional[str] = None
+    period_year: int
+    period_month: int
+    basic_salary: Decimal
+    total_programs: int
+    per_program_rate: Decimal
+    program_allowance: Decimal
+    other_allowance: Decimal
+    total_advances: Decimal
+    total_deductions: Decimal
+    gross_salary: Decimal
+    net_salary: Decimal
+    items: list
+
+
+class PayrollActionRequest(BaseModel):
+    actor: str = Field(..., max_length=80)
+    reason: Optional[str] = None
+
+
+class PayrollPayRequest(BaseModel):
+    actor: str = Field(..., max_length=80)
+    payment_method: str = Field(..., pattern=r"^(Cash|Bkash|Nagad|Rocket|Bank)$")
+    payment_reference: Optional[str] = Field(None, max_length=80)
+    payout_idempotency_key: Optional[str] = Field(None, max_length=80)
+    reason: Optional[str] = None
+
+
+class PayrollCorrectRequest(BaseModel):
+    actor: str = Field(..., max_length=80)
+    reason: str = Field(..., min_length=5)
+    per_program_rate: Optional[Decimal] = None
+
+
+class PayrollApprovalLogEntry(BaseModel):
+    log_id: int
+    run_id: int
+    action: str
+    actor: str
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    reason: Optional[str] = None
+    payload_json: Any
     created_at: datetime

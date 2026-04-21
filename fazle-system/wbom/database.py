@@ -167,6 +167,32 @@ def ensure_wbom_tables():
     except Exception as e:
         logger.warning("Migration 017 failed (may already be applied): %s", e)
 
+    # 018: Case/workflow foundation for SLA, approvals, and event timelines
+    try:
+        import pathlib
+        _mig_018 = pathlib.Path(__file__).parent / "migrations" / "018_case_workflow_foundation.sql"
+        if _mig_018.exists():
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(_mig_018.read_text())
+                conn.commit()
+            logger.info("Applied migration 018_case_workflow_foundation")
+    except Exception as e:
+        logger.warning("Migration 018 failed (may already be applied): %s", e)
+
+    # 019: Payroll run engine — payroll_runs, run_items, approval_log (Sprint-1 P0-01/P0-02/P0-03)
+    try:
+        import pathlib
+        _mig_019 = pathlib.Path(__file__).parent / "migrations" / "019_payroll_run_engine.sql"
+        if _mig_019.exists():
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(_mig_019.read_text())
+                conn.commit()
+            logger.info("Applied migration 019_payroll_run_engine")
+    except Exception as e:
+        logger.warning("Migration 019 failed (may already be applied): %s", e)
+
 
 # ── Audit helper ─────────────────────────────────────────────
 
@@ -232,7 +258,7 @@ def insert_row_dedup(table: str, data: dict, conflict_cols: list[str]) -> tuple[
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(f"SELECT * FROM {table} WHERE {where} LIMIT 1", vals)
             row = cur.fetchone()
-    return dict(row) if row else ({}, False), False
+    return (dict(row) if row else {}), False
 
 
 @contextmanager
