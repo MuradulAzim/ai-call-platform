@@ -1123,3 +1123,79 @@ class RecruitmentMetricsResponse(BaseModel):
     funnel_breakdown:     dict
     recruiter_performance: list[RecruiterPerformance]
     no_response_leads:    list[NoResponseLead]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Sprint-4: Complaint + Client Retention models
+# ═══════════════════════════════════════════════════════════════
+
+class ComplaintIntakeRequest(BaseModel):
+    complaint_type: str          # client | employee
+    category:       str
+    description:    str
+    reporter_phone: Optional[str] = None
+    reporter_name:  Optional[str] = None
+    client_id:      Optional[int] = None
+    employee_id:    Optional[int] = None
+    source:         str = "whatsapp"
+
+
+class ComplaintIntakeResponse(BaseModel):
+    complaint_id: int
+    priority:     str
+    sla_due_at:   str
+    reply:        str
+
+
+class ComplaintAssignRequest(BaseModel):
+    staff_name: str
+    actor:      str = "system"
+
+
+class ComplaintEscalateRequest(BaseModel):
+    reason: str
+    actor:  str = "system"
+
+
+class ComplaintAdvanceRequest(BaseModel):
+    to_status: str
+    actor:     str = "system"
+    notes:     Optional[str] = None
+
+
+class ComplaintResolveRequest(BaseModel):
+    resolution_notes: str
+    actor:            str = "system"
+
+
+class ComplaintEventEntry(BaseModel):
+    event_id:    int
+    event_type:  str
+    actor:       Optional[str] = None
+    from_status: Optional[str] = None
+    to_status:   Optional[str] = None
+    notes:       Optional[str] = None
+    created_at:  Optional[str] = None
+
+
+class RepeatComplaintClient(BaseModel):
+    reporter_phone:   Optional[str] = None
+    reporter_name:    Optional[str] = None
+    complaint_count:  int
+
+
+class FastestResolver(BaseModel):
+    staff:           str
+    resolved_count:  int
+    avg_hours:       float
+
+
+class ComplaintMetricsResponse(BaseModel):
+    ref_date:                    str
+    unresolved_by_type:          dict
+    unresolved_total:            int
+    critical_open:               int
+    sla_breaches_total:          int
+    repeat_complaint_clients:    list[RepeatComplaintClient]
+    fastest_resolvers:           list[FastestResolver]
+    category_breakdown:          dict

@@ -219,6 +219,19 @@ def ensure_wbom_tables():
     except Exception as e:
         logger.warning("Migration 021 failed (may already be applied): %s", e)
 
+    # 022: Complaint + Retention tables (Sprint-4)
+    try:
+        import pathlib
+        _mig_022 = pathlib.Path(__file__).parent / "migrations" / "022_complaints.sql"
+        if _mig_022.exists():
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(_mig_022.read_text())
+                conn.commit()
+            logger.info("Applied migration 022_complaints")
+    except Exception as e:
+        logger.warning("Migration 022 failed (may already be applied): %s", e)
+
 
 # ── Audit helper ─────────────────────────────────────────────
 

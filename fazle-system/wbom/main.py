@@ -39,6 +39,7 @@ from routes.workflow import router as workflow_router
 from routes.payroll import router as payroll_router
 from routes.dashboard import router as dashboard_router
 from routes.recruitment import router as recruitment_router
+from routes.complaints import router as complaints_router
 
 # ---- logging ------------------------------------------------
 from structured_log import setup_structured_logging
@@ -144,6 +145,7 @@ app.include_router(workflow_router, prefix="/api/wbom")
 app.include_router(payroll_router, prefix="/api/wbom")
 app.include_router(dashboard_router, prefix="/api/wbom")
 app.include_router(recruitment_router, prefix="/api/wbom")
+app.include_router(complaints_router, prefix="/api/wbom")
 
 
 # ---- health --------------------------------------------------
